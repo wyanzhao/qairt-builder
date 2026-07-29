@@ -93,6 +93,23 @@ def test_init_keeps_managed_dockerignore_last_and_excludes_large_inputs(
         assert lines.index(required) > lines.index("!models/**")
 
 
+def test_unmatched_managed_dockerignore_marker_fails_without_data_loss(
+    tmp_path,
+) -> None:
+    original = (
+        "# user rule\n"
+        "# qairt-agent managed exclusions: begin\n"
+        "!keep-this-user-rule\n"
+    )
+    path = tmp_path / ".dockerignore"
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(HarnessConstraintsError, match="unmatched"):
+        init(tmp_path)
+
+    assert path.read_text(encoding="utf-8") == original
+
+
 def test_init_source_archive_is_deterministic_and_refreshable(tmp_path) -> None:
     config = init(tmp_path)
     archive = tmp_path / AGENT_SOURCE_ARCHIVE

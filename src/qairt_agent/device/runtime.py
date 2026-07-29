@@ -157,7 +157,10 @@ class DeviceRuntime:
             owner,
         )
         lease.acquire()
+        heartbeat_check = getattr(lease, "require_heartbeat", None)
         try:
+            if callable(heartbeat_check):
+                heartbeat_check()
             lease.record_attempt_dir(attempt_dir)
         except BaseException:
             # record_attempt_dir is atomic.  If it failed before publishing an
@@ -179,6 +182,8 @@ class DeviceRuntime:
             str(name): str(Path(path).expanduser().resolve())
             for name, path in push_files.items()
         }
+        cleanup_error: BaseException | None = None
+        release_error: BaseException | None = None
         try:
             with client.stage_attempt(
                 job_id,
@@ -187,6 +192,8 @@ class DeviceRuntime:
                 push_files=normalized_files,
                 cleanup_callback=cleanup_confirmed,
             ) as adb_session:
+                if callable(heartbeat_check):
+                    heartbeat_check()
                 device = self._device_factory(adapter, config)
                 try:
                     yield DeviceStageSession(
@@ -198,12 +205,44 @@ class DeviceRuntime:
                     # Let stage_attempt finish its exact cleanup first, then
                     # re-raise the original operation failure with traceback.
                     pending = (exc, sys.exc_info()[2])
+                if callable(heartbeat_check):
+                    heartbeat_check()
+        except BaseException as exc:
+            cleanup_error = exc
         finally:
             # release() always stops the independent heartbeat.  It removes a
             # clean lease, but deliberately retains one whose exact attempt
             # pointer survived a cleanup failure so GC can recover it.
-            lease.release()
+            try:
+                lease.release()
+            except BaseException as exc:
+                release_error = exc
 
         if pending is not None:
             exc, traceback = pending
+            secondary = cleanup_error or release_error
+            if secondary is not None:
+                raise DeviceUnavailableError(
+                    "device cleanup failed after the stage operation failed",
+                    stage="device",
+                    retryable=True,
+                    details={
+                        "stage_error": str(exc),
+                        "cleanup_error": str(secondary),
+                    },
+                ) from exc
             raise exc.with_traceback(traceback)
+        if cleanup_error is not None:
+            if release_error is not None:
+                raise DeviceUnavailableError(
+                    "device cleanup and lease release both failed",
+                    stage="device",
+                    retryable=True,
+                    details={
+                        "cleanup_error": str(cleanup_error),
+                        "release_error": str(release_error),
+                    },
+                ) from cleanup_error
+            raise cleanup_error
+        if release_error is not None:
+            raise release_error

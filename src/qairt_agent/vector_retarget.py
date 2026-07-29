@@ -26,6 +26,7 @@ single-source retargeting is rejected for those families.
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
 import re
 from dataclasses import dataclass
@@ -36,7 +37,8 @@ import numpy as np
 import onnx
 from onnx import helper
 
-from qairt_agent.vectors import VectorManifest, VectorPreparer, sha256_file
+from qairt_agent.families.inspector import OnnxInspector
+from qairt_agent.vectors import VectorManifest, VectorPreparer, sha256_hex
 
 
 ReferenceSource = Literal["provided_golden", "onnxruntime"]
@@ -44,6 +46,29 @@ ReferenceSource = Literal["provided_golden", "onnxruntime"]
 
 class VectorRetargetError(ValueError):
     """The vector case cannot be proven compatible with the target graph."""
+
+
+class GoldenAbiMismatchError(VectorRetargetError):
+    """A supplied golden exists but does not match the target output ABI."""
+
+
+def onnx_bundle_sha256(model_path: str | os.PathLike[str]) -> str:
+    """Hash the ONNX protobuf and every referenced external-data payload."""
+
+    path = Path(model_path).expanduser().resolve()
+    assets = (path, *OnnxInspector().external_data_paths(path))
+    digest = hashlib.sha256()
+    for asset in assets:
+        resolved = Path(asset).expanduser().resolve()
+        try:
+            identity = resolved.relative_to(path.parent).as_posix()
+        except ValueError:
+            identity = resolved.name
+        digest.update(identity.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(sha256_hex(resolved).encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -554,40 +579,45 @@ def _validate_golden_abi(
     *,
     ar: int,
     cl: int,
+    expected_manifest_sha256: str | None = None,
 ) -> tuple[str, ...]:
     if not manifest.goldens:
         return ()
     outputs_by_name = {item.name: item for item in output_abi}
     unknown = sorted(set(manifest.goldens) - set(outputs_by_name))
     if unknown:
-        raise VectorRetargetError(
+        raise GoldenAbiMismatchError(
             f"provided golden tensors are not target ONNX outputs: {unknown}"
         )
-    values = VectorPreparer.load_tensors(manifest_path, section="goldens")
+    values = VectorPreparer.load_tensors(
+        manifest_path,
+        section="goldens",
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
     for name, value in values.items():
         abi = outputs_by_name[name]
         if np.dtype(value.dtype) != abi.dtype:
-            raise VectorRetargetError(
+            raise GoldenAbiMismatchError(
                 f"golden {name!r} dtype mismatch: manifest={value.dtype}, target={abi.dtype}"
             )
         if value.ndim != len(abi.shape):
-            raise VectorRetargetError(
+            raise GoldenAbiMismatchError(
                 f"golden {name!r} rank mismatch: manifest={value.ndim}, "
                 f"target={len(abi.shape)}"
             )
         for axis, (actual, declared) in enumerate(zip(value.shape, abi.shape)):
             if isinstance(declared, int) and actual != declared:
-                raise VectorRetargetError(
+                raise GoldenAbiMismatchError(
                     f"golden {name!r} axis {axis} mismatch: manifest={actual}, "
                     f"target={declared}"
                 )
             kind = _symbol_kind(declared if isinstance(declared, str) else None)
             if kind == "ar" and actual != ar:
-                raise VectorRetargetError(
+                raise GoldenAbiMismatchError(
                     f"golden {name!r} axis {axis} proves AR={actual}, expected {ar}"
                 )
             if kind == "cl" and actual != cl:
-                raise VectorRetargetError(
+                raise GoldenAbiMismatchError(
                     f"golden {name!r} axis {axis} proves CL={actual}, expected {cl}"
                 )
     return tuple(sorted(values))
@@ -665,13 +695,14 @@ def validate_provided_ar_manifest(
         outputs_abi,
         ar=ar,
         cl=cl,
+        expected_manifest_sha256=expected_manifest_sha256,
     )
     return ValidatedArManifest(
         manifest_path=source_path,
-        manifest_sha256=sha256_file(source_path),
+        manifest_sha256=sha256_hex(source_path),
         manifest=manifest,
         target_onnx_path=target_path,
-        target_onnx_sha256=sha256_file(target_path),
+        target_onnx_sha256=onnx_bundle_sha256(target_path),
         family=policy.canonical_name,
         ar=ar,
         cl=cl,
@@ -714,8 +745,8 @@ def retarget_vector_manifest(
         source_manifest_path,
         expected_sha256=expected_source_manifest_sha256,
     )
-    source_manifest_sha256 = sha256_file(source_path)
-    target_onnx_sha256 = sha256_file(target_path)
+    source_manifest_sha256 = sha256_hex(source_path)
+    target_onnx_sha256 = onnx_bundle_sha256(target_path)
     source_inputs = VectorPreparer.load_tensors(
         source_path,
         section="inputs",
@@ -944,11 +975,13 @@ def retarget_vector_manifest(
 
 
 __all__ = [
+    "GoldenAbiMismatchError",
     "OnnxTensorAbi",
     "ReferenceSource",
     "ValidatedArManifest",
     "VectorRetargetError",
     "inspect_onnx_abi",
+    "onnx_bundle_sha256",
     "retarget_vector_manifest",
     "validate_provided_ar_manifest",
 ]

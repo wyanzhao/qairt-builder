@@ -9,17 +9,60 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import json
 import os
 import re
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
+from qairt_agent.artifacts import sha256_file as _artifact_sha256_file
+
 VECTOR_MANIFEST_SCHEMA = "qairt-agent.vector-manifest"
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort directory sync after an atomic rename."""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    try:
+        directory_fd = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _atomic_write(destination: Path, data: bytes) -> None:
+    """Write *data* to *destination* atomically with fsync."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=destination.name + ".",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_path, destination)
+        _fsync_directory(destination.parent)
+    except BaseException:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
 
 
 def _path_from_value(value: Any) -> Path:
@@ -30,14 +73,10 @@ def _path_from_value(value: Any) -> Path:
     raise TypeError(f"Expected a path or artifact-like object, got {type(value).__name__}")
 
 
-def sha256_file(path: str | os.PathLike[str] | Any) -> str:
-    """Return the SHA256 of *path* without loading the whole file in memory."""
+def sha256_hex(path: str | os.PathLike[str] | Any) -> str:
+    """Return the shared, memoized artifact SHA256 for vector callers."""
 
-    digest = hashlib.sha256()
-    with _path_from_value(path).open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    return _artifact_sha256_file(_path_from_value(path))[0]
 
 
 def _json_bytes(value: Mapping[str, Any]) -> bytes:
@@ -198,7 +237,7 @@ class VectorPreparer:
 
     @staticmethod
     def manifest_sha256(path: str | os.PathLike[str]) -> str:
-        return sha256_file(path)
+        return sha256_hex(path)
 
     @staticmethod
     def load_manifest(
@@ -207,22 +246,30 @@ class VectorPreparer:
         manifest_path = _path_from_value(path)
         if expected_sha256 is None and hasattr(path, "sha256"):
             expected_sha256 = str(getattr(path, "sha256"))
+        payload = manifest_path.read_bytes()
         if expected_sha256 is not None:
-            actual_sha256 = sha256_file(manifest_path)
+            actual_sha256 = hashlib.sha256(payload).hexdigest()
             if actual_sha256 != expected_sha256:
                 raise ValueError(
                     f"Vector manifest SHA256 mismatch: expected {expected_sha256}, got {actual_sha256}"
                 )
-        with manifest_path.open("r", encoding="utf-8") as stream:
-            data = json.load(stream)
+        data = json.loads(payload)
         return VectorManifest.from_dict(data)
 
     @staticmethod
     def _resolve_tensor_path(manifest_path: Path, record: TensorRecord) -> Path:
         tensor_path = Path(record.path)
-        if not tensor_path.is_absolute():
-            tensor_path = manifest_path.parent / tensor_path
-        return tensor_path.resolve()
+        if tensor_path.is_absolute():
+            raise ValueError(
+                f"Tensor path must be relative to the vector case: {record.path!r}"
+            )
+        case_root = manifest_path.parent.resolve()
+        resolved = (case_root / tensor_path).resolve()
+        if not resolved.is_relative_to(case_root):
+            raise ValueError(
+                f"Tensor path escapes the vector case directory: {record.path!r}"
+            )
+        return resolved
 
     @classmethod
     def load_tensors(
@@ -244,19 +291,27 @@ class VectorPreparer:
         tensors: dict[str, np.ndarray] = {}
         for name, record in records.items():
             tensor_path = cls._resolve_tensor_path(path, record)
-            if verify:
-                actual_sha256 = sha256_file(tensor_path)
-                if actual_sha256 != record.sha256:
-                    raise ValueError(
-                        f"Tensor {name!r} SHA256 mismatch: expected {record.sha256}, got {actual_sha256}"
-                    )
 
             dtype = np.dtype(record.dtype)
             expected_items = int(np.prod(record.shape, dtype=np.int64))
             if record.storage == "raw":
-                tensor = np.fromfile(tensor_path, dtype=dtype)
+                raw_bytes = tensor_path.read_bytes()
+                if verify:
+                    actual_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+                    if actual_sha256 != record.sha256:
+                        raise ValueError(
+                            f"Tensor {name!r} SHA256 mismatch: expected {record.sha256}, got {actual_sha256}"
+                        )
+                tensor = np.frombuffer(raw_bytes, dtype=dtype)
             elif record.storage == "npy":
-                tensor = np.load(tensor_path, allow_pickle=False)
+                raw_bytes = tensor_path.read_bytes()
+                if verify:
+                    actual_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+                    if actual_sha256 != record.sha256:
+                        raise ValueError(
+                            f"Tensor {name!r} SHA256 mismatch: expected {record.sha256}, got {actual_sha256}"
+                        )
+                tensor = np.load(io.BytesIO(raw_bytes), allow_pickle=False)
                 if tensor.dtype != dtype:
                     raise ValueError(
                         f"Tensor {name!r} dtype mismatch: manifest={dtype}, file={tensor.dtype}"
@@ -273,7 +328,9 @@ class VectorPreparer:
                 raise ValueError(
                     f"Tensor {name!r} byte-size mismatch: expected {record.nbytes}, got {tensor.nbytes}"
                 )
-            tensors[name] = tensor
+            # ``frombuffer`` over immutable bytes is read-only.  Return owned
+            # arrays so downstream SDK adapters can normalize in place.
+            tensors[name] = tensor.copy()
         return tensors
 
     def _source_to_array(self, value: Any) -> tuple[np.ndarray, str | None]:
@@ -326,12 +383,10 @@ class VectorPreparer:
         destination = section_dir / f"{_safe_name(name)}-{content_sha256[:12]}.raw"
 
         if destination.exists():
-            if sha256_file(destination) != content_sha256:
+            if sha256_hex(destination) != content_sha256:
                 raise FileExistsError(f"Refusing to replace conflicting tensor artifact {destination}")
         else:
-            temporary = destination.with_suffix(destination.suffix + ".tmp")
-            temporary.write_bytes(raw_bytes)
-            os.replace(temporary, destination)
+            _atomic_write(destination, raw_bytes)
 
         return TensorRecord(
             name=name,
@@ -353,9 +408,7 @@ class VectorPreparer:
             if path.read_bytes() == payload:
                 return path
             raise FileExistsError(f"Refusing to replace immutable vector manifest {path}")
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_bytes(payload)
-        os.replace(temporary, path)
+        _atomic_write(path, payload)
         return path
 
     def prepare_case(
@@ -469,6 +522,8 @@ class VectorPreparer:
         case_dir = source_path.parent
         golden_records = dict(source.goldens)
         for name, value in outputs.items():
+            if name in golden_records:
+                continue
             golden_records[name] = self._store_tensor(case_dir, "goldens", name, value, role="golden")
 
         captured = VectorManifest(
@@ -479,7 +534,7 @@ class VectorPreparer:
                 **dict(source.metadata),
                 **copy.deepcopy(dict(metadata_updates or {})),
             },
-            source_manifest_sha256=sha256_file(source_path),
+            source_manifest_sha256=sha256_hex(source_path),
         )
         return self._write_manifest(case_dir / destination_name, captured)
 
@@ -522,7 +577,7 @@ class VectorPreparer:
                 "reference_model_path": os.fspath(
                     Path(model_path).expanduser().resolve()
                 ),
-                "reference_model_sha256": sha256_file(model_path),
+                "reference_model_sha256": sha256_hex(model_path),
                 "onnxruntime_version": str(getattr(ort, "__version__", "unknown")),
                 "onnxruntime_providers": list(providers),
                 "reference_output_names": list(selected),
@@ -557,7 +612,7 @@ class VectorPreparer:
                 tensor_path = cls._resolve_tensor_path(manifest_path, record)
                 if any(character.isspace() for character in os.fspath(tensor_path)):
                     raise ValueError(f"QAIRT input-list path contains whitespace: {tensor_path}")
-                if sha256_file(tensor_path) != record.sha256:
+                if sha256_hex(tensor_path) != record.sha256:
                     raise ValueError(f"Tensor {name!r} failed SHA256 verification")
                 tokens.append(f"{name}:={tensor_path}")
             lines.append(" ".join(tokens))
@@ -579,5 +634,5 @@ __all__ = [
     "TensorSource",
     "VectorManifest",
     "VectorPreparer",
-    "sha256_file",
+    "sha256_hex",
 ]

@@ -374,17 +374,17 @@ def _content_identity(
                 except (OSError, ValueError):
                     pass
             return value
-        try:
-            path = _resolve_path(value, base_dir)
-            if path.exists() or _is_path_field(key_path):
+        if _is_path_field(key_path):
+            try:
+                path = _resolve_path(value, base_dir)
                 return _path_identity(
                     path,
                     key_path=key_path,
                     expected_sha256=expected_sha256,
                     active_paths=active_paths,
                 )
-        except (OSError, ValueError):
-            pass
+            except (OSError, ValueError):
+                pass
         return value
     if isinstance(value, Mapping):
         normalized: dict[str, Any] = {}
@@ -424,7 +424,11 @@ def _content_identity(
     return str(value)
 
 
-def content_identity(value: Any) -> Any:
+def content_identity(
+    value: Any,
+    *,
+    project_root: str | os.PathLike[str] | None = None,
+) -> Any:
     """Canonicalize config/spec data and replace input paths with byte identities.
 
     Existing files are hashed from their bytes. ONNX files additionally include
@@ -433,10 +437,15 @@ def content_identity(value: Any) -> Any:
     recursively hashed.
     """
 
+    base_dir = (
+        Path(project_root).expanduser().resolve()
+        if project_root is not None
+        else None
+    )
     return _content_identity(
         value,
         key_path=(),
-        base_dir=None,
+        base_dir=base_dir,
         expected_sha256=None,
         active_paths=set(),
     )

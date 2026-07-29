@@ -1,0 +1,44 @@
+{
+  "name": "qwen3-4b-2layer-genai",
+  "preset": "qwen3_5",
+  "sources": {
+    "text": {
+      "onnx": "/models/Qwen3-4B_onnx_w4a16_2layer/model.onnx",
+      "encodings": "/models/Qwen3-4B_onnx_w4a16_2layer/model.encodings",
+      "config_path": "/models/Qwen3-4B_onnx_w4a16_2layer/config.json"
+    }
+  },
+  "sequence": {
+    "ars": [128],
+    "context_lengths": [512],
+    "weight_sharing": false,
+    "native_kv": true
+  },
+  "split": {
+    "embedding_mode": "compiled",
+    "decoder_slice_count": 1,
+    "split_lm_head": false
+  },
+  "vectors": {
+    "mode": "capture"
+  },
+  "stage_configs": {
+    "benchmark": {
+      "prompt": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "attached_models_by_ar": {
+      "128": {
+        "model_path": "/models/Qwen3-4B_onnx_w4a16_2layer/model.onnx",
+        "encodings_path": "/models/Qwen3-4B_onnx_w4a16_2layer/model.encodings"
+      }
+    }
+  },
+  "output_root": "/artifacts/qwen3-4b-2layer-genai"
+}

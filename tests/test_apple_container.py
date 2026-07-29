@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import subprocess
 
 import pytest
+from pydantic import ValidationError
 
 from qairt_agent.apple_container import AppleContainerRunner
 from qairt_agent.docker import WorkerImageConfig, default_mounts
-from qairt_agent.errors import AppleContainerUnavailableError, ErrorCode
+from qairt_agent.errors import (
+    AppleContainerUnavailableError,
+    ErrorCode,
+    WorkerCommandError,
+)
 
 
 class FakeCompleted:
@@ -152,7 +158,7 @@ def test_run_nonzero_is_structured(container_on_path) -> None:
         image=WorkerImageConfig(image_ref="worker:test"),
     )
 
-    with pytest.raises(AppleContainerUnavailableError) as caught:
+    with pytest.raises(WorkerCommandError) as caught:
         runner.run(
             mounts=default_mounts("state", "artifacts", "cache"),
             command=["true"],
@@ -160,6 +166,8 @@ def test_run_nonzero_is_structured(container_on_path) -> None:
 
     error = caught.value.to_tool_error()
     assert error.stage == "apple-container-run"
+    assert error.code == ErrorCode.STAGE_FAILED
+    assert error.retryable is False
     assert error.details["returncode"] == 125
 
 
@@ -279,6 +287,30 @@ def test_sdk_smoke_uses_rosetta_read_only_sdk_and_no_dns(
     ]
 
 
+def test_sdk_smoke_rejects_mount_delimiter_in_sdk_root(tmp_path) -> None:
+    runner = AppleContainerRunner(
+        image=WorkerImageConfig(image_ref="worker:test"),
+    )
+
+    with pytest.raises(ValidationError, match="mount source"):
+        runner.build_sdk_smoke_argv(sdk_root=tmp_path / "sdk,readonly=false")
+
+
+def test_image_inspection_timeout_is_structured() -> None:
+    def timeout(argv: list[str]) -> FakeCompleted:
+        raise subprocess.TimeoutExpired(argv, 8.0)
+
+    runner = AppleContainerRunner(
+        command_executor=timeout,
+        image=WorkerImageConfig(image_ref="worker:test"),
+    )
+
+    with pytest.raises(WorkerCommandError, match="timed out") as excinfo:
+        runner.require_image()
+    assert excinfo.value.retryable is True
+    assert excinfo.value.details["timeout_seconds"] == 8.0
+
+
 def test_wrong_container_cli_version_is_structured(
     container_on_path,
 ) -> None:
@@ -370,3 +402,35 @@ def test_host_adb_alias_must_be_configured() -> None:
     )
     with pytest.raises(AppleContainerUnavailableError):
         false_positive.require_host_alias("host.container.internal")
+
+
+def test_build_run_argv_includes_memory_and_cpus() -> None:
+    runner = AppleContainerRunner(
+        image=WorkerImageConfig(image_ref="worker:test"),
+        host_arch=lambda: "arm64",
+    )
+
+    argv = runner.build_run_argv(
+        mounts=default_mounts("state", "artifacts", "cache"),
+        command=["true"],
+        memory="96G",
+        cpus=8,
+    )
+
+    assert argv[argv.index("-m") + 1] == "96G"
+    assert argv[argv.index("-c") + 1] == "8"
+
+
+def test_build_run_argv_omits_resources_when_unset() -> None:
+    runner = AppleContainerRunner(
+        image=WorkerImageConfig(image_ref="worker:test"),
+        host_arch=lambda: "arm64",
+    )
+
+    argv = runner.build_run_argv(
+        mounts=default_mounts("state", "artifacts", "cache"),
+        command=["true"],
+    )
+
+    assert "-m" not in argv
+    assert "-c" not in argv

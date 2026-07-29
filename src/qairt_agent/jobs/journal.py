@@ -71,6 +71,11 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(tmp, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)
@@ -142,16 +147,42 @@ class JobJournal:
             updated_at=now,
             launcher=launcher or {},
         )
-        journal._commit(
-            status,
-            "job_created",
-            {"job_id": job_id, "parent_job_id": parent_job_id, "spec_sha256": spec_sha256},
-            initial=True,
-        )
+        with journal._fs_lock():
+            journal._commit_locked(
+                status,
+                "job_created",
+                {
+                    "job_id": job_id,
+                    "parent_job_id": parent_job_id,
+                    "spec_sha256": spec_sha256,
+                },
+                initial=True,
+            )
         return journal
 
     @classmethod
     def open(cls, root: str | Path, job_id: str) -> "JobJournal":
+        """Attach for mutation/worker execution and reconcile crash residue."""
+
+        journal = cls(root, job_id)
+        if not (journal._dir / "state.json").exists():
+            raise JobNotFoundError(
+                f"job '{job_id}' not found",
+                stage="journal",
+                details={"job_id": job_id, "path": str(journal._dir)},
+            )
+        with journal._fs_lock():
+            journal._reconcile_locked()
+        return journal
+
+    @classmethod
+    def open_readonly(
+        cls,
+        root: str | Path,
+        job_id: str,
+    ) -> "JobJournal":
+        """Attach for status/event reads without locking or reconciliation."""
+
         journal = cls(root, job_id)
         if not (journal._dir / "state.json").exists():
             raise JobNotFoundError(
@@ -239,12 +270,80 @@ class JobJournal:
     def state(self) -> JobStatus:
         return self._read_state()
 
-    def _next_seq(self) -> int:
-        events_dir = self._dir / "events"
-        seqs = [int(path.stem) for path in events_dir.glob("*.json") if path.stem.isdigit()]
-        return (max(seqs) + 1) if seqs else 1
+    def _event_paths_by_seq(self) -> dict[int, Path]:
+        return {
+            int(path.stem): path
+            for path in (self._dir / "events").glob("*.json")
+            if path.stem.isdigit()
+        }
 
-    def _commit(
+    def _reconcile_locked(self) -> JobStatus:
+        """Repair an event-first interrupted commit and recover receipts."""
+
+        current = self._read_state()
+        event_paths = self._event_paths_by_seq()
+        # State is the transaction commit point.  An event beyond state.seq
+        # was durably written before a crash and is not yet authoritative.
+        removed_tail = False
+        for seq, path in event_paths.items():
+            if seq > current.seq:
+                path.unlink()
+                removed_tail = True
+        if removed_tail:
+            directory_fd = os.open(self._dir / "events", os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        event_paths = self._event_paths_by_seq()
+        missing_events = [
+            seq for seq in range(1, current.seq + 1)
+            if seq not in event_paths
+        ]
+        if missing_events:
+            raise JobConflictError(
+                f"job '{self._job_id}' journal is missing committed events",
+                stage="journal",
+                details={
+                    "job_id": self._job_id,
+                    "state_seq": current.seq,
+                    "missing_sequences": missing_events,
+                },
+            )
+
+        known = {
+            (receipt.stage_key, receipt.attempt)
+            for receipt in current.stages
+        }
+        recovered = [
+            receipt
+            for receipt in self.receipts()
+            if (receipt.stage_key, receipt.attempt) not in known
+        ]
+        if recovered:
+            target = current.model_copy(
+                update={
+                    "stages": current.stages + tuple(recovered),
+                    "current_stage": recovered[-1].stage_name,
+                }
+            )
+            current = self._commit_locked(
+                target,
+                "receipts_recovered",
+                {
+                    "receipts": [
+                        {
+                            "stage_name": item.stage_name,
+                            "stage_key": item.stage_key,
+                            "attempt": item.attempt,
+                        }
+                        for item in recovered
+                    ]
+                },
+            )
+        return current
+
+    def _commit_locked(
         self,
         target: JobStatus,
         event_type: str,
@@ -252,43 +351,56 @@ class JobJournal:
         *,
         initial: bool = False,
     ) -> JobStatus:
-        with self._fs_lock():
-            if not initial:
-                current = self._read_state()
-                if current.state.terminal and target.state != current.state:
-                    raise JobConflictError(
-                        f"cannot transition job '{self._job_id}' out of terminal state "
-                        f"'{current.state.value}'",
-                        stage="journal",
-                        details={"job_id": self._job_id, "state": current.state.value},
-                    )
-                # ``set_state`` prepares its target before entering this lock.
-                # Preserve a heartbeat that won the lock in the meantime.
-                if current.heartbeat_at is not None and (
-                    target.heartbeat_at is None
-                    or current.heartbeat_at > target.heartbeat_at
-                ):
-                    target = target.model_copy(
-                        update={"heartbeat_at": current.heartbeat_at}
-                    )
-            seq = self._next_seq()
-            now = utc_now()
-            final = target.model_copy(update={"seq": seq, "updated_at": now})
-            event = {
-                "seq": seq,
-                "type": event_type,
-                "at": now.isoformat(),
-                "payload": payload,
-            }
-            _atomic_write_json(self._dir / "events" / f"{seq:010d}.json", event)
-            _atomic_write_bytes(
-                self._dir / "state.json",
-                final.model_dump_json(indent=2).encode("utf-8"),
-            )
-            return final
+        current = None if initial else self._read_state()
+        if current is not None:
+            if current.state.terminal and target.state != current.state:
+                raise JobConflictError(
+                    f"cannot transition job '{self._job_id}' out of terminal "
+                    f"state '{current.state.value}'",
+                    stage="journal",
+                    details={
+                        "job_id": self._job_id,
+                        "state": current.state.value,
+                    },
+                )
+            if current.heartbeat_at is not None and (
+                target.heartbeat_at is None
+                or current.heartbeat_at > target.heartbeat_at
+            ):
+                target = target.model_copy(
+                    update={"heartbeat_at": current.heartbeat_at}
+                )
+        seq = 1 if current is None else current.seq + 1
+        now = utc_now()
+        final = target.model_copy(update={"seq": seq, "updated_at": now})
+        event = {
+            "seq": seq,
+            "type": event_type,
+            "at": now.isoformat(),
+            "payload": payload,
+        }
+        _atomic_write_json(
+            self._dir / "events" / f"{seq:010d}.json",
+            event,
+        )
+        _atomic_write_bytes(
+            self._dir / "state.json",
+            final.model_dump_json(indent=2).encode("utf-8"),
+        )
+        return final
 
-    def append_event(self, event_type: str, payload: dict[str, Any] | None = None) -> JobStatus:
-        return self._commit(self._read_state(), event_type, payload or {})
+    def append_event(
+        self,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> JobStatus:
+        with self._fs_lock():
+            current = self._read_state()
+            return self._commit_locked(
+                current,
+                event_type,
+                payload or {},
+            )
 
     def set_state(
         self,
@@ -300,26 +412,44 @@ class JobJournal:
         heartbeat_at: datetime | None = None,
         event_payload: dict[str, Any] | None = None,
     ) -> JobStatus:
-        current = self._read_state()
-        target = JobStatus(
-            job_id=self._job_id,
-            state=state,
-            seq=current.seq,
-            parent_job_id=current.parent_job_id,
-            spec_sha256=current.spec_sha256,
-            created_at=current.created_at,
-            updated_at=current.updated_at,
-            current_stage=current_stage if current_stage is not None else current.current_stage,
-            stages=current.stages,
-            manifest=manifest if manifest is not None else current.manifest,
-            heartbeat_at=heartbeat_at if heartbeat_at is not None else current.heartbeat_at,
-            launcher=current.launcher,
-            error=error,
-        )
-        payload = {"state": state.value, "current_stage": target.current_stage}
-        if event_payload:
-            payload.update(event_payload)
-        return self._commit(target, "state_changed", payload)
+        with self._fs_lock():
+            current = self._read_state()
+            target = JobStatus(
+                job_id=self._job_id,
+                state=state,
+                seq=current.seq,
+                parent_job_id=current.parent_job_id,
+                spec_sha256=current.spec_sha256,
+                created_at=current.created_at,
+                updated_at=current.updated_at,
+                current_stage=(
+                    current_stage
+                    if current_stage is not None
+                    else current.current_stage
+                ),
+                stages=current.stages,
+                manifest=(
+                    manifest if manifest is not None else current.manifest
+                ),
+                heartbeat_at=(
+                    heartbeat_at
+                    if heartbeat_at is not None
+                    else current.heartbeat_at
+                ),
+                launcher=current.launcher,
+                error=error,
+            )
+            payload = {
+                "state": state.value,
+                "current_stage": target.current_stage,
+            }
+            if event_payload:
+                payload.update(event_payload)
+            return self._commit_locked(
+                target,
+                "state_changed",
+                payload,
+            )
 
     def events(self, after_seq: int = 0) -> list[dict[str, Any]]:
         events_dir = self._dir / "events"
@@ -345,35 +475,48 @@ class JobJournal:
         return self._dir / "receipts" / f"{safe_name}-{receipt.stage_key[:16]}-{receipt.attempt:03d}.json"
 
     def record_receipt(self, receipt: StageReceipt) -> JobStatus:
-        path = self._receipt_path(receipt)
-        payload = json.loads(receipt.model_dump_json())
-        if path.exists():
-            existing = json.loads(path.read_text(encoding="utf-8"))
-            if existing != payload:
-                raise JobConflictError(
-                    f"conflicting receipt for stage '{receipt.stage_name}' attempt {receipt.attempt}",
-                    stage="journal",
-                    details={"path": str(path)},
-                )
-        else:
-            _atomic_write_json(path, payload)
+        with self._fs_lock():
+            path = self._receipt_path(receipt)
+            payload = json.loads(receipt.model_dump_json())
+            if path.exists():
+                existing = json.loads(path.read_text(encoding="utf-8"))
+                if existing != payload:
+                    raise JobConflictError(
+                        f"conflicting receipt for stage "
+                        f"'{receipt.stage_name}' attempt {receipt.attempt}",
+                        stage="journal",
+                        details={"path": str(path)},
+                    )
+            else:
+                _atomic_write_json(path, payload)
 
-        current = self._read_state()
-        already = any(
-            r.stage_key == receipt.stage_key and r.attempt == receipt.attempt for r in current.stages
-        )
-        stages = current.stages if already else current.stages + (receipt,)
-        target = current.model_copy(update={"stages": stages, "current_stage": receipt.stage_name})
-        return self._commit(
-            target,
-            "stage_receipt",
-            {
-                "stage_name": receipt.stage_name,
-                "stage_key": receipt.stage_key,
-                "attempt": receipt.attempt,
-                "status": receipt.status.value,
-            },
-        )
+            current = self._read_state()
+            already = any(
+                item.stage_key == receipt.stage_key
+                and item.attempt == receipt.attempt
+                for item in current.stages
+            )
+            stages = (
+                current.stages
+                if already
+                else current.stages + (receipt,)
+            )
+            target = current.model_copy(
+                update={
+                    "stages": stages,
+                    "current_stage": receipt.stage_name,
+                }
+            )
+            return self._commit_locked(
+                target,
+                "stage_receipt",
+                {
+                    "stage_name": receipt.stage_name,
+                    "stage_key": receipt.stage_key,
+                    "attempt": receipt.attempt,
+                    "status": receipt.status.value,
+                },
+            )
 
     def receipts(self) -> list[StageReceipt]:
         receipts_dir = self._dir / "receipts"

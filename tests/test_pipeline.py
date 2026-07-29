@@ -9,7 +9,9 @@ from typing import Any, Mapping
 
 import numpy as np
 import onnx
+import pytest
 from onnx import TensorProto, helper
+from pydantic import ValidationError
 
 from qairt_agent.artifacts import ManifestStore, verify_artifact
 from qairt_agent.contracts import (
@@ -249,7 +251,7 @@ class FakeAdapter:
             sdk_build_id="260626120635",
             target_soc="SM8850",
             dsp_arch="v81",
-            soc_model=660,
+            soc_model=87,
         )
 
     def create_calibration_config(self, **kwargs: Any) -> dict[str, Any]:
@@ -341,7 +343,7 @@ class FakeAdapter:
                     ar_values=(1, 128),
                     target_soc="SM8850",
                     dsp_arch="v81",
-                    soc_model=660,
+                    soc_model=87,
                     weight_sharing=True,
                     native_kv_config_path=native_kv,
                     context_length=4096,
@@ -392,7 +394,7 @@ class FakeAdapter:
                     ar_values=(1,),
                     target_soc="SM8850",
                     dsp_arch="v81",
-                    soc_model=660,
+                    soc_model=87,
                     weight_sharing=False,
                     native_kv_config_path=None,
                 ),
@@ -481,7 +483,7 @@ class FakeAdapter:
             split_lm_head=True,
             target_soc="SM8850",
             dsp_arch="v81",
-            soc_model=660,
+            soc_model=87,
             weight_sharing=True,
             native_kv=True,
             runtime_supported=True,
@@ -546,7 +548,7 @@ class FakeAdapter:
             split_lm_head=True,
             target_soc="SM8850",
             dsp_arch="v81",
-            soc_model=660,
+            soc_model=87,
             weight_sharing=True,
             native_kv=True,
             runtime_supported=False,
@@ -846,7 +848,7 @@ class FakeVlAdapter(FakeAdapter):
                     ar_values=(1,),
                     target_soc="SM8850",
                     dsp_arch="v81",
-                    soc_model=660,
+                    soc_model=87,
                     weight_sharing=False,
                     native_kv_config_path=None,
                     context_length=None,
@@ -960,7 +962,7 @@ class FakeQualityModesAdapter(FakeAdapter):
                     ar_values=(1,),
                     target_soc="SM8850",
                     dsp_arch="v81",
-                    soc_model=660,
+                    soc_model=87,
                     weight_sharing=False,
                     native_kv_config_path=None,
                     context_length=4096,
@@ -972,7 +974,7 @@ class FakeQualityModesAdapter(FakeAdapter):
                     ar_values=(1,),
                     target_soc="SM8850",
                     dsp_arch="v81",
-                    soc_model=660,
+                    soc_model=87,
                     weight_sharing=False,
                     native_kv_config_path=None,
                     context_length=4096,
@@ -1033,7 +1035,7 @@ class FakeQualityModesAdapter(FakeAdapter):
                     ar_values=(1,),
                     target_soc="SM8850",
                     dsp_arch="v81",
-                    soc_model=660,
+                    soc_model=87,
                     weight_sharing=False,
                     native_kv_config_path=None,
                     context_length=4096,
@@ -1045,7 +1047,7 @@ class FakeQualityModesAdapter(FakeAdapter):
                     ar_values=(1,),
                     target_soc="SM8850",
                     dsp_arch="v81",
-                    soc_model=660,
+                    soc_model=87,
                     weight_sharing=False,
                     native_kv_config_path=None,
                     context_length=4096,
@@ -1488,29 +1490,23 @@ def test_low_level_multi_ar_build_fails_closed_when_one_vector_is_missing(
         goldens={"y": np.array([1.0], dtype=np.float32)},
         case_id="only-ar1",
     )
-    spec = _make_spec(
-        tmp_path,
-        vectors={
-            "mode": "provided",
-            "validation_manifests_by_ar": {1: ar1_vectors},
-        },
-        sequence={
-            "ars": [1, 128],
-            "context_lengths": [4096],
-            "weight_sharing": True,
-            "native_kv": False,
-        },
-    )
-
-    built = _fake_agent(MultiArFakeAdapterFactory()).build(spec)
-
-    assert not built.ok
-    assert built.error is not None
-    assert built.error.code is ErrorCode.INVALID_SPEC
-    assert built.error.stage == "build"
-    assert "no validation vector manifest is available for AR128" in (
-        built.error.message
-    )
+    with pytest.raises(
+        ValidationError,
+        match="validation_manifests_by_ar is missing requested sequence.ars",
+    ):
+        _make_spec(
+            tmp_path,
+            vectors={
+                "mode": "provided",
+                "validation_manifests_by_ar": {1: ar1_vectors},
+            },
+            sequence={
+                "ars": [1, 128],
+                "context_lengths": [4096],
+                "weight_sharing": True,
+                "native_kv": False,
+            },
+        )
 
 
 def test_explicit_ar_override_keeps_single_ar_followups(
@@ -1675,6 +1671,95 @@ def test_validate_executes_all_requested_sqnr_modes_with_reference_slice_chain(
     ]
     assert len(slice1_inputs) == 2
     assert sorted(float(value[0]) for value in slice1_inputs) == [2.0, 3.0]
+
+
+def test_full_reference_only_divergence_sets_aggregate_flag(
+    tmp_path: Path,
+) -> None:
+    vectors = _vector_case(
+        tmp_path,
+        inputs={"x": np.array([2.0], dtype=np.float32)},
+        goldens={"y": np.array([99.0], dtype=np.float32)},
+        case_id="full-reference-only",
+    )
+    spec = _make_spec(
+        tmp_path,
+        vectors={
+            "mode": "provided",
+            "validation_manifest": vectors,
+        },
+        sequence={
+            "ars": [1, 128],
+            "context_lengths": [4096],
+            "weight_sharing": True,
+            "native_kv": False,
+        },
+        quality={"sqnr_modes": ["full_reference"]},
+    )
+    agent = _fake_agent(MultiArFakeAdapterFactory())
+
+    built = agent.build(spec)
+    assert built.ok and built.manifest is not None
+    validated = agent.validate(
+        built.manifest.path,
+        built.manifest.sha256,
+    )
+
+    assert validated.ok, validated.error
+    assert validated.data is not None
+    assert {
+        tuple(result["report"]["executed_modes"])
+        for result in validated.data["results_by_ar"].values()
+    } == {("full_reference",)}
+    assert validated.data["divergence_observed"] is True
+
+
+def test_teacher_chain_only_without_goldens_fails_at_reference_gate(
+    tmp_path: Path,
+) -> None:
+    vectors = VectorPreparer(tmp_path / "vectors").prepare_case(
+        "teacher-chain-no-goldens",
+        {"x": np.array([2.0], dtype=np.float32)},
+    )
+    spec = _make_spec(
+        tmp_path,
+        vectors={
+            "mode": "provided",
+            "validation_manifest": vectors,
+        },
+        sequence={
+            "ars": [1],
+            "context_lengths": [4096],
+            "weight_sharing": False,
+            "native_kv": False,
+        },
+        quality={"sqnr_modes": ["teacher_forced", "chain"]},
+    )
+    agent = _fake_agent(FakeAdapterFactory())
+    built = agent.build(spec)
+    assert built.ok and built.manifest is not None
+
+    failed = agent.validate(
+        built.manifest.path,
+        built.manifest.sha256,
+        config={
+            "context_path": str(tmp_path / "single.bin"),
+            "graph_name": "decoder_ar1",
+            "vector_manifest": str(vectors),
+            "context_length": 4096,
+            "ar": 1,
+        },
+    )
+
+    assert not failed.ok
+    assert failed.error is not None
+    assert failed.error.stage == "validate"
+    assert "slice-level reference manifests" in failed.error.message
+    assert failed.error.details["requested_modes"] == [
+        "teacher_forced",
+        "chain",
+    ]
+    assert "empty reports are forbidden" not in failed.error.message
 
 
 def test_teacher_forced_auto_capture_fails_closed_with_missing_slice_models(
@@ -3002,6 +3087,31 @@ def test_compile_context_forwards_strict_inputs_and_same_parent_retry_reuses(
     assert retried.data is not None and retried.data["reused"] is True
     assert factory.log.instances == instance_count
     assert len(factory.log.calls) == call_count
+
+
+def test_compile_context_requires_authoritative_graph_names(
+    tmp_path: Path,
+) -> None:
+    factory = FakeAdapterFactory()
+    agent = _fake_agent(factory)
+    plan = agent.plan(_make_spec(tmp_path), offline=True)
+    assert plan.manifest is not None
+    model = _write(tmp_path / "models" / "ar1.dlc", b"ar1")
+
+    result = agent.compile_context(
+        plan.manifest.path,
+        plan.manifest.sha256,
+        config={
+            "models": [model],
+            "ar_values": [1],
+        },
+    )
+
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code is ErrorCode.INVALID_SPEC
+    assert "explicit graph_names" in result.error.message
+    assert "compile_context" not in factory.log.names()
 
 
 def test_compile_context_rejects_json_reconstructed_qwen35_evidence(

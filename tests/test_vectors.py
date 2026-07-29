@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import json
 
 import numpy as np
 import pytest
@@ -87,6 +88,31 @@ def test_capture_reference_publishes_new_manifest(tmp_path: Path) -> None:
     )
 
 
+def test_capture_reference_never_overwrites_supplied_golden(tmp_path: Path) -> None:
+    preparer = VectorPreparer(tmp_path / "vectors")
+    supplied = np.array([7.0, 8.0], dtype=np.float32)
+    manifest_path = preparer.prepare_case(
+        "capture-preserves-golden",
+        {"x": np.array([1.0, 2.0], dtype=np.float32)},
+        goldens={"y": supplied},
+    )
+
+    captured_path = preparer.capture_reference(
+        manifest_path,
+        lambda inputs: {
+            "y": np.array([-1.0, -1.0], dtype=np.float32),
+            "z": inputs["x"] * 3,
+        },
+    )
+    goldens = preparer.load_tensors(captured_path, section="goldens")
+
+    np.testing.assert_array_equal(goldens["y"], supplied)
+    np.testing.assert_array_equal(
+        goldens["z"],
+        np.array([3.0, 6.0], dtype=np.float32),
+    )
+
+
 def test_raw_source_requires_shape_and_dtype(tmp_path: Path) -> None:
     raw_path = tmp_path / "x.raw"
     raw_path.write_bytes(b"\x00\x01")
@@ -105,3 +131,50 @@ def test_manifest_loader_accepts_artifact_like_object(tmp_path: Path) -> None:
     )
 
     assert preparer.load_manifest(artifact).case_id == "artifact-ref"
+
+
+@pytest.mark.parametrize("record_path", ["../outside.raw", "/tmp/outside.raw"])
+def test_tensor_paths_cannot_escape_vector_case(
+    tmp_path: Path,
+    record_path: str,
+) -> None:
+    case = tmp_path / "case"
+    case.mkdir()
+    outside = tmp_path / "outside.raw"
+    outside.write_bytes(np.array([1], dtype=np.int32).tobytes())
+    manifest = {
+        "schema": "qairt-agent.vector-manifest",
+        "case_id": "escape",
+        "inputs": {
+            "x": {
+                "name": "x",
+                "path": record_path,
+                "dtype": "int32",
+                "shape": [1],
+                "sha256": "0" * 64,
+                "nbytes": 4,
+                "storage": "raw",
+                "byte_order": "little",
+            }
+        },
+        "goldens": {},
+        "metadata": {},
+    }
+    manifest_path = case / "vector_manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="relative|escapes"):
+        VectorPreparer.load_tensors(manifest_path)
+
+
+def test_loaded_raw_tensors_are_writable(tmp_path: Path) -> None:
+    preparer = VectorPreparer(tmp_path / "vectors")
+    manifest_path = preparer.prepare_case(
+        "writable",
+        {"x": np.array([1], dtype=np.int32)},
+    )
+
+    loaded = preparer.load_tensors(manifest_path)["x"]
+    loaded[0] = 2
+
+    assert loaded.tolist() == [2]

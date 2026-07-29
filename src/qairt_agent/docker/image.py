@@ -36,8 +36,9 @@ PINNED_PYTHON = DEFAULT_CONSTRAINTS.python_version
 #: emulate it.
 DEFAULT_PLATFORM = DEFAULT_CONSTRAINTS.platform
 
-# Container-side mount targets.  Sources are logical (relative paths or named
-# volumes) so the plan is host-independent; targets are fixed by the worker.
+# Container-side mount targets.  Sources may be logical volume names or host
+# paths (including absolute paths supplied by the CLI); targets are fixed by
+# the worker.
 SDK_MOUNT_TARGET = "/opt/qairt"
 WORKSPACE_MOUNT_TARGET = "/workspace"
 MODELS_MOUNT_TARGET = "/models"
@@ -52,6 +53,20 @@ WORKER_PYTHONPATH = (
 
 #: Host architectures that run the amd64 worker natively (no emulation).
 _NATIVE_AMD64_ARCHES = frozenset({"x86_64", "amd64"})
+_MOUNT_DELIMITERS = (":", ",", "=")
+
+
+def _validate_mount_value(value: str, *, label: str) -> str:
+    """Reject values that can change Docker or Apple mount field parsing."""
+
+    if not value:
+        raise ValueError(f"{label} cannot be blank")
+    for char in _MOUNT_DELIMITERS:
+        if char in value:
+            raise ValueError(
+                f"{label} must not contain {char!r}: {value!r}"
+            )
+    return value
 
 
 class WorkerImageConfig(FrozenContract):
@@ -88,10 +103,9 @@ class WorkerImageConfig(FrozenContract):
 class RuntimeMounts(FrozenContract):
     """The runtime mount plan for one container invocation.
 
-    Sources are logical (relative host paths or named volumes), never
-    host-absolute, so the plan stays portable.  The SDK and workspace are
-    mounted read-only; the state, artifacts, and cache volumes are read-write
-    and are provided by the caller.
+    Sources may be relative host paths, absolute host paths, or named volumes.
+    The SDK and workspace are mounted read-only; the state, artifacts, and cache
+    volumes are read-write and are provided by the caller.
     """
 
     sdk_root: str = "./qnn/qnn"
@@ -102,6 +116,24 @@ class RuntimeMounts(FrozenContract):
     jobs_volume: str | None = None
     models_root: str | None = None
     compatibility_mounts: tuple["BindMount", ...] = ()
+
+    @field_validator(
+        "sdk_root",
+        "workspace",
+        "state_volume",
+        "artifacts_volume",
+        "cache_volume",
+        "jobs_volume",
+        "models_root",
+    )
+    @classmethod
+    def sources_have_no_mount_delimiters(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+        return _validate_mount_value(value, label="mount source")
 
     def to_docker_args(self) -> list[str]:
         """Render the mount plan as ``docker run -v`` arguments.
@@ -176,12 +208,17 @@ class BindMount(FrozenContract):
     target: str
     read_only: bool = False
 
+    @field_validator("source")
+    @classmethod
+    def source_has_no_delimiters(cls, value: str) -> str:
+        return _validate_mount_value(value, label="mount source")
+
     @field_validator("target")
     @classmethod
     def target_is_absolute(cls, value: str) -> str:
         if not value.startswith("/"):
             raise ValueError("container mount target must be absolute")
-        return value
+        return _validate_mount_value(value, label="mount target")
 
 
 def default_mounts(

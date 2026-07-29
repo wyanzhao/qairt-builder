@@ -316,7 +316,7 @@ logs/worker-launch.log detached-runtime startup stdout/stderr
   then accepts it only after an import smoke test against the read-only mounted SDK. Run
   `qairt-agent image smoke --root .` to repeat that gate without rebuilding.
 - `doctor` verifies SDK metadata, QAIRT 2.48 capability, Ubuntu/x86_64 ABI, and
-  the `SM8850/v81/soc_model 660` target. On a host without the SDK or selected
+  the `SM8850/v81/soc_model 87` target. On a host without the SDK or selected
   runtime it reports those checks as failing rather than silently passing.
 - Both runtimes use the same Ubuntu 22.04 / Python 3.10 / `linux/amd64`
   image. The SDK, models, and artifacts are mounted, never baked into the

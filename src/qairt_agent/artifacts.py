@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import tempfile
+from collections import OrderedDict
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -88,28 +89,70 @@ def canonical_json_bytes(payload: BaseModel | Mapping[str, Any] | list[Any]) -> 
     return (serialized + "\n").encode("utf-8")
 
 
-def sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> tuple[str, int]:
-    """Return the SHA256 and byte size of a file."""
+def sha256_file(
+    path: str | Path,
+    *,
+    chunk_size: int = 1024 * 1024,
+    use_cache: bool = True,
+) -> tuple[str, int]:
+    """Return the SHA256 and byte size of a file.
 
-    resolved = Path(path)
+    With ``use_cache=True``, results are memoized per-process by resolved path,
+    size, and ``mtime_ns`` to avoid repeatedly reading large unchanged build
+    inputs. This mode is an optimization for stage-key/input discovery and
+    deliberately trusts filesystem metadata. Evidence verification calls use
+    ``use_cache=False`` or hash the exact bytes they parse.
+    """
+
+    resolved = Path(path).expanduser().resolve()
     if not resolved.is_file():
         raise ArtifactNotFoundError(
             f"artifact does not exist or is not a file: {resolved}",
             details={"path": str(resolved)},
         )
+    stat = resolved.stat()
+    cache_key = (str(resolved), stat.st_size, stat.st_mtime_ns)
+    cached = _SHA256_CACHE.get(cache_key) if use_cache else None
+    if cached is not None:
+        _SHA256_CACHE.move_to_end(cache_key)
+        return cached
     digest = hashlib.sha256()
     size_bytes = 0
     with resolved.open("rb") as stream:
         while chunk := stream.read(chunk_size):
             digest.update(chunk)
             size_bytes += len(chunk)
-    return digest.hexdigest(), size_bytes
+    after = resolved.stat()
+    if (
+        after.st_size != stat.st_size
+        or after.st_mtime_ns != stat.st_mtime_ns
+    ):
+        raise ArtifactIntegrityError(
+            f"artifact changed while hashing: {resolved}",
+            details={"path": str(resolved)},
+        )
+    result = (digest.hexdigest(), size_bytes)
+    if use_cache:
+        _SHA256_CACHE[cache_key] = result
+        _SHA256_CACHE.move_to_end(cache_key)
+        while len(_SHA256_CACHE) > _SHA256_CACHE_MAX_ENTRIES:
+            _SHA256_CACHE.popitem(last=False)
+    return result
+
+
+# Process-level memoization for sha256_file.  The contract requires "verify
+# before reuse" — not "re-hash the same unchanged content six times per build".
+_SHA256_CACHE_MAX_ENTRIES = 4096
+_SHA256_CACHE: OrderedDict[
+    tuple[str, int, int],
+    tuple[str, int],
+] = OrderedDict()
 
 
 def verify_artifact(ref: ArtifactRef) -> None:
     """Raise when a referenced artifact is missing, resized, or rehashed."""
 
-    actual_sha256, actual_size = sha256_file(ref.path)
+    actual_sha256, actual_size = sha256_file(ref.path, use_cache=False)
     if actual_sha256 != ref.sha256 or actual_size != ref.size_bytes:
         raise ArtifactIntegrityError(
             f"artifact integrity check failed: {ref.path}",
@@ -121,6 +164,32 @@ def verify_artifact(ref: ArtifactRef) -> None:
                 "actual_size_bytes": actual_size,
             },
         )
+
+
+def _read_verified_bytes(ref: ArtifactRef) -> bytes:
+    """Read once, then verify and return the exact bytes that were hashed."""
+
+    try:
+        payload = ref.path.read_bytes()
+    except OSError as exc:
+        raise ArtifactNotFoundError(
+            f"artifact cannot be read: {ref.path}",
+            details={"path": str(ref.path), "reason": str(exc)},
+        ) from exc
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    actual_size = len(payload)
+    if actual_sha256 != ref.sha256 or actual_size != ref.size_bytes:
+        raise ArtifactIntegrityError(
+            f"artifact integrity check failed: {ref.path}",
+            details={
+                "path": str(ref.path),
+                "expected_sha256": ref.sha256,
+                "actual_sha256": actual_sha256,
+                "expected_size_bytes": ref.size_bytes,
+                "actual_size_bytes": actual_size,
+            },
+        )
+    return payload
 
 
 def _fsync_directory(path: Path) -> None:
@@ -159,7 +228,10 @@ def atomic_publish_json(
     expected_sha256 = hashlib.sha256(data).hexdigest()
 
     if destination.exists():
-        existing_sha256, existing_size = sha256_file(destination)
+        existing_sha256, existing_size = sha256_file(
+            destination,
+            use_cache=False,
+        )
         if existing_sha256 == expected_sha256 and existing_size == len(data):
             return ArtifactRef(
                 path=destination,
@@ -329,9 +401,8 @@ class ManifestStore:
                 "artifact is not declared as a manifest",
                 details={"path": str(ref.path), "kind": ref.kind.value},
             )
-        verify_artifact(ref)
         try:
-            return RunManifest.model_validate_json(ref.path.read_bytes())
+            return RunManifest.model_validate_json(_read_verified_bytes(ref))
         except (OSError, ValidationError, ValueError) as exc:
             raise ManifestInvalidError(
                 f"invalid run manifest: {ref.path}",
@@ -484,12 +555,14 @@ def verify_manifest_graph(ref: ArtifactRef) -> tuple[ArtifactRef, ...]:
         if key in seen:
             return
         seen.add(key)
-        verify_artifact(artifact)
         discovered.append(artifact)
         if artifact.kind is not ArtifactKind.MANIFEST:
+            verify_artifact(artifact)
             return
         try:
-            manifest = RunManifest.model_validate_json(artifact.path.read_bytes())
+            manifest = RunManifest.model_validate_json(
+                _read_verified_bytes(artifact)
+            )
         except (OSError, ValidationError, ValueError) as exc:
             raise ManifestInvalidError(
                 f"invalid run manifest: {artifact.path}",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib
 import os
 import platform
 import re
@@ -137,6 +138,7 @@ class PreflightChecker:
         python_version: tuple[int, int] | None = None,
         os_release_reader: Callable[[], Mapping[str, str]] = _read_os_release,
         constraints: HarnessConstraints | None = None,
+        soc_details_resolver: Callable[[str, str], Any] | None = None,
     ) -> None:
         self._environ = environ if environ is not None else os.environ
         self._system = system
@@ -148,6 +150,20 @@ class PreflightChecker:
         # project-owned harness through QAIRT_AGENT_HARNESS_CONSTRAINTS just
         # like detached container workers do.
         self._constraints = constraints or load_harness_constraints()
+        self._soc_details_resolver = soc_details_resolver
+
+    def _resolve_sdk_soc_details(self) -> Any | None:
+        resolver = self._soc_details_resolver
+        if resolver is None:
+            try:
+                module = importlib.import_module(
+                    "qti.aisw.tools.core.utilities.devices.api."
+                    "device_factory"
+                )
+                resolver = module.DeviceFactory.get_device_soc_details
+            except (ImportError, AttributeError):
+                return None
+        return resolver("HTP", self._constraints.target_chipset)
 
     def check(self, spec: Any) -> PreflightReport:
         issues: list[PreflightIssue] = []
@@ -311,6 +327,66 @@ class PreflightChecker:
                             f"got {mapped_arch or '<missing>'}",
                         )
                     )
+
+            try:
+                sdk_soc_details = self._resolve_sdk_soc_details()
+            except Exception as exc:  # noqa: BLE001 - report as preflight issue
+                issues.append(
+                    PreflightIssue(
+                        "sdk.soc_details_unavailable",
+                        "DeviceFactory.get_device_soc_details could not resolve "
+                        f"{constraints.target_chipset}: {exc}",
+                    )
+                )
+            else:
+                if sdk_soc_details is None:
+                    issues.append(
+                        PreflightIssue(
+                            "sdk.soc_details_unverified",
+                            "QAIRT DeviceFactory Python API is unavailable; "
+                            f"{constraints.target_chipset} soc_model and "
+                            "dsp_arch could not be cross-checked",
+                            IssueSeverity.WARNING,
+                        )
+                    )
+                else:
+                    observed_model = _read(sdk_soc_details, "model")
+                    observed_arch = _read(sdk_soc_details, "dsp_arch")
+                    try:
+                        observed_model_value = int(observed_model)
+                    except (TypeError, ValueError):
+                        observed_model_value = None
+                    observed_arch_value = str(
+                        getattr(observed_arch, "value", observed_arch)
+                    ).lower().removeprefix("v")
+                    expected_arch_value = (
+                        constraints.target_dsp_arch.lower().removeprefix("v")
+                    )
+                    if (
+                        observed_model_value
+                        != constraints.target_soc_model
+                    ):
+                        issues.append(
+                            PreflightIssue(
+                                "sdk.soc_model_map",
+                                "DeviceFactory reports "
+                                f"soc_model={observed_model!r} for "
+                                f"{constraints.target_chipset}, but the "
+                                "harness pins "
+                                f"{constraints.target_soc_model}",
+                            )
+                        )
+                    if observed_arch_value != expected_arch_value:
+                        issues.append(
+                            PreflightIssue(
+                                "sdk.dsp_arch_map",
+                                "DeviceFactory reports "
+                                f"dsp_arch={observed_arch!r} for "
+                                f"{constraints.target_chipset}, but the "
+                                "harness pins "
+                                f"{constraints.target_dsp_arch}",
+                            )
+                        )
 
         if target_soc != constraints.target_chipset:
             issues.append(

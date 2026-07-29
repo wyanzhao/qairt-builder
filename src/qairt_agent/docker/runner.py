@@ -18,7 +18,14 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
+from qairt_agent.container_runner import (
+    WorkerRunnerMixin,
+    execute_command,
+    harness_build_args,
+    harness_build_path,
+)
 from qairt_agent.docker.image import (
+    BindMount,
     DEFAULT_IMAGE_REF,
     DEFAULT_PLATFORM,
     DockerImageConfig,
@@ -28,26 +35,48 @@ from qairt_agent.docker.image import (
 from qairt_agent.errors import DockerUnavailableError
 from qairt_agent.harness import (
     DEFAULT_CONSTRAINTS,
-    DEFAULT_CONSTRAINTS_LOGICAL_PATH,
     HarnessConstraints,
     parse_version,
 )
 
 CommandExecutor = Callable[[list[str]], Any]
+_PROBE_TIMEOUT_SECONDS = 10.0
+_COMMAND_TIMEOUT_SECONDS = 7200.0
 
 
 def _default_executor(argv: list[str]) -> subprocess.CompletedProcess[str]:
     """Run a command, capturing output as text and never raising on status."""
 
-    return subprocess.run(argv, capture_output=True, text=True, check=False)
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_COMMAND_TIMEOUT_SECONDS,
+    )
 
 
-class DockerRunner:
+def _default_probe_executor(
+    argv: list[str],
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_PROBE_TIMEOUT_SECONDS,
+    )
+
+
+class DockerRunner(WorkerRunnerMixin):
     """Build and dispatch ``docker run`` invocations against a pinned image.
 
     The ``command_executor`` injection point is what makes the runner testable:
     pass a fake callable to record argv instead of shelling out to Docker.
     """
+
+    worker_backend_name = "Docker"
+    worker_run_stage = "docker-run"
 
     def __init__(
         self,
@@ -57,6 +86,9 @@ class DockerRunner:
         constraints: HarnessConstraints | None = None,
     ) -> None:
         self._executor: CommandExecutor = command_executor or _default_executor
+        self._probe_executor: CommandExecutor = (
+            command_executor or _default_probe_executor
+        )
         self.image = image
         self.constraints = constraints or DEFAULT_CONSTRAINTS
 
@@ -66,7 +98,7 @@ class DockerRunner:
         if shutil.which("docker") is None:
             return False
         try:
-            result = self._executor(
+            result = self._probe_executor(
                 ["docker", "version", "--format", "{{json .}}"]
             )
         except Exception:  # noqa: BLE001 - any probe failure means unavailable
@@ -126,8 +158,11 @@ class DockerRunner:
         """Return the immutable image ID, failing closed if it is unavailable."""
 
         image_ref = self.image.image_ref if self.image else DEFAULT_IMAGE_REF
-        result = self._executor(
-            ["docker", "image", "inspect", "--format", "{{.Id}}", image_ref]
+        result = execute_command(
+            self._probe_executor,
+            ["docker", "image", "inspect", "--format", "{{.Id}}", image_ref],
+            backend_name="Docker",
+            stage="docker",
         )
         image_id = (getattr(result, "stdout", "") or "").strip()
         if getattr(result, "returncode", 1) != 0 or not image_id.startswith("sha256:"):
@@ -151,6 +186,8 @@ class DockerRunner:
         env: dict[str, str] | None = None,
         add_host_gateway: bool = False,
         user: str | None = None,
+        memory: str | None = None,
+        cpus: int | None = None,
     ) -> list[str]:
         """Render a docker-run argv without executing it."""
 
@@ -159,6 +196,10 @@ class DockerRunner:
         argv: list[str] = ["docker", "run", "--rm", "--platform", effective_platform]
         if not network:
             argv += ["--network", "none"]
+        if memory:
+            argv += ["--memory", memory]
+        if cpus is not None:
+            argv += ["--cpus", str(cpus)]
         if add_host_gateway:
             argv += [
                 "--add-host",
@@ -179,24 +220,12 @@ class DockerRunner:
 
         self.require_available()
         context_path = Path(context).expanduser().resolve()
-        constraints_path = self.constraints.source_path.expanduser().resolve()
-        try:
-            harness_build_path = constraints_path.relative_to(
-                context_path
-            ).as_posix()
-        except ValueError:
-            if constraints_path == DEFAULT_CONSTRAINTS.source_path.resolve():
-                harness_build_path = DEFAULT_CONSTRAINTS_LOGICAL_PATH
-            else:
-                raise DockerUnavailableError(
-                    "selected harness constraints must be inside the image "
-                    "build context",
-                    stage="docker-build",
-                    details={
-                        "constraints": str(constraints_path),
-                        "context": str(context_path),
-                    },
-                )
+        visible_constraints = harness_build_path(
+            context_path,
+            self.constraints,
+            error_type=DockerUnavailableError,
+            stage="docker-build",
+        )
         image_ref = self.image.image_ref if self.image else DEFAULT_IMAGE_REF
         platform_name = self.image.platform if self.image else DEFAULT_PLATFORM
         argv = [
@@ -208,21 +237,15 @@ class DockerRunner:
             str(Path(dockerfile)),
             "--tag",
             image_ref,
-            "--build-arg",
-            f"UBUNTU_VERSION={self.constraints.ubuntu_version}",
-            "--build-arg",
-            f"PYTHON_VERSION={self.constraints.python_version}",
-            "--build-arg",
-            f"QAIRT_DEPENDENCIES_FILE={self.constraints.dependencies_file}",
-            "--build-arg",
-            f"HARNESS_CONSTRAINTS_FILE={harness_build_path}",
-            "--build-arg",
-            f"TORCH_VERSION={self.constraints.torch_version}",
-            "--build-arg",
-            f"TORCH_INDEX_URL={self.constraints.torch_index_url}",
+            *harness_build_args(self.constraints, visible_constraints),
             str(context_path),
         ]
-        result = self._executor(argv)
+        result = execute_command(
+            self._executor,
+            argv,
+            backend_name="Docker",
+            stage="docker-build",
+        )
         if getattr(result, "returncode", 1) != 0:
             raise DockerUnavailableError(
                 f"failed to build Docker worker image '{image_ref}'",
@@ -241,6 +264,11 @@ class DockerRunner:
         """
 
         resolved_sdk = Path(sdk_root).expanduser().resolve()
+        sdk_mount = BindMount(
+            source=str(resolved_sdk),
+            target="/opt/qairt",
+            read_only=True,
+        )
         image_ref = self.image.image_ref if self.image else DEFAULT_IMAGE_REF
         platform_name = self.image.platform if self.image else DEFAULT_PLATFORM
         return [
@@ -264,7 +292,7 @@ class DockerRunner:
             "-e",
             "LD_LIBRARY_PATH=/opt/qairt/lib/x86_64-linux-clang",
             "-v",
-            f"{resolved_sdk}:/opt/qairt:ro",
+            f"{sdk_mount.source}:{sdk_mount.target}:ro",
             image_ref,
             "/opt/venv/bin/python",
             "-m",
@@ -284,7 +312,12 @@ class DockerRunner:
             )
         self.require_available()
         self.require_image()
-        result = self._executor(self.build_sdk_smoke_argv(sdk_root=resolved_sdk))
+        result = execute_command(
+            self._executor,
+            self.build_sdk_smoke_argv(sdk_root=resolved_sdk),
+            backend_name="Docker",
+            stage="image-smoke",
+        )
         if getattr(result, "returncode", 1) != 0:
             raise DockerUnavailableError(
                 "Docker worker image failed the mounted QAIRT Python API smoke test",
@@ -296,71 +329,5 @@ class DockerRunner:
                 },
             )
         return result
-
-    def run(
-        self,
-        *,
-        mounts: RuntimeMounts,
-        command: list[str],
-        network: bool = True,
-        platform: str | None = None,
-        workdir: str = "/workspace",
-        env: dict[str, str] | None = None,
-        user: str | None = None,
-    ) -> Any:
-        """Assemble and execute one ``docker run`` invocation.
-
-        The platform always defaults to the pinned worker platform; passing
-        ``network=False`` isolates the container (``--network none``) for
-        build-only and pickle-import jobs.
-        """
-
-        self.require_available()
-
-        argv = self.build_run_argv(
-            mounts=mounts,
-            command=command,
-            network=network,
-            platform=platform,
-            workdir=workdir,
-            env=env,
-            user=user,
-        )
-        result = self._executor(argv)
-        if getattr(result, "returncode", 1) != 0:
-            raise DockerUnavailableError(
-                "Docker worker command failed",
-                stage="docker-run",
-                retryable=True,
-                details={
-                    "returncode": getattr(result, "returncode", None),
-                    "stdout": getattr(result, "stdout", "") or "",
-                    "stderr": getattr(result, "stderr", "") or "",
-                },
-            )
-        return result
-
-    def run_build_isolated(
-        self,
-        *,
-        mounts: RuntimeMounts,
-        command: list[str],
-        platform: str | None = None,
-        workdir: str = "/workspace",
-        env: dict[str, str] | None = None,
-        user: str | None = None,
-    ) -> Any:
-        """Run a build-only / pickle-import job with the network disabled."""
-
-        return self.run(
-            mounts=mounts,
-            command=command,
-            network=False,
-            platform=platform,
-            workdir=workdir,
-            env=env,
-            user=user,
-        )
-
 
 __all__ = ["CommandExecutor", "DockerRunner"]

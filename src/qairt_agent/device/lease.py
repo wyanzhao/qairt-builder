@@ -425,6 +425,47 @@ class DeviceLease:
             process.kill()
             process.wait(timeout=2.0)
 
+    def require_heartbeat(self) -> None:
+        """Fail the active stage if its independent heartbeat has died."""
+
+        process = self._heartbeat_process
+        if process is None or process.poll() is not None:
+            raise LeaseConflictError(
+                "device lease heartbeat sidecar is not alive",
+                stage="device",
+                retryable=True,
+                details={
+                    "owner": self._owner,
+                    "path": str(self._path),
+                    "returncode": (
+                        process.poll() if process is not None else None
+                    ),
+                },
+            )
+        if self._heartbeat_path is None or self._owner_token is None:
+            raise LeaseConflictError(
+                "device lease heartbeat identity is incomplete",
+                stage="device",
+                retryable=True,
+                details={"owner": self._owner, "path": str(self._path)},
+            )
+        try:
+            heartbeat = self._heartbeat_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise LeaseConflictError(
+                "device lease heartbeat cannot be read",
+                stage="device",
+                retryable=True,
+                details={"path": str(self._heartbeat_path)},
+            ) from exc
+        if not heartbeat.startswith(self._owner_token + ":"):
+            raise LeaseConflictError(
+                "device lease heartbeat owner token does not match",
+                stage="device",
+                retryable=True,
+                details={"path": str(self._heartbeat_path)},
+            )
+
     def acquire(self) -> None:
         """Atomically publish the owner and start its heartbeat sidecar."""
 

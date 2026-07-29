@@ -83,7 +83,7 @@ Pass its `routes` and `contexts` fields to `qairt_run_chain` or to
 
 `spec` must include `sources.*.config_path`, `output_root`, `sequence`,
 `split`, `vectors`, and an explicit target. The canonical target uses
-`dsp_arch = "v81"` and `soc_model = 660`; `htp_arch` is not a contract field.
+`dsp_arch = "v81"` and `soc_model = 87`; `htp_arch` is not a contract field.
 See the canonical JSON files and routing notes under `examples/`.
 
 `qairt_build` is the low-level Python API lane and publishes explicit

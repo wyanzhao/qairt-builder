@@ -59,6 +59,7 @@ from qairt_agent.qairt_adapter import (
 from qairt_agent.qairt_adapter.errors import (
     ExperimentalFeatureError,
     QairtAdapterError,
+    QairtCompilationError,
     QairtConfigurationError,
     QairtPreflightError,
     QairtSdkImportError,
@@ -69,12 +70,15 @@ from qairt_agent.runtime.index import (
     make_runtime_index,
     select_runtime_binding,
 )
+from qairt_agent.runtime.state import state_slot
 from qairt_agent.vector_retarget import (
+    GoldenAbiMismatchError,
     VectorRetargetError,
+    onnx_bundle_sha256,
     retarget_vector_manifest,
     validate_provided_ar_manifest,
 )
-from qairt_agent.vectors import TensorSource, VectorPreparer, sha256_file
+from qairt_agent.vectors import TensorSource, VectorPreparer, sha256_hex
 
 _LIVE_SDK_FIELDS = {
     "execution_result",
@@ -482,6 +486,8 @@ class QairtAgent:
             code = ErrorCode.PREFLIGHT_FAILED
         elif isinstance(exc, (ExperimentalFeatureError, QairtConfigurationError)):
             code = ErrorCode.STAGE_FAILED
+        elif isinstance(exc, QairtCompilationError):
+            code = ErrorCode.STAGE_FAILED
         elif isinstance(exc, QairtAdapterError):
             code = ErrorCode.STAGE_FAILED
         elif isinstance(exc, FileNotFoundError):
@@ -559,7 +565,7 @@ class QairtAgent:
                 if not tensor_path.is_absolute():
                     tensor_path = manifest_path.parent / tensor_path
                 tensor_path = tensor_path.resolve()
-                actual_sha256 = sha256_file(tensor_path)
+                actual_sha256 = sha256_hex(tensor_path)
                 if actual_sha256 != record.sha256:
                     raise ValueError(
                         f"Vector tensor {record.name!r} SHA256 mismatch: "
@@ -1197,37 +1203,6 @@ class QairtAgent:
             "compile": spec.compile,
         }
 
-    @staticmethod
-    def _state_slot(tensor_name: str) -> str | None:
-        lowered = tensor_name.lower()
-        state_tokens = (
-            "past_key",
-            "past_value",
-            "present_key",
-            "present_value",
-            "key_cache",
-            "value_cache",
-            "kv_cache",
-            "recurrent_state",
-            "conv_state",
-        )
-        if not any(token in lowered for token in state_tokens):
-            return None
-        normalized = lowered
-        for old, new in (
-            ("present_key", "key"),
-            ("past_key", "key"),
-            ("present_value", "value"),
-            ("past_value", "value"),
-            ("_input", ""),
-            ("_output", ""),
-            ("_in", ""),
-            ("_out", ""),
-        ):
-            normalized = normalized.replace(old, new)
-        normalized = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
-        return normalized
-
     @classmethod
     def _publish_slice_routes(
         cls,
@@ -1290,12 +1265,12 @@ class QairtAgent:
                 state_inputs = {
                     name: slot
                     for name in input_names
-                    if (slot := cls._state_slot(name)) is not None
+                    if (slot := state_slot(name)) is not None
                 }
                 state_outputs = {
                     name: slot
                     for name in output_names
-                    if (slot := cls._state_slot(name)) is not None
+                    if (slot := state_slot(name)) is not None
                 }
                 from_previous = {
                     name: name
@@ -1627,6 +1602,8 @@ class QairtAgent:
                         ar=ar,
                         cl=context_length,
                     )
+                except GoldenAbiMismatchError:
+                    raise
                 except VectorRetargetError:
                     selected_path = retarget_vector_manifest(
                         source_path,
@@ -1648,11 +1625,11 @@ class QairtAgent:
                     record = {
                         "binding": "derived_from_source_manifest",
                         "manifest_path": os.fspath(selected_path),
-                        "manifest_sha256": sha256_file(selected_path),
+                        "manifest_sha256": sha256_hex(selected_path),
                         "target_onnx_path": os.fspath(
                             Path(target).expanduser().resolve()
                         ),
-                        "target_onnx_sha256": sha256_file(target),
+                        "target_onnx_sha256": onnx_bundle_sha256(target),
                         "family": spec.family.value,
                         "ar": ar,
                         "cl": context_length,
@@ -1772,7 +1749,7 @@ class QairtAgent:
                 record.update(
                     {
                         "manifest_path": os.fspath(selected_path),
-                        "manifest_sha256": sha256_file(selected_path),
+                        "manifest_sha256": sha256_hex(selected_path),
                         "reference_source": "onnxruntime",
                         "binding": "provided_independent_ar_with_ort_fallback",
                     }
@@ -3425,7 +3402,7 @@ class QairtAgent:
                         "slice": route.slice_id,
                         "reference_source": "provided_per_slice_golden",
                         "manifest_path": os.fspath(path),
-                        "manifest_sha256": sha256_file(path),
+                        "manifest_sha256": sha256_hex(path),
                         "case_id": vector.case_id,
                     }
                 )
@@ -3574,7 +3551,7 @@ class QairtAgent:
                     "ar": int(ar_key),
                     "context_length": int(cl_key),
                     "reference_model_path": os.fspath(model_path),
-                    "reference_model_sha256": sha256_file(model_path),
+                    "reference_model_sha256": sha256_hex(model_path),
                 },
             )
             try:
@@ -3628,7 +3605,7 @@ class QairtAgent:
                     "manifest_path": os.fspath(ref.path),
                     "manifest_sha256": ref.sha256,
                     "model_path": os.fspath(model_path),
-                    "model_sha256": sha256_file(model_path),
+                    "model_sha256": sha256_hex(model_path),
                     "input_names": list(route.input_names),
                     "output_names": list(route.output_names),
                 }
@@ -3761,7 +3738,7 @@ class QairtAgent:
                 **dict(source.metadata),
                 "reference_request": "golden_missing_fallback",
                 "source_manifest_path": os.fspath(source_path),
-                "source_manifest_sha256": sha256_file(source_path),
+                "source_manifest_sha256": sha256_hex(source_path),
             },
         )
         return preparer.capture_onnx(
@@ -4032,12 +4009,14 @@ class QairtAgent:
             if not models:
                 raise ValueError("compile_context requires config.models")
             ars = tuple(int(value) for value in selected.get("ar_values", spec.sequence.ars))
-            graph_names = tuple(
-                str(value)
-                for value in selected.get(
-                    "graph_names", tuple(f"graph_ar{ar}" for ar in ars)
+            raw_graph_names = selected.get("graph_names")
+            if raw_graph_names is None:
+                raise InvalidSpecError(
+                    "compile_context requires explicit graph_names from QAIRT "
+                    "graphs_info; synthesized graph_ar* names are forbidden",
+                    stage="compile_context",
                 )
-            )
+            graph_names = tuple(str(value) for value in raw_graph_names)
             source_kinds = tuple(
                 str(value)
                 for value in selected.get("source_kinds", ("derived",) * len(models))
@@ -4455,6 +4434,680 @@ class QairtAgent:
             stage_config=selected,
         )
 
+    @staticmethod
+    def _require_exact_multi_ar_vectors(
+        runtime_index: Mapping[str, Any],
+        requested_ars: Sequence[int],
+        *,
+        stage: str,
+    ) -> None:
+        """Fail before fanout unless every AR has an exact vector manifest."""
+
+        vectors = runtime_index.get("vectors") or {}
+        exact_vectors = (
+            vectors.get("validation_manifests_by_ar") or {}
+            if isinstance(vectors, Mapping)
+            else {}
+        )
+        missing = [
+            int(ar) for ar in requested_ars if not exact_vectors.get(str(ar))
+        ]
+        if missing:
+            raise InvalidSpecError(
+                f"automatic multi-AR {stage} requires one exact vector "
+                "manifest for every requested AR",
+                stage=stage,
+                details={
+                    "requested_ars": [int(ar) for ar in requested_ars],
+                    "missing_vector_ars": missing,
+                    "hint": (
+                        "build must publish runtime_index.vectors."
+                        "validation_manifests_by_ar for every AR"
+                    ),
+                },
+            )
+
+    @staticmethod
+    def _multi_ar_coverage(
+        manifest: RunManifest,
+        requested_ars: Sequence[int],
+    ) -> dict[str, Any]:
+        normalized = [int(ar) for ar in requested_ars]
+        return {
+            "mode": "all_requested_ars",
+            "requested_ars": normalized,
+            "executed_ars": normalized,
+            "missing_ars": [],
+            "complete": True,
+            "context_lengths": [
+                int(value)
+                for value in manifest.build_spec.sequence.context_lengths
+            ],
+        }
+
+    @staticmethod
+    def _fanout_reports_by_ar(
+        manifest: RunManifest,
+        adapter: Any,
+        output_dir: Path,
+        selected: Mapping[str, Any],
+        requested_ars: Sequence[int],
+        *,
+        stage: str,
+        report_logical_prefix: str,
+        run_one: Callable[
+            ...,
+            tuple[dict[str, Any], tuple[ArtifactRef, ...], dict[str, Any]],
+        ],
+    ) -> tuple[
+        dict[str, Any],
+        list[ArtifactRef],
+        dict[str, Any],
+        dict[str, tuple[ArtifactRef, ...]],
+    ]:
+        """Run one exact-AR operation and validate its report publication."""
+
+        results_by_ar: dict[str, Any] = {}
+        output_refs: list[ArtifactRef] = []
+        per_ar_metrics: dict[str, Any] = {}
+        refs_by_ar: dict[str, tuple[ArtifactRef, ...]] = {}
+        for raw_ar in requested_ars:
+            ar = int(raw_ar)
+            ar_key = str(ar)
+            payload, refs, metrics = run_one(
+                manifest,
+                adapter,
+                output_dir / f"ar{ar}",
+                {**selected, "ar": ar},
+                report_suffix=f"_ar{ar}",
+            )
+            expected_name = f"{report_logical_prefix}_ar{ar}"
+            report_refs = [
+                ref for ref in refs if ref.logical_name == expected_name
+            ]
+            if len(report_refs) != 1:
+                raise InvalidSpecError(
+                    f"multi-AR {stage} did not publish exactly one "
+                    f"AR{ar} {report_logical_prefix} report",
+                    stage=stage,
+                )
+            results_by_ar[ar_key] = {
+                "report": payload,
+                "report_artifact": _jsonable(report_refs[0]),
+            }
+            per_ar_metrics[ar_key] = _jsonable(metrics)
+            refs_by_ar[ar_key] = refs
+            output_refs.extend(refs)
+        return results_by_ar, output_refs, per_ar_metrics, refs_by_ar
+
+    def _validate_one(
+        self,
+        manifest: RunManifest,
+        adapter: Any,
+        output_dir: Path,
+        selected_config: Mapping[str, Any],
+        *,
+        manifest_sha256: str,
+        report_suffix: str = "",
+    ) -> tuple[dict[str, Any], tuple[ArtifactRef, ...], dict[str, Any]]:
+        """Execute and publish one AR-scoped SQNR validation report."""
+
+        effective = dict(selected_config)
+        explicit_outputs = any(
+            key in effective
+            for key in (
+                "references",
+                "teacher_forced_outputs",
+                "device_chain_outputs",
+                "actual_manifest",
+            )
+        )
+        explicit_graph = all(
+            effective.get(key) is not None
+            for key in ("context_path", "graph_name", "vector_manifest")
+        )
+        explicit_chain = (
+            effective.get("routes") is not None
+            and isinstance(effective.get("contexts"), Mapping)
+            and effective.get("vector_manifest") is not None
+        )
+        if not explicit_outputs and not explicit_graph and not explicit_chain:
+            effective = self._automatic_runtime_binding(manifest, effective)
+            if effective["lane"] == "genai_builder":
+                if not effective.get("runtime_supported", False):
+                    raise InvalidSpecError(
+                        "the GenAI container runtime is unsupported by this "
+                        "QAIRT SDK workflow; validation fails closed",
+                        stage="validate",
+                        details={
+                            "family": effective.get("family"),
+                            "container_path": effective.get("container_path"),
+                        },
+                    )
+                tensor_runtime = effective.get("tensor_runtime")
+                if not isinstance(tensor_runtime, Mapping):
+                    raise InvalidSpecError(
+                        "this saved GenAI container did not expose an "
+                        "auditable public CompiledModel split route for "
+                        "raw-tensor SQNR; provide explicit actual/reference "
+                        "manifests or a low-level diagnostic context",
+                        stage="validate",
+                    )
+                effective.update(
+                    {
+                        "routes": tensor_runtime["routes"],
+                        "contexts": tensor_runtime["contexts"],
+                        "scope": tensor_runtime["scope"],
+                    }
+                )
+        effective = self._enforce_qwen3_vl_runtime_scope(
+            manifest,
+            effective,
+            stage="validate",
+        )
+        requested_modes = self._requested_sqnr_modes(
+            manifest.build_spec,
+            effective,
+        )
+        automatic_mode_execution = bool(requested_modes) and not explicit_outputs
+
+        reference_refs: list[ArtifactRef] = []
+        reference_source = "provided"
+        if "references" in effective:
+            references = self._slice_tensor_tree(
+                effective["references"],
+                section=str(effective.get("reference_section", "goldens")),
+            )
+        elif effective.get("vector_manifest") is not None:
+            vector_path = effective["vector_manifest"]
+            vector = VectorPreparer.load_manifest(
+                vector_path,
+                expected_sha256=effective.get("vector_manifest_sha256"),
+            )
+            needs_full_reference = (
+                not requested_modes
+                or SqnrMode.FULL_REFERENCE in requested_modes
+            )
+            if not vector.goldens and needs_full_reference:
+                reference_model = (
+                    effective.get("reference_model_path")
+                    or effective.get("model_path")
+                    or manifest.build_spec.sources.text.onnx_path
+                )
+                vector_path = self._capture_onnx_reference(
+                    vector_path,
+                    reference_model,
+                    output_dir,
+                    expected_manifest_sha256=effective.get(
+                        "vector_manifest_sha256"
+                    ),
+                )
+                reference_refs.append(
+                    ArtifactRef.from_path(
+                        vector_path,
+                        kind=ArtifactKind.GOLDEN_VECTORS,
+                        logical_name=(
+                            "onnxruntime_reference_manifest"
+                            f"{report_suffix}"
+                        ),
+                    )
+                )
+                reference_source = "onnxruntime"
+            references = (
+                {
+                    "model": self._manifest_inputs(
+                        vector_path,
+                        section="goldens",
+                        sha256=(
+                            None
+                            if reference_source == "onnxruntime"
+                            else effective.get(
+                                "vector_manifest_sha256"
+                            )
+                        ),
+                    )
+                }
+                if vector.goldens or needs_full_reference
+                else {}
+            )
+        else:
+            raise ValueError("validate requires references or vector_manifest")
+        if (
+            automatic_mode_execution
+            and not references
+            and effective.get("routes") is None
+            and SqnrMode.FULL_REFERENCE not in requested_modes
+        ):
+            raise InvalidSpecError(
+                "teacher_forced/chain-only SQNR on a manifest without "
+                "goldens requires slice-level reference manifests and "
+                "audited routes; a single non-route graph cannot provide "
+                "the required reference boundaries",
+                stage="validate",
+                details={
+                    "requested_modes": [
+                        mode.value for mode in requested_modes
+                    ],
+                    "binding": (
+                        "single_graph"
+                        if all(
+                            effective.get(key) is not None
+                            for key in (
+                                "context_path",
+                                "graph_name",
+                                "vector_manifest",
+                            )
+                        )
+                        else "custom"
+                    ),
+                    "has_supplied_goldens": False,
+                    "hint": (
+                        "publish routes plus per-slice references, supply "
+                        "goldens, or include full_reference"
+                    ),
+                },
+            )
+        full_references = references
+        full_reference_actual: dict[str, dict[str, np.ndarray]] | None = None
+        slice_reference_refs: tuple[ArtifactRef, ...] = ()
+        slice_reference_audit: list[dict[str, Any]] = []
+
+        teacher = (
+            self._slice_tensor_tree(
+                effective["teacher_forced_outputs"],
+                section=str(effective.get("actual_section", "inputs")),
+            )
+            if "teacher_forced_outputs" in effective
+            else None
+        )
+        chain = (
+            self._slice_tensor_tree(
+                effective["device_chain_outputs"],
+                section=str(effective.get("actual_section", "inputs")),
+            )
+            if "device_chain_outputs" in effective
+            else None
+        )
+        if teacher is None and chain is None:
+            actual = effective.get("actual_manifest")
+            if actual is not None:
+                chain = {
+                    "model": self._manifest_inputs(
+                        actual,
+                        section=str(effective.get("actual_section", "goldens")),
+                        sha256=effective.get("actual_manifest_sha256"),
+                    )
+                }
+            elif effective.get("routes") is not None:
+                self._preflight(adapter, manifest.build_spec)
+                inputs = self._manifest_inputs(
+                    effective["vector_manifest"],
+                    section=str(effective.get("input_section", "inputs")),
+                    sha256=effective.get("vector_manifest_sha256"),
+                )
+                contexts = effective.get("contexts")
+                if not isinstance(contexts, Mapping) or not contexts:
+                    raise ValueError(
+                        "chain validation requires contexts mapped by slice"
+                    )
+                routes = tuple(
+                    SliceRoute.from_object(route)
+                    for route in effective["routes"]
+                )
+                initial_native_state = self._tensor_mapping(
+                    effective.get("initial_native_state", {})
+                )
+                if not initial_native_state:
+                    initial_native_state = self._initial_native_state_from_routes(
+                        routes,
+                        inputs,
+                    )
+                slice_vector_paths: tuple[Path, ...] = ()
+                teacher_inputs: dict[
+                    str, dict[str, np.ndarray]
+                ] | None = None
+                if automatic_mode_execution and any(
+                    mode in requested_modes
+                    for mode in (SqnrMode.TEACHER_FORCED, SqnrMode.CHAIN)
+                ):
+                    (
+                        slice_references,
+                        teacher_inputs,
+                        slice_vector_paths,
+                        slice_reference_refs,
+                        slice_reference_audit,
+                    ) = self._prepare_slice_quality_vectors(
+                        manifest,
+                        effective,
+                        routes,
+                        inputs,
+                        output_dir,
+                    )
+                    references = slice_references
+                inline_cases: list[Mapping[str, Any]] = []
+                if initial_native_state:
+                    inline_cases.append(initial_native_state)
+                if teacher_inputs is not None:
+                    inline_cases.extend(teacher_inputs.values())
+                push_files = self._device_stage_files(
+                    output_dir,
+                    contexts=tuple(contexts.values()),
+                    vector_manifests=(
+                        effective["vector_manifest"],
+                        *slice_vector_paths,
+                    ),
+                    inline_cases=tuple(inline_cases),
+                )
+                with self._device_stage(
+                    manifest,
+                    adapter,
+                    stage_name="validate",
+                    input_manifest_sha256=manifest_sha256,
+                    stage_config=effective,
+                    push_files=push_files,
+                ) as device_stage:
+                    runner = SliceChainRunner(
+                        routes,
+                        self._chain_executors(
+                            adapter,
+                            contexts,
+                            device=device_stage.device,
+                            native_io=bool(effective.get("native_io", False)),
+                            execution_options=self._execution_options(effective),
+                        ),
+                    )
+                    selected_ar = int(
+                        effective.get(
+                            "ar",
+                            manifest.build_spec.sequence.ars[0],
+                        )
+                    )
+                    needs_chain = (
+                        not automatic_mode_execution
+                        or SqnrMode.FULL_REFERENCE in requested_modes
+                        or SqnrMode.CHAIN in requested_modes
+                    )
+                    if needs_chain:
+                        chain_result = runner.run_device_chain(
+                            inputs,
+                            ar=selected_ar,
+                            initial_native_state=initial_native_state,
+                        )
+                        full_reference_actual = {
+                            "model": dict(chain_result.final_outputs)
+                        }
+                        if automatic_mode_execution:
+                            chain = (
+                                {
+                                    str(name): dict(values)
+                                    for name, values
+                                    in chain_result.outputs_by_slice().items()
+                                }
+                                if SqnrMode.CHAIN in requested_modes
+                                else None
+                            )
+                        else:
+                            chain = (
+                                full_reference_actual
+                                if set(references) == {"model"}
+                                else {
+                                    str(name): dict(values)
+                                    for name, values
+                                    in chain_result.outputs_by_slice().items()
+                                }
+                            )
+                    if (
+                        automatic_mode_execution
+                        and SqnrMode.TEACHER_FORCED in requested_modes
+                    ):
+                        assert teacher_inputs is not None
+                        teacher_result = runner.run_teacher_forced(
+                            inputs,
+                            teacher_inputs,
+                            ar=selected_ar,
+                            initial_native_state=initial_native_state,
+                        )
+                        teacher = {
+                            str(name): dict(values)
+                            for name, values
+                            in teacher_result.outputs_by_slice().items()
+                        }
+                    device_identifier = device_stage.identifier
+                    remote_attempt_dir = device_stage.adb.attempt_dir
+            elif all(
+                effective.get(key) is not None
+                for key in ("context_path", "graph_name", "vector_manifest")
+            ):
+                self._preflight(adapter, manifest.build_spec)
+                inputs = self._manifest_inputs(
+                    effective["vector_manifest"],
+                    section=str(effective.get("input_section", "inputs")),
+                    sha256=effective.get("vector_manifest_sha256"),
+                )
+                push_files = self._device_stage_files(
+                    output_dir,
+                    contexts=(effective["context_path"],),
+                    vector_manifests=(effective["vector_manifest"],),
+                )
+                with self._device_stage(
+                    manifest,
+                    adapter,
+                    stage_name="validate",
+                    input_manifest_sha256=manifest_sha256,
+                    stage_config=effective,
+                    push_files=push_files,
+                ) as device_stage:
+                    raw_result = adapter.run_graph(
+                        effective["context_path"],
+                        inputs,
+                        graph_name=str(effective["graph_name"]),
+                        device=device_stage.device,
+                        native_io=bool(effective.get("native_io", False)),
+                        **self._execution_options(effective),
+                    )
+                    chain = {
+                        "model": _output_mapping(
+                            raw_result,
+                            graph_name=str(effective["graph_name"]),
+                        )
+                    }
+                    full_reference_actual = chain
+                    if automatic_mode_execution:
+                        teacher = (
+                            chain
+                            if SqnrMode.TEACHER_FORCED in requested_modes
+                            else None
+                        )
+                        chain = (
+                            chain
+                            if SqnrMode.CHAIN in requested_modes
+                            else None
+                        )
+                    device_identifier = device_stage.identifier
+                    remote_attempt_dir = device_stage.adb.attempt_dir
+            else:
+                raise ValueError(
+                    "validate requires teacher_forced_outputs, "
+                    "device_chain_outputs, actual_manifest, or "
+                    "context_path+graph_name+vector_manifest"
+                )
+        if not references or not any(references.values()):
+            raise ValueError(
+                "SQNR validation requires at least one reference tensor; "
+                "empty reports are forbidden"
+            )
+        diagnoser = QualityDiagnoser(
+            reference_energy_floor=float(
+                effective.get("reference_energy_floor", 0.0)
+            )
+        )
+        report = diagnoser.diagnose_slices(
+            references,
+            teacher_forced_outputs=teacher,
+            device_chain_outputs=chain,
+            lineage=effective.get("lineage"),
+        )
+        if not report.observations:
+            raise ValueError("SQNR validation produced no observations")
+        mode_reports: dict[str, Any] = {}
+        if requested_modes:
+            if SqnrMode.FULL_REFERENCE in requested_modes:
+                full_actual = full_reference_actual
+                if full_actual is None and set(full_references) == {"model"}:
+                    full_actual = chain
+                if full_actual is None:
+                    raise InvalidSpecError(
+                        "full_reference SQNR requested without end-to-end "
+                        "device outputs",
+                        stage="validate",
+                    )
+                full_report = diagnoser.diagnose_slices(
+                    full_references,
+                    device_chain_outputs=full_actual,
+                    lineage=effective.get("lineage"),
+                )
+                mode_reports[SqnrMode.FULL_REFERENCE.value] = (
+                    full_report.to_dict()
+                )
+            if SqnrMode.TEACHER_FORCED in requested_modes:
+                if teacher is None:
+                    raise InvalidSpecError(
+                        "teacher_forced SQNR requested without "
+                        "teacher-forced device outputs",
+                        stage="validate",
+                    )
+                mode_reports[SqnrMode.TEACHER_FORCED.value] = (
+                    diagnoser.diagnose_slices(
+                        references,
+                        teacher_forced_outputs=teacher,
+                        lineage=effective.get("lineage"),
+                    ).to_dict()
+                )
+            if SqnrMode.CHAIN in requested_modes:
+                if chain is None:
+                    raise InvalidSpecError(
+                        "chain SQNR requested without device-chain outputs",
+                        stage="validate",
+                    )
+                mode_reports[SqnrMode.CHAIN.value] = (
+                    diagnoser.diagnose_slices(
+                        references,
+                        device_chain_outputs=chain,
+                        lineage=effective.get("lineage"),
+                    ).to_dict()
+                )
+        payload = report.to_dict()
+        payload["policy"] = "report_only"
+        payload["reference_source"] = reference_source
+        payload["requested_modes"] = [
+            mode.value for mode in requested_modes
+        ]
+        payload["executed_modes"] = list(mode_reports)
+        payload["mode_reports"] = mode_reports
+        if slice_reference_audit:
+            payload["slice_reference_evidence"] = slice_reference_audit
+        divergence_observed = any(
+            mode_report.get("first_teacher_error") is not None
+            or mode_report.get("first_chain_error") is not None
+            for mode_report in mode_reports.values()
+        ) if mode_reports else (
+            report.first_teacher_error is not None
+            or report.first_chain_error is not None
+        )
+        dump_intermediates = bool(
+            effective.get(
+                "dump_intermediates_on_failure",
+                manifest.build_spec.quality.dump_intermediates_on_failure,
+            )
+        )
+        if automatic_mode_execution:
+            payload["diagnostic_evidence"] = (
+                self._diagnostic_context_evidence(
+                    manifest,
+                    effective,
+                    requested=dump_intermediates,
+                    divergence_observed=divergence_observed,
+                    slice_reference_refs=slice_reference_refs,
+                )
+            )
+        payload["runtime_binding"] = {
+            key: _jsonable(effective.get(key))
+            for key in (
+                "lane",
+                "family",
+                "ar",
+                "context_length",
+                "scope",
+                "route_manifest",
+                "context_path",
+                "graph_name",
+                "reference_model_path",
+                "component",
+                "coverage",
+                "excluded_components",
+                "graph_ar",
+            )
+            if effective.get(key) is not None
+        }
+        requested_ar_values = [
+            int(value)
+            for value in manifest.build_spec.sequence.ars
+        ]
+        if effective.get("ar") is not None:
+            executed_ar = int(effective["ar"])
+            payload["coverage"] = {
+                "mode": (
+                    "single_ar_override"
+                    if selected_config.get("ar") is not None
+                    and not report_suffix
+                    else "single_ar"
+                ),
+                "requested_ars": requested_ar_values,
+                "executed_ars": [executed_ar],
+                "missing_ars": [
+                    ar
+                    for ar in requested_ar_values
+                    if ar != executed_ar
+                ],
+                "complete": requested_ar_values == [executed_ar],
+            }
+        else:
+            payload["coverage"] = {
+                "mode": "explicit_custom_runtime",
+                "requested_ars": requested_ar_values,
+                "executed_ars": "caller_defined",
+                "complete": None,
+            }
+        report_ref = atomic_publish_json(
+            output_dir / f"sqnr_report{report_suffix}.json",
+            payload,
+            kind=ArtifactKind.REPORT,
+            logical_name=f"sqnr_report{report_suffix}",
+        )
+        metrics: dict[str, Any] = {
+            "observation_count": len(report.observations),
+            "policy": "report_only",
+            "reference_source": reference_source,
+            "requested_modes": [
+                mode.value for mode in requested_modes
+            ],
+            "executed_modes": list(mode_reports),
+            "divergence_observed": divergence_observed,
+        }
+        if "device_identifier" in locals():
+            metrics.update(
+                {
+                    "device_identifier": device_identifier,
+                    "remote_attempt_dir": remote_attempt_dir,
+                    "remote_cleanup": "confirmed",
+                }
+            )
+        return (
+            payload,
+            tuple(reference_refs) + slice_reference_refs + (report_ref,),
+            metrics,
+        )
+
     def validate(
         self,
         manifest_uri: str | Path,
@@ -4470,7 +5123,7 @@ class QairtAgent:
         if vector_manifest is not None:
             selected.setdefault("vector_manifest", vector_manifest)
 
-        def run_one(
+        def run_selected(
             manifest: RunManifest,
             adapter: Any,
             output_dir: Path,
@@ -4478,516 +5131,13 @@ class QairtAgent:
             *,
             report_suffix: str = "",
         ) -> tuple[dict[str, Any], tuple[ArtifactRef, ...], dict[str, Any]]:
-            effective = dict(selected_config)
-            explicit_outputs = any(
-                key in effective
-                for key in (
-                    "references",
-                    "teacher_forced_outputs",
-                    "device_chain_outputs",
-                    "actual_manifest",
-                )
-            )
-            explicit_graph = all(
-                effective.get(key) is not None
-                for key in ("context_path", "graph_name", "vector_manifest")
-            )
-            explicit_chain = (
-                effective.get("routes") is not None
-                and isinstance(effective.get("contexts"), Mapping)
-                and effective.get("vector_manifest") is not None
-            )
-            if not explicit_outputs and not explicit_graph and not explicit_chain:
-                effective = self._automatic_runtime_binding(manifest, effective)
-                if effective["lane"] == "genai_builder":
-                    if not effective.get("runtime_supported", False):
-                        raise InvalidSpecError(
-                            "the GenAI container runtime is unsupported by this "
-                            "QAIRT SDK workflow; validation fails closed",
-                            stage="validate",
-                            details={
-                                "family": effective.get("family"),
-                                "container_path": effective.get("container_path"),
-                            },
-                        )
-                    tensor_runtime = effective.get("tensor_runtime")
-                    if not isinstance(tensor_runtime, Mapping):
-                        raise InvalidSpecError(
-                            "this saved GenAI container did not expose an "
-                            "auditable public CompiledModel split route for "
-                            "raw-tensor SQNR; provide explicit actual/reference "
-                            "manifests or a low-level diagnostic context",
-                            stage="validate",
-                        )
-                    effective.update(
-                        {
-                            "routes": tensor_runtime["routes"],
-                            "contexts": tensor_runtime["contexts"],
-                            "scope": tensor_runtime["scope"],
-                        }
-                    )
-            if not explicit_outputs:
-                effective = self._enforce_qwen3_vl_runtime_scope(
-                    manifest,
-                    effective,
-                    stage="validate",
-                )
-            requested_modes = self._requested_sqnr_modes(
-                manifest.build_spec,
-                effective,
-            )
-            automatic_mode_execution = bool(requested_modes) and not explicit_outputs
-
-            reference_refs: list[ArtifactRef] = []
-            reference_source = "provided"
-            if "references" in effective:
-                references = self._slice_tensor_tree(
-                    effective["references"],
-                    section=str(effective.get("reference_section", "goldens")),
-                )
-            elif effective.get("vector_manifest") is not None:
-                vector_path = effective["vector_manifest"]
-                vector = VectorPreparer.load_manifest(
-                    vector_path,
-                    expected_sha256=effective.get("vector_manifest_sha256"),
-                )
-                if not vector.goldens:
-                    reference_model = (
-                        effective.get("reference_model_path")
-                        or effective.get("model_path")
-                        or manifest.build_spec.sources.text.onnx_path
-                    )
-                    vector_path = self._capture_onnx_reference(
-                        vector_path,
-                        reference_model,
-                        output_dir,
-                        expected_manifest_sha256=effective.get(
-                            "vector_manifest_sha256"
-                        ),
-                    )
-                    reference_refs.append(
-                        ArtifactRef.from_path(
-                            vector_path,
-                            kind=ArtifactKind.GOLDEN_VECTORS,
-                            logical_name=(
-                                "onnxruntime_reference_manifest"
-                                f"{report_suffix}"
-                            ),
-                        )
-                    )
-                    reference_source = "onnxruntime"
-                references = {
-                    "model": self._manifest_inputs(
-                        vector_path,
-                        section="goldens",
-                        sha256=(
-                            None
-                            if reference_source == "onnxruntime"
-                            else effective.get("vector_manifest_sha256")
-                        ),
-                    )
-                }
-            else:
-                raise ValueError("validate requires references or vector_manifest")
-            if not references or not any(references.values()):
-                raise ValueError(
-                    "SQNR validation requires at least one reference tensor; "
-                    "empty reports are forbidden"
-                )
-            full_references = references
-            full_reference_actual: dict[str, dict[str, np.ndarray]] | None = None
-            slice_reference_refs: tuple[ArtifactRef, ...] = ()
-            slice_reference_audit: list[dict[str, Any]] = []
-
-            teacher = (
-                self._slice_tensor_tree(
-                    effective["teacher_forced_outputs"],
-                    section=str(effective.get("actual_section", "inputs")),
-                )
-                if "teacher_forced_outputs" in effective
-                else None
-            )
-            chain = (
-                self._slice_tensor_tree(
-                    effective["device_chain_outputs"],
-                    section=str(effective.get("actual_section", "inputs")),
-                )
-                if "device_chain_outputs" in effective
-                else None
-            )
-            if teacher is None and chain is None:
-                actual = effective.get("actual_manifest")
-                if actual is not None:
-                    chain = {
-                        "model": self._manifest_inputs(
-                            actual,
-                            section=str(effective.get("actual_section", "goldens")),
-                            sha256=effective.get("actual_manifest_sha256"),
-                        )
-                    }
-                elif effective.get("routes") is not None:
-                    self._preflight(adapter, manifest.build_spec)
-                    inputs = self._manifest_inputs(
-                        effective["vector_manifest"],
-                        section=str(effective.get("input_section", "inputs")),
-                        sha256=effective.get("vector_manifest_sha256"),
-                    )
-                    contexts = effective.get("contexts")
-                    if not isinstance(contexts, Mapping) or not contexts:
-                        raise ValueError(
-                            "chain validation requires contexts mapped by slice"
-                        )
-                    routes = tuple(
-                        SliceRoute.from_object(route)
-                        for route in effective["routes"]
-                    )
-                    initial_native_state = self._tensor_mapping(
-                        effective.get("initial_native_state", {})
-                    )
-                    if not initial_native_state:
-                        initial_native_state = self._initial_native_state_from_routes(
-                            routes,
-                            inputs,
-                        )
-                    slice_vector_paths: tuple[Path, ...] = ()
-                    teacher_inputs: dict[
-                        str, dict[str, np.ndarray]
-                    ] | None = None
-                    if automatic_mode_execution and any(
-                        mode in requested_modes
-                        for mode in (SqnrMode.TEACHER_FORCED, SqnrMode.CHAIN)
-                    ):
-                        (
-                            slice_references,
-                            teacher_inputs,
-                            slice_vector_paths,
-                            slice_reference_refs,
-                            slice_reference_audit,
-                        ) = self._prepare_slice_quality_vectors(
-                            manifest,
-                            effective,
-                            routes,
-                            inputs,
-                            output_dir,
-                        )
-                        references = slice_references
-                    inline_cases: list[Mapping[str, Any]] = []
-                    if initial_native_state:
-                        inline_cases.append(initial_native_state)
-                    if teacher_inputs is not None:
-                        inline_cases.extend(teacher_inputs.values())
-                    push_files = self._device_stage_files(
-                        output_dir,
-                        contexts=tuple(contexts.values()),
-                        vector_manifests=(
-                            effective["vector_manifest"],
-                            *slice_vector_paths,
-                        ),
-                        inline_cases=tuple(inline_cases),
-                    )
-                    with self._device_stage(
-                        manifest,
-                        adapter,
-                        stage_name="validate",
-                        input_manifest_sha256=manifest_sha256,
-                        stage_config=effective,
-                        push_files=push_files,
-                    ) as device_stage:
-                        runner = SliceChainRunner(
-                            routes,
-                            self._chain_executors(
-                                adapter,
-                                contexts,
-                                device=device_stage.device,
-                                native_io=bool(effective.get("native_io", False)),
-                                execution_options=self._execution_options(effective),
-                            ),
-                        )
-                        selected_ar = int(
-                            effective.get(
-                                "ar",
-                                manifest.build_spec.sequence.ars[0],
-                            )
-                        )
-                        needs_chain = (
-                            not automatic_mode_execution
-                            or SqnrMode.FULL_REFERENCE in requested_modes
-                            or SqnrMode.CHAIN in requested_modes
-                        )
-                        if needs_chain:
-                            chain_result = runner.run_device_chain(
-                                inputs,
-                                ar=selected_ar,
-                                initial_native_state=initial_native_state,
-                            )
-                            full_reference_actual = {
-                                "model": dict(chain_result.final_outputs)
-                            }
-                            if automatic_mode_execution:
-                                chain = (
-                                    {
-                                        str(name): dict(values)
-                                        for name, values
-                                        in chain_result.outputs_by_slice().items()
-                                    }
-                                    if SqnrMode.CHAIN in requested_modes
-                                    else None
-                                )
-                            else:
-                                chain = (
-                                    full_reference_actual
-                                    if set(references) == {"model"}
-                                    else {
-                                        str(name): dict(values)
-                                        for name, values
-                                        in chain_result.outputs_by_slice().items()
-                                    }
-                                )
-                        if (
-                            automatic_mode_execution
-                            and SqnrMode.TEACHER_FORCED in requested_modes
-                        ):
-                            assert teacher_inputs is not None
-                            teacher_result = runner.run_teacher_forced(
-                                inputs,
-                                teacher_inputs,
-                                ar=selected_ar,
-                                initial_native_state=initial_native_state,
-                            )
-                            teacher = {
-                                str(name): dict(values)
-                                for name, values
-                                in teacher_result.outputs_by_slice().items()
-                            }
-                        device_identifier = device_stage.identifier
-                        remote_attempt_dir = device_stage.adb.attempt_dir
-                elif all(
-                    effective.get(key) is not None
-                    for key in ("context_path", "graph_name", "vector_manifest")
-                ):
-                    self._preflight(adapter, manifest.build_spec)
-                    inputs = self._manifest_inputs(
-                        effective["vector_manifest"],
-                        section=str(effective.get("input_section", "inputs")),
-                        sha256=effective.get("vector_manifest_sha256"),
-                    )
-                    push_files = self._device_stage_files(
-                        output_dir,
-                        contexts=(effective["context_path"],),
-                        vector_manifests=(effective["vector_manifest"],),
-                    )
-                    with self._device_stage(
-                        manifest,
-                        adapter,
-                        stage_name="validate",
-                        input_manifest_sha256=manifest_sha256,
-                        stage_config=effective,
-                        push_files=push_files,
-                    ) as device_stage:
-                        raw_result = adapter.run_graph(
-                            effective["context_path"],
-                            inputs,
-                            graph_name=str(effective["graph_name"]),
-                            device=device_stage.device,
-                            native_io=bool(effective.get("native_io", False)),
-                            **self._execution_options(effective),
-                        )
-                        chain = {
-                            "model": _output_mapping(
-                                raw_result,
-                                graph_name=str(effective["graph_name"]),
-                            )
-                        }
-                        full_reference_actual = chain
-                        if automatic_mode_execution:
-                            teacher = (
-                                chain
-                                if SqnrMode.TEACHER_FORCED in requested_modes
-                                else None
-                            )
-                            chain = (
-                                chain
-                                if SqnrMode.CHAIN in requested_modes
-                                else None
-                            )
-                        device_identifier = device_stage.identifier
-                        remote_attempt_dir = device_stage.adb.attempt_dir
-                else:
-                    raise ValueError(
-                        "validate requires teacher_forced_outputs, "
-                        "device_chain_outputs, actual_manifest, or "
-                        "context_path+graph_name+vector_manifest"
-                    )
-            diagnoser = QualityDiagnoser(
-                reference_energy_floor=float(
-                    effective.get("reference_energy_floor", 0.0)
-                )
-            )
-            report = diagnoser.diagnose_slices(
-                references,
-                teacher_forced_outputs=teacher,
-                device_chain_outputs=chain,
-                lineage=effective.get("lineage"),
-            )
-            if not report.observations:
-                raise ValueError("SQNR validation produced no observations")
-            mode_reports: dict[str, Any] = {}
-            if requested_modes:
-                if SqnrMode.FULL_REFERENCE in requested_modes:
-                    full_actual = full_reference_actual
-                    if full_actual is None and set(full_references) == {"model"}:
-                        full_actual = chain
-                    if full_actual is None:
-                        raise InvalidSpecError(
-                            "full_reference SQNR requested without end-to-end "
-                            "device outputs",
-                            stage="validate",
-                        )
-                    full_report = diagnoser.diagnose_slices(
-                        full_references,
-                        device_chain_outputs=full_actual,
-                        lineage=effective.get("lineage"),
-                    )
-                    mode_reports[SqnrMode.FULL_REFERENCE.value] = (
-                        full_report.to_dict()
-                    )
-                if SqnrMode.TEACHER_FORCED in requested_modes:
-                    if teacher is None:
-                        raise InvalidSpecError(
-                            "teacher_forced SQNR requested without "
-                            "teacher-forced device outputs",
-                            stage="validate",
-                        )
-                    mode_reports[SqnrMode.TEACHER_FORCED.value] = (
-                        diagnoser.diagnose_slices(
-                            references,
-                            teacher_forced_outputs=teacher,
-                            lineage=effective.get("lineage"),
-                        ).to_dict()
-                    )
-                if SqnrMode.CHAIN in requested_modes:
-                    if chain is None:
-                        raise InvalidSpecError(
-                            "chain SQNR requested without device-chain outputs",
-                            stage="validate",
-                        )
-                    mode_reports[SqnrMode.CHAIN.value] = (
-                        diagnoser.diagnose_slices(
-                            references,
-                            device_chain_outputs=chain,
-                            lineage=effective.get("lineage"),
-                        ).to_dict()
-                    )
-            payload = report.to_dict()
-            payload["policy"] = "report_only"
-            payload["reference_source"] = reference_source
-            payload["requested_modes"] = [
-                mode.value for mode in requested_modes
-            ]
-            payload["executed_modes"] = list(mode_reports)
-            payload["mode_reports"] = mode_reports
-            if slice_reference_audit:
-                payload["slice_reference_evidence"] = slice_reference_audit
-            divergence_observed = any(
-                mode_report.get("first_teacher_error") is not None
-                or mode_report.get("first_chain_error") is not None
-                for mode_report in mode_reports.values()
-            ) if mode_reports else (
-                report.first_teacher_error is not None
-                or report.first_chain_error is not None
-            )
-            dump_intermediates = bool(
-                effective.get(
-                    "dump_intermediates_on_failure",
-                    manifest.build_spec.quality.dump_intermediates_on_failure,
-                )
-            )
-            if automatic_mode_execution:
-                payload["diagnostic_evidence"] = (
-                    self._diagnostic_context_evidence(
-                        manifest,
-                        effective,
-                        requested=dump_intermediates,
-                        divergence_observed=divergence_observed,
-                        slice_reference_refs=slice_reference_refs,
-                    )
-                )
-            payload["runtime_binding"] = {
-                key: _jsonable(effective.get(key))
-                for key in (
-                    "lane",
-                    "family",
-                    "ar",
-                    "context_length",
-                    "scope",
-                    "route_manifest",
-                    "context_path",
-                    "graph_name",
-                    "reference_model_path",
-                    "component",
-                    "coverage",
-                    "excluded_components",
-                    "graph_ar",
-                )
-                if effective.get(key) is not None
-            }
-            requested_ar_values = [
-                int(value)
-                for value in manifest.build_spec.sequence.ars
-            ]
-            if effective.get("ar") is not None:
-                executed_ar = int(effective["ar"])
-                payload["coverage"] = {
-                    "mode": (
-                        "single_ar_override"
-                        if selected_config.get("ar") is not None
-                        and not report_suffix
-                        else "single_ar"
-                    ),
-                    "requested_ars": requested_ar_values,
-                    "executed_ars": [executed_ar],
-                    "missing_ars": [
-                        ar
-                        for ar in requested_ar_values
-                        if ar != executed_ar
-                    ],
-                    "complete": requested_ar_values == [executed_ar],
-                }
-            else:
-                payload["coverage"] = {
-                    "mode": "explicit_custom_runtime",
-                    "requested_ars": requested_ar_values,
-                    "executed_ars": "caller_defined",
-                    "complete": None,
-                }
-            report_ref = atomic_publish_json(
-                output_dir / f"sqnr_report{report_suffix}.json",
-                payload,
-                kind=ArtifactKind.REPORT,
-                logical_name=f"sqnr_report{report_suffix}",
-            )
-            metrics: dict[str, Any] = {
-                "observation_count": len(report.observations),
-                "policy": "report_only",
-                "reference_source": reference_source,
-                "requested_modes": [
-                    mode.value for mode in requested_modes
-                ],
-                "executed_modes": list(mode_reports),
-                "divergence_observed": divergence_observed,
-            }
-            if "device_identifier" in locals():
-                metrics.update(
-                    {
-                        "device_identifier": device_identifier,
-                        "remote_attempt_dir": remote_attempt_dir,
-                        "remote_cleanup": "confirmed",
-                    }
-                )
-            return (
-                payload,
-                tuple(reference_refs) + slice_reference_refs + (report_ref,),
-                metrics,
+            return self._validate_one(
+                manifest,
+                adapter,
+                output_dir,
+                selected_config,
+                manifest_sha256=manifest_sha256,
+                report_suffix=report_suffix,
             )
 
         def operation(
@@ -5024,7 +5174,7 @@ class QairtAgent:
                 or selected.get("ar") is not None
                 or len(requested_ars) <= 1
             ):
-                return run_one(
+                return run_selected(
                     manifest,
                     adapter,
                     output_dir,
@@ -5032,71 +5182,28 @@ class QairtAgent:
                 )
 
             runtime_index = self._runtime_index_for_manifest(manifest)
-            vectors = runtime_index.get("vectors") or {}
-            exact_vectors = (
-                vectors.get("validation_manifests_by_ar") or {}
-                if isinstance(vectors, Mapping)
-                else {}
+            self._require_exact_multi_ar_vectors(
+                runtime_index,
+                requested_ars,
+                stage="validate",
             )
-            missing_vector_ars = [
-                ar for ar in requested_ars if not exact_vectors.get(str(ar))
-            ]
-            if missing_vector_ars:
-                raise InvalidSpecError(
-                    "automatic multi-AR validation requires one exact vector "
-                    "manifest for every requested AR",
-                    stage="validate",
-                    details={
-                        "requested_ars": list(requested_ars),
-                        "missing_vector_ars": missing_vector_ars,
-                        "hint": (
-                            "build must publish runtime_index.vectors."
-                            "validation_manifests_by_ar for every AR"
-                        ),
-                    },
-                )
+            (
+                results_by_ar,
+                output_refs,
+                per_ar_metrics,
+                _,
+            ) = self._fanout_reports_by_ar(
+                manifest,
+                adapter,
+                output_dir,
+                selected,
+                requested_ars,
+                stage="validate",
+                report_logical_prefix="sqnr_report",
+                run_one=run_selected,
+            )
 
-            results_by_ar: dict[str, Any] = {}
-            output_refs: list[ArtifactRef] = []
-            per_ar_metrics: dict[str, Any] = {}
-            for ar in requested_ars:
-                ar_key = str(ar)
-                payload, refs, metrics = run_one(
-                    manifest,
-                    adapter,
-                    output_dir / f"ar{ar}",
-                    {**selected, "ar": ar},
-                    report_suffix=f"_ar{ar}",
-                )
-                report_refs = [
-                    ref
-                    for ref in refs
-                    if ref.logical_name == f"sqnr_report_ar{ar}"
-                ]
-                if len(report_refs) != 1:
-                    raise InvalidSpecError(
-                        "multi-AR validation did not publish exactly one "
-                        f"AR{ar} SQNR report",
-                        stage="validate",
-                    )
-                results_by_ar[ar_key] = {
-                    "report": payload,
-                    "report_artifact": _jsonable(report_refs[0]),
-                }
-                per_ar_metrics[ar_key] = _jsonable(metrics)
-                output_refs.extend(refs)
-
-            coverage = {
-                "mode": "all_requested_ars",
-                "requested_ars": list(requested_ars),
-                "executed_ars": list(requested_ars),
-                "missing_ars": [],
-                "complete": True,
-                "context_lengths": [
-                    int(value)
-                    for value in manifest.build_spec.sequence.context_lengths
-                ],
-            }
+            coverage = self._multi_ar_coverage(manifest, requested_ars)
             reference_sources_by_ar = {
                 ar: result["report"].get("reference_source")
                 for ar, result in results_by_ar.items()
@@ -5106,11 +5213,23 @@ class QairtAgent:
                 for value in reference_sources_by_ar.values()
                 if value is not None
             }
+
+            def _ar_first_error(result: dict, field: str) -> Any:
+                """Derive first_teacher/chain_error from mode_reports (authoritative)."""
+                mode_reports = result["report"].get("mode_reports")
+                if mode_reports:
+                    for mode_report in mode_reports.values():
+                        value = mode_report.get(field)
+                        if value is not None:
+                            return value
+                    return None
+                return result["report"].get(field)
+
             first_teacher_error_ar = next(
                 (
                     ar
                     for ar, result in results_by_ar.items()
-                    if result["report"].get("first_teacher_error") is not None
+                    if _ar_first_error(result, "first_teacher_error") is not None
                 ),
                 None,
             )
@@ -5118,7 +5237,7 @@ class QairtAgent:
                 (
                     ar
                     for ar, result in results_by_ar.items()
-                    if result["report"].get("first_chain_error") is not None
+                    if _ar_first_error(result, "first_chain_error") is not None
                 ),
                 None,
             )
@@ -5136,8 +5255,9 @@ class QairtAgent:
                 ),
                 "reference_sources_by_ar": reference_sources_by_ar,
                 "first_teacher_error": (
-                    results_by_ar[first_teacher_error_ar]["report"].get(
-                        "first_teacher_error"
+                    _ar_first_error(
+                        results_by_ar[first_teacher_error_ar],
+                        "first_teacher_error",
                     )
                     if first_teacher_error_ar is not None
                     else None
@@ -5148,8 +5268,9 @@ class QairtAgent:
                     else None
                 ),
                 "first_chain_error": (
-                    results_by_ar[first_chain_error_ar]["report"].get(
-                        "first_chain_error"
+                    _ar_first_error(
+                        results_by_ar[first_chain_error_ar],
+                        "first_chain_error",
                     )
                     if first_chain_error_ar is not None
                     else None
@@ -5190,374 +5311,255 @@ class QairtAgent:
             execution_context=execution_context,
         )
 
-    def benchmark(
+    def _benchmark_one(
         self,
-        manifest_uri: str | Path,
-        manifest_sha256: str,
+        manifest: RunManifest,
+        adapter: Any,
+        output_dir: Path,
+        selected_config: Mapping[str, Any],
         *,
-        config: Mapping[str, Any] | None = None,
-        execution_context: StageExecutionContext | None = None,
-    ) -> ToolResult[dict[str, Any]]:
-        """Measure warmed wall latency with optional A/A calibration."""
+        manifest_sha256: str,
+        report_suffix: str = "",
+    ) -> tuple[dict[str, Any], tuple[ArtifactRef, ...], dict[str, Any]]:
+        """Execute and publish one AR-scoped latency benchmark report."""
 
-        selected = dict(config or {})
-
-        def run_one(
-            manifest: RunManifest,
-            adapter: Any,
-            output_dir: Path,
-            selected_config: Mapping[str, Any],
-            *,
-            report_suffix: str = "",
-        ) -> tuple[dict[str, Any], tuple[ArtifactRef, ...], dict[str, Any]]:
-            effective = dict(selected_config)
-            explicit_chain = effective.get("routes") is not None
-            explicit_graph = all(
-                effective.get(key) is not None
-                for key in ("context_path", "graph_name", "vector_manifest")
-            )
-            explicit_genai = effective.get("container_path") is not None
-            if not explicit_chain and not explicit_graph and not explicit_genai:
-                effective = self._automatic_runtime_binding(
-                    manifest,
-                    effective,
-                )
-            effective = self._enforce_qwen3_vl_runtime_scope(
+        effective = dict(selected_config)
+        explicit_chain = effective.get("routes") is not None
+        explicit_graph = all(
+            effective.get(key) is not None
+            for key in ("context_path", "graph_name", "vector_manifest")
+        )
+        explicit_genai = effective.get("container_path") is not None
+        if not explicit_chain and not explicit_graph and not explicit_genai:
+            effective = self._automatic_runtime_binding(
                 manifest,
                 effective,
-                stage="benchmark",
             )
+        effective = self._enforce_qwen3_vl_runtime_scope(
+            manifest,
+            effective,
+            stage="benchmark",
+        )
 
-            spec = manifest.build_spec
-            optrace_enabled = bool(
-                effective.get("optrace", spec.benchmark.optrace)
+        spec = manifest.build_spec
+        optrace_enabled = bool(
+            effective.get("optrace", spec.benchmark.optrace)
+        )
+        profile_level = str(
+            effective.get("profile_level", "detailed")
+        )
+        profile_option = str(
+            effective.get("profile_option", "optrace")
+        )
+        if optrace_enabled and profile_option.lower() != "optrace":
+            raise InvalidSpecError(
+                "benchmark.optrace requires profile_option='optrace'",
+                stage="benchmark",
+                details={"profile_option": profile_option},
             )
-            profile_level = str(
-                effective.get("profile_level", "detailed")
-            )
-            profile_option = str(
-                effective.get("profile_option", "optrace")
-            )
-            if optrace_enabled and profile_option.lower() != "optrace":
+        profile_entries: list[dict[str, Any]] = []
+        normalized_profile_ops: list[dict[str, Any]] = []
+        profile_source_refs: list[ArtifactRef] = []
+        self._preflight(adapter, spec)
+        execution_options = self._execution_options(effective)
+        native_io = bool(effective.get("native_io", False))
+        scope = "graph"
+        generation_metrics: dict[str, Any] | None = None
+        generated_text_sha256: str | None = None
+        generated_text_length: int | None = None
+        profile_routes: Sequence[Mapping[str, Any]] | None = None
+        profile_contexts: Mapping[str, Any] | None = None
+        profile_inputs: dict[str, np.ndarray] | None = None
+        profile_ar: int | None = None
+        profile_initial_native_state: dict[str, np.ndarray] = {}
+        profile_claim_scope = (
+            "production_runtime_optrace"
+        )
+        if effective.get("lane") == "genai_builder" or explicit_genai:
+            if not effective.get("runtime_supported", True):
                 raise InvalidSpecError(
-                    "benchmark.optrace requires profile_option='optrace'",
+                    "the saved GenAI container is marked runtime unsupported "
+                    "by the selected QAIRT workflow",
                     stage="benchmark",
-                    details={"profile_option": profile_option},
+                    details={
+                        "family": effective.get("family"),
+                        "container_path": effective.get("container_path"),
+                    },
                 )
-            profile_entries: list[dict[str, Any]] = []
-            normalized_profile_ops: list[dict[str, Any]] = []
-            profile_source_refs: list[ArtifactRef] = []
-            self._preflight(adapter, spec)
-            execution_options = self._execution_options(effective)
-            native_io = bool(effective.get("native_io", False))
-            scope = "graph"
-            generation_metrics: dict[str, Any] | None = None
-            generated_text_sha256: str | None = None
-            generated_text_length: int | None = None
-            profile_routes: Sequence[Mapping[str, Any]] | None = None
-            profile_contexts: Mapping[str, Any] | None = None
-            profile_inputs: dict[str, np.ndarray] | None = None
-            profile_ar: int | None = None
-            profile_initial_native_state: dict[str, np.ndarray] = {}
-            profile_claim_scope = (
-                "production_runtime_optrace"
-            )
-            if effective.get("lane") == "genai_builder" or explicit_genai:
-                if not effective.get("runtime_supported", True):
+            if effective.get("container_path") is None:
+                raise ValueError(
+                    "GenAI benchmark requires container_path"
+                )
+            if effective.get("prompt") is not None:
+                prompt: Any = effective["prompt"]
+            elif effective.get("prompt_path") is not None:
+                prompt = Path(effective["prompt_path"]).expanduser().resolve()
+                if not prompt.is_file():
+                    raise FileNotFoundError(
+                        f"GenAI prompt_path does not exist: {prompt}"
+                    )
+            else:
+                raise InvalidSpecError(
+                    "GenAI benchmark requires stage_configs.benchmark.prompt "
+                    "or prompt_path so the measured workload is explicit",
+                    stage="benchmark",
+                )
+            tensor_runtime = effective.get("tensor_runtime")
+            if optrace_enabled:
+                if "steps" in effective:
                     raise InvalidSpecError(
-                        "the saved GenAI container is marked runtime unsupported "
-                        "by the selected QAIRT workflow",
+                        "GenAI benchmark.optrace does not accept chain "
+                        "steps; select one explicit AR raw-tensor binding",
+                        stage="benchmark",
+                        details={"unsupported_field": "steps"},
+                    )
+                if not isinstance(tensor_runtime, Mapping):
+                    raise InvalidSpecError(
+                        "GenAI benchmark.optrace requires an auditable "
+                        "public raw CompiledModel tensor runtime",
                         stage="benchmark",
                         details={
                             "family": effective.get("family"),
-                            "container_path": effective.get("container_path"),
+                            "container_path": effective.get(
+                                "container_path"
+                            ),
                         },
                     )
-                if effective.get("container_path") is None:
-                    raise ValueError(
-                        "GenAI benchmark requires container_path"
+                raw_routes = tensor_runtime.get("routes")
+                raw_contexts = tensor_runtime.get("contexts")
+                if (
+                    not isinstance(raw_routes, Sequence)
+                    or isinstance(
+                        raw_routes,
+                        (str, bytes, bytearray),
                     )
-                if effective.get("prompt") is not None:
-                    prompt: Any = effective["prompt"]
-                elif effective.get("prompt_path") is not None:
-                    prompt = Path(effective["prompt_path"]).expanduser().resolve()
-                    if not prompt.is_file():
-                        raise FileNotFoundError(
-                            f"GenAI prompt_path does not exist: {prompt}"
-                        )
-                else:
+                    or not raw_routes
+                    or not isinstance(raw_contexts, Mapping)
+                    or not raw_contexts
+                ):
                     raise InvalidSpecError(
-                        "GenAI benchmark requires stage_configs.benchmark.prompt "
-                        "or prompt_path so the measured workload is explicit",
+                        "GenAI tensor runtime is missing raw routes or "
+                        "compiled contexts required for optrace",
                         stage="benchmark",
                     )
-                tensor_runtime = effective.get("tensor_runtime")
-                if optrace_enabled:
-                    if not isinstance(tensor_runtime, Mapping):
-                        raise InvalidSpecError(
-                            "GenAI benchmark.optrace requires an auditable "
-                            "public raw CompiledModel tensor runtime",
-                            stage="benchmark",
-                            details={
-                                "family": effective.get("family"),
-                                "container_path": effective.get(
-                                    "container_path"
-                                ),
-                            },
-                        )
-                    raw_routes = tensor_runtime.get("routes")
-                    raw_contexts = tensor_runtime.get("contexts")
-                    if (
-                        not isinstance(raw_routes, Sequence)
-                        or isinstance(
-                            raw_routes,
-                            (str, bytes, bytearray),
-                        )
-                        or not raw_routes
-                        or not isinstance(raw_contexts, Mapping)
-                        or not raw_contexts
-                    ):
-                        raise InvalidSpecError(
-                            "GenAI tensor runtime is missing raw routes or "
-                            "compiled contexts required for optrace",
-                            stage="benchmark",
-                        )
-                    if effective.get("vector_manifest") is None:
-                        raise InvalidSpecError(
-                            "GenAI benchmark.optrace requires the exact per-AR "
-                            "vector manifest selected by runtime_index",
-                            stage="benchmark",
-                        )
-                    profile_routes = list(raw_routes)
-                    profile_contexts = dict(raw_contexts)
-                    profile_inputs = self._manifest_inputs(
-                        effective["vector_manifest"],
-                        sha256=effective.get("vector_manifest_sha256"),
+                if effective.get("vector_manifest") is None:
+                    raise InvalidSpecError(
+                        "GenAI benchmark.optrace requires the exact per-AR "
+                        "vector manifest selected by runtime_index",
+                        stage="benchmark",
                     )
-                    profile_initial_native_state = (
-                        self._initial_native_state_from_routes(
-                            profile_routes,
-                            profile_inputs,
-                        )
-                    )
-                    profile_ar = int(
-                        effective.get("ar", spec.sequence.ars[0])
-                    )
-                    profile_claim_scope = (
-                        "raw_compiled_slices_not_generation_wall_latency"
-                    )
-                context_paths = (
-                    tuple(profile_contexts.values())
-                    if profile_contexts is not None
-                    else ()
+                profile_routes = list(raw_routes)
+                profile_contexts = dict(raw_contexts)
+                profile_inputs = self._manifest_inputs(
+                    effective["vector_manifest"],
+                    sha256=effective.get("vector_manifest_sha256"),
                 )
-                vector_manifests = (
-                    (effective["vector_manifest"],)
-                    if profile_inputs is not None
-                    else ()
-                )
-                inline_cases: list[Mapping[str, Any]] = []
-                if profile_initial_native_state:
-                    inline_cases.append(profile_initial_native_state)
-                scope = "genai_generation"
-            elif effective.get("routes") is not None:
-                contexts = effective.get("contexts")
-                if not isinstance(contexts, Mapping) or not contexts:
-                    raise ValueError(
-                        "chain benchmark requires config.contexts mapped by slice"
+                profile_initial_native_state = (
+                    self._initial_native_state_from_routes(
+                        profile_routes,
+                        profile_inputs,
                     )
-                context_paths = tuple(contexts.values())
-                vector_manifests = (
-                    (effective["vector_manifest"],)
-                    if effective.get("vector_manifest") is not None
-                    else ()
                 )
-                inline_cases = [
-                    dict(step.get("inputs", {}))
-                    for step in effective.get("steps", ())
-                    if isinstance(step, Mapping)
-                ]
-                initial_native_state = self._tensor_mapping(
-                    effective.get("initial_native_state", {})
+                profile_ar = int(
+                    effective.get("ar", spec.sequence.ars[0])
                 )
-                if (
-                    not initial_native_state
-                    and effective.get("vector_manifest") is not None
-                ):
-                    manifest_inputs = self._manifest_inputs(
-                        effective["vector_manifest"],
-                        sha256=effective.get("vector_manifest_sha256"),
-                    )
-                    initial_native_state = self._initial_native_state_from_routes(
-                        effective["routes"],
-                        manifest_inputs,
-                    )
-                if initial_native_state:
-                    inline_cases.append(initial_native_state)
-                profile_routes = list(effective["routes"])
-                profile_contexts = dict(contexts)
-                profile_initial_native_state = dict(initial_native_state)
-
-            else:
-                required = ("context_path", "graph_name", "vector_manifest")
-                missing = [key for key in required if effective.get(key) is None]
-                if missing:
-                    raise ValueError(f"benchmark missing config fields: {missing}")
-                context_paths = (effective["context_path"],)
-                vector_manifests = (effective["vector_manifest"],)
-                inline_cases = []
-
-            push_files = self._device_stage_files(
-                output_dir,
-                contexts=context_paths,
-                vector_manifests=vector_manifests,
-                inline_cases=tuple(inline_cases),
+                profile_claim_scope = (
+                    "raw_compiled_slices_not_generation_wall_latency"
+                )
+            context_paths = (
+                tuple(profile_contexts.values())
+                if profile_contexts is not None
+                else ()
             )
-
-            warmup = int(effective.get("warmup_runs", spec.benchmark.warmup_runs))
-            repeats = int(
-                effective.get("measured_runs", spec.benchmark.measured_runs)
+            vector_manifests = (
+                (effective["vector_manifest"],)
+                if profile_inputs is not None
+                else ()
             )
-            diagnoser = LatencyDiagnoser()
-            with self._device_stage(
-                manifest,
-                adapter,
-                stage_name="benchmark",
-                input_manifest_sha256=manifest_sha256,
-                stage_config=effective,
-                push_files=push_files,
-            ) as device_stage:
-                if effective.get("lane") == "genai_builder" or explicit_genai:
-                    executor = adapter.create_genai_executor(
-                        effective["container_path"],
-                        device=device_stage.device,
-                    )
-                    last_generation: dict[str, Any] = {}
+            inline_cases: list[Mapping[str, Any]] = []
+            if profile_initial_native_state:
+                inline_cases.append(profile_initial_native_state)
+            scope = "genai_generation"
+        elif effective.get("routes") is not None:
+            contexts = effective.get("contexts")
+            if not isinstance(contexts, Mapping) or not contexts:
+                raise ValueError(
+                    "chain benchmark requires config.contexts mapped by slice"
+                )
+            context_paths = tuple(contexts.values())
+            vector_manifests = (
+                (effective["vector_manifest"],)
+                if effective.get("vector_manifest") is not None
+                else ()
+            )
+            inline_cases = [
+                dict(step.get("inputs", {}))
+                for step in effective.get("steps", ())
+                if isinstance(step, Mapping)
+            ]
+            initial_native_state = self._tensor_mapping(
+                effective.get("initial_native_state", {})
+            )
+            if (
+                not initial_native_state
+                and effective.get("vector_manifest") is not None
+            ):
+                manifest_inputs = self._manifest_inputs(
+                    effective["vector_manifest"],
+                    sha256=effective.get("vector_manifest_sha256"),
+                )
+                initial_native_state = self._initial_native_state_from_routes(
+                    effective["routes"],
+                    manifest_inputs,
+                )
+            if initial_native_state:
+                inline_cases.append(initial_native_state)
+            profile_routes = list(effective["routes"])
+            profile_contexts = dict(contexts)
+            profile_initial_native_state = dict(initial_native_state)
 
-                    def invoke() -> Any:
-                        result = executor.generate(prompt)
-                        last_generation["result"] = result
-                        return result
+        else:
+            required = ("context_path", "graph_name", "vector_manifest")
+            missing = [key for key in required if effective.get(key) is None]
+            if missing:
+                raise ValueError(f"benchmark missing config fields: {missing}")
+            context_paths = (effective["context_path"],)
+            vector_manifests = (effective["vector_manifest"],)
+            inline_cases = []
 
-                    try:
-                        measurement = diagnoser.measure(
-                            invoke,
-                            warmup=warmup,
-                            repeats=repeats,
-                        )
-                        aa_measurement = (
-                            diagnoser.calibrate_aa(
-                                invoke,
-                                warmup=warmup,
-                                repeats=repeats,
-                            )
-                            if bool(effective.get("aa_calibration", True))
-                            else None
-                        )
-                        result = last_generation.get("result")
-                        metrics_value = getattr(result, "metrics", None)
-                        if metrics_value is not None:
-                            generation_metrics = _jsonable(metrics_value)
-                        generated_text = getattr(result, "generated_text", None)
-                        if isinstance(generated_text, str):
-                            generated_text_length = len(generated_text)
-                            generated_text_sha256 = hashlib.sha256(
-                                generated_text.encode("utf-8")
-                            ).hexdigest()
-                    finally:
-                        adapter.clean_genai_executor(executor)
-                elif effective.get("routes") is not None:
-                    loaded_contexts: dict[str, Any] = {}
-                    for slice_name, context_path in contexts.items():
-                        if hasattr(adapter, "load_compiled"):
-                            loaded_contexts[str(slice_name)] = (
-                                adapter.load_compiled(context_path)
-                            )
-                        elif hasattr(adapter, "_compiled_model"):
-                            loaded_contexts[str(slice_name)] = (
-                                adapter._compiled_model(context_path)
-                            )
-                        else:
-                            loaded_contexts[str(slice_name)] = context_path
-                    runner = SliceChainRunner(
-                        effective["routes"],
-                        self._chain_executors(
-                            adapter,
-                            loaded_contexts,
-                            device=device_stage.device,
-                            native_io=native_io,
-                            execution_options=execution_options,
-                        ),
-                    )
-                    scope = (
-                        "chain_sequence" if "steps" in effective else "chain"
-                    )
-                    if "steps" in effective:
-                        steps = effective["steps"]
+        push_files = self._device_stage_files(
+            output_dir,
+            contexts=context_paths,
+            vector_manifests=vector_manifests,
+            inline_cases=tuple(inline_cases),
+        )
 
-                        def invoke() -> Any:
-                            return runner.run_sequence(
-                                steps,
-                                mode="device_chain",
-                                initial_native_state=initial_native_state,
-                            )
+        warmup = int(effective.get("warmup_runs", spec.benchmark.warmup_runs))
+        repeats = int(
+            effective.get("measured_runs", spec.benchmark.measured_runs)
+        )
+        diagnoser = LatencyDiagnoser()
+        with self._device_stage(
+            manifest,
+            adapter,
+            stage_name="benchmark",
+            input_manifest_sha256=manifest_sha256,
+            stage_config=effective,
+            push_files=push_files,
+        ) as device_stage:
+            if effective.get("lane") == "genai_builder" or explicit_genai:
+                executor = adapter.create_genai_executor(
+                    effective["container_path"],
+                    device=device_stage.device,
+                )
+                last_generation: dict[str, Any] = {}
 
-                    else:
-                        if effective.get("vector_manifest") is None:
-                            raise ValueError(
-                                "chain benchmark requires vector_manifest "
-                                "when steps are absent"
-                            )
-                        inputs = self._manifest_inputs(
-                            effective["vector_manifest"],
-                            sha256=effective.get("vector_manifest_sha256"),
-                        )
-                        ar = int(
-                            effective.get("ar", spec.sequence.ars[0])
-                        )
-                        profile_inputs = dict(inputs)
-                        profile_ar = ar
+                def invoke() -> Any:
+                    result = executor.generate(prompt)
+                    last_generation["result"] = result
+                    return result
 
-                        def invoke() -> Any:
-                            return runner.run_device_chain(
-                                inputs,
-                                ar=ar,
-                                initial_native_state=initial_native_state,
-                            )
-
-                else:
-                    inputs = self._manifest_inputs(
-                        effective["vector_manifest"],
-                        sha256=effective.get("vector_manifest_sha256"),
-                    )
-                    if hasattr(adapter, "load_compiled"):
-                        compiled = adapter.load_compiled(
-                            effective["context_path"]
-                        )
-                    elif hasattr(adapter, "_compiled_model"):
-                        compiled = adapter._compiled_model(
-                            effective["context_path"]
-                        )
-                    else:
-                        compiled = effective["context_path"]
-
-                    def invoke() -> Any:
-                        return adapter.run_graph(
-                            compiled,
-                            inputs,
-                            graph_name=str(effective["graph_name"]),
-                            device=device_stage.device,
-                            native_io=native_io,
-                            **execution_options,
-                        )
-                    profile_inputs = dict(inputs)
-                    profile_ar = int(
-                        effective.get("ar", spec.sequence.ars[0])
-                    )
-
-                if scope != "genai_generation":
-                    # Context loading, Device construction, ADB staging, and
-                    # graph-runner setup are all complete before the timer.
+                try:
                     measurement = diagnoser.measure(
                         invoke,
                         warmup=warmup,
@@ -5572,361 +5574,508 @@ class QairtAgent:
                         if bool(effective.get("aa_calibration", True))
                         else None
                     )
-                if optrace_enabled:
-                    if not hasattr(adapter, "profile"):
-                        raise InvalidSpecError(
-                            "the selected QAIRT adapter does not expose the "
-                            "public profile API required by benchmark.optrace",
-                            stage="benchmark",
+                    result = last_generation.get("result")
+                    metrics_value = getattr(result, "metrics", None)
+                    if metrics_value is not None:
+                        generation_metrics = _jsonable(metrics_value)
+                    generated_text = getattr(result, "generated_text", None)
+                    if isinstance(generated_text, str):
+                        generated_text_length = len(generated_text)
+                        generated_text_sha256 = hashlib.sha256(
+                            generated_text.encode("utf-8")
+                        ).hexdigest()
+                finally:
+                    adapter.clean_genai_executor(executor)
+            elif effective.get("routes") is not None:
+                loaded_contexts: dict[str, Any] = {}
+                for slice_name, context_path in contexts.items():
+                    if hasattr(adapter, "load_compiled"):
+                        loaded_contexts[str(slice_name)] = (
+                            adapter.load_compiled(context_path)
+                        )
+                    elif hasattr(adapter, "_compiled_model"):
+                        loaded_contexts[str(slice_name)] = (
+                            adapter._compiled_model(context_path)
+                        )
+                    else:
+                        loaded_contexts[str(slice_name)] = context_path
+                runner = SliceChainRunner(
+                    effective["routes"],
+                    self._chain_executors(
+                        adapter,
+                        loaded_contexts,
+                        device=device_stage.device,
+                        native_io=native_io,
+                        execution_options=execution_options,
+                    ),
+                )
+                scope = (
+                    "chain_sequence" if "steps" in effective else "chain"
+                )
+                if "steps" in effective:
+                    steps = effective["steps"]
+
+                    def invoke() -> Any:
+                        return runner.run_sequence(
+                            steps,
+                            mode="device_chain",
+                            initial_native_state=initial_native_state,
                         )
 
-                    def capture_profile(
-                        compiled_context: Any,
-                        profile_inputs: Mapping[str, np.ndarray],
-                        *,
-                        slice_id: str,
-                        graph_name: str,
-                        step_index: int,
-                    ) -> dict[str, np.ndarray]:
-                        profiled = adapter.profile(
-                            compiled_context,
-                            profile_inputs,
-                            graph_name=graph_name,
-                            device=device_stage.device,
-                            native_io=native_io,
-                            level=profile_level,
-                            option=profile_option,
-                            **execution_options,
+                else:
+                    if effective.get("vector_manifest") is None:
+                        raise ValueError(
+                            "chain benchmark requires vector_manifest "
+                            "when steps are absent"
                         )
-                        raw_reports: list[Any] = []
-                        source_refs: list[ArtifactRef] = []
-                        profile_call_index = len(profile_entries)
-                        for report_index, raw_report in enumerate(
-                            tuple(getattr(profiled, "reports", ()) or ())
-                        ):
-                            report_payload, source_ref = (
-                                self._profile_report_payload(raw_report)
-                            )
-                            raw_reports.append(report_payload)
-                            captured_ref = atomic_publish_json(
-                                output_dir
-                                / "optrace"
-                                / (
-                                    f"profile-{profile_call_index:04d}-"
-                                    f"report-{report_index:04d}.json"
-                                ),
-                                {
-                                    "schema": (
-                                        "qairt-agent.captured-profile-report.v1"
-                                    ),
-                                    "source_artifact": (
-                                        _jsonable(source_ref)
-                                        if source_ref is not None
-                                        else None
-                                    ),
-                                    "report": report_payload,
-                                },
-                                kind=ArtifactKind.REPORT,
-                            )
-                            source_refs.append(captured_ref)
-                        records = self._normalize_optrace_records(
-                            raw_reports,
-                            slice_id=slice_id,
-                            graph_name=graph_name,
-                            step_index=step_index,
+                    inputs = self._manifest_inputs(
+                        effective["vector_manifest"],
+                        sha256=effective.get("vector_manifest_sha256"),
+                    )
+                    ar = int(
+                        effective.get("ar", spec.sequence.ars[0])
+                    )
+                    profile_inputs = dict(inputs)
+                    profile_ar = ar
+
+                    def invoke() -> Any:
+                        return runner.run_device_chain(
+                            inputs,
+                            ar=ar,
+                            initial_native_state=initial_native_state,
                         )
-                        profile_entries.append(
+
+            else:
+                inputs = self._manifest_inputs(
+                    effective["vector_manifest"],
+                    sha256=effective.get("vector_manifest_sha256"),
+                )
+                if hasattr(adapter, "load_compiled"):
+                    compiled = adapter.load_compiled(
+                        effective["context_path"]
+                    )
+                elif hasattr(adapter, "_compiled_model"):
+                    compiled = adapter._compiled_model(
+                        effective["context_path"]
+                    )
+                else:
+                    compiled = effective["context_path"]
+
+                def invoke() -> Any:
+                    return adapter.run_graph(
+                        compiled,
+                        inputs,
+                        graph_name=str(effective["graph_name"]),
+                        device=device_stage.device,
+                        native_io=native_io,
+                        **execution_options,
+                    )
+                profile_inputs = dict(inputs)
+                profile_ar = int(
+                    effective.get("ar", spec.sequence.ars[0])
+                )
+
+            if scope != "genai_generation":
+                # Context loading, Device construction, ADB staging, and
+                # graph-runner setup are all complete before the timer.
+                measurement = diagnoser.measure(
+                    invoke,
+                    warmup=warmup,
+                    repeats=repeats,
+                )
+                aa_measurement = (
+                    diagnoser.calibrate_aa(
+                        invoke,
+                        warmup=warmup,
+                        repeats=repeats,
+                    )
+                    if bool(effective.get("aa_calibration", True))
+                    else None
+                )
+            if optrace_enabled:
+                if not hasattr(adapter, "profile"):
+                    raise InvalidSpecError(
+                        "the selected QAIRT adapter does not expose the "
+                        "public profile API required by benchmark.optrace",
+                        stage="benchmark",
+                    )
+
+                def capture_profile(
+                    compiled_context: Any,
+                    profile_inputs: Mapping[str, np.ndarray],
+                    *,
+                    slice_id: str,
+                    graph_name: str,
+                    step_index: int,
+                ) -> dict[str, np.ndarray]:
+                    profiled = adapter.profile(
+                        compiled_context,
+                        profile_inputs,
+                        graph_name=graph_name,
+                        device=device_stage.device,
+                        native_io=native_io,
+                        level=profile_level,
+                        option=profile_option,
+                        **execution_options,
+                    )
+                    raw_reports: list[Any] = []
+                    source_refs: list[ArtifactRef] = []
+                    profile_call_index = len(profile_entries)
+                    for report_index, raw_report in enumerate(
+                        tuple(getattr(profiled, "reports", ()) or ())
+                    ):
+                        report_payload, source_ref = (
+                            self._profile_report_payload(raw_report)
+                        )
+                        raw_reports.append(report_payload)
+                        captured_ref = atomic_publish_json(
+                            output_dir
+                            / "optrace"
+                            / (
+                                f"profile-{profile_call_index:04d}-"
+                                f"report-{report_index:04d}.json"
+                            ),
                             {
-                                "slice_id": slice_id,
-                                "graph_name": graph_name,
-                                "step_index": step_index,
-                                "level": str(
-                                    getattr(
-                                        profiled,
-                                        "level",
-                                        profile_level,
-                                    )
+                                "schema": (
+                                    "qairt-agent.captured-profile-report.v1"
                                 ),
-                                "option": str(
-                                    getattr(
-                                        profiled,
-                                        "option",
-                                        profile_option,
-                                    )
+                                "source_artifact": (
+                                    _jsonable(source_ref)
+                                    if source_ref is not None
+                                    else None
                                 ),
-                                "reports": raw_reports,
-                                "report_artifacts": [
-                                    _jsonable(ref) for ref in source_refs
-                                ],
-                                "normalized_op_count": len(records),
-                            }
+                                "report": report_payload,
+                            },
+                            kind=ArtifactKind.REPORT,
                         )
-                        normalized_profile_ops.extend(records)
-                        profile_source_refs.extend(source_refs)
-                        return _output_mapping(
-                            getattr(profiled, "execution_result", None),
-                            graph_name=graph_name,
-                        )
-
-                    if profile_routes is not None:
-                        assert profile_contexts is not None
-                        loaded_profile_contexts: dict[str, Any] = {}
-                        for (
-                            slice_name,
-                            context_path,
-                        ) in profile_contexts.items():
-                            if hasattr(adapter, "load_compiled"):
-                                loaded_profile_contexts[str(slice_name)] = (
-                                    adapter.load_compiled(context_path)
+                        source_refs.append(captured_ref)
+                    records = self._normalize_optrace_records(
+                        raw_reports,
+                        slice_id=slice_id,
+                        graph_name=graph_name,
+                        step_index=step_index,
+                    )
+                    profile_entries.append(
+                        {
+                            "slice_id": slice_id,
+                            "graph_name": graph_name,
+                            "step_index": step_index,
+                            "level": str(
+                                getattr(
+                                    profiled,
+                                    "level",
+                                    profile_level,
                                 )
-                            elif hasattr(adapter, "_compiled_model"):
-                                loaded_profile_contexts[str(slice_name)] = (
-                                    adapter._compiled_model(context_path)
+                            ),
+                            "option": str(
+                                getattr(
+                                    profiled,
+                                    "option",
+                                    profile_option,
                                 )
-                            else:
-                                loaded_profile_contexts[str(slice_name)] = (
-                                    context_path
-                                )
-                        profile_executors: dict[
-                            str,
-                            Callable[
-                                [Mapping[str, np.ndarray], Any],
-                                Mapping[str, np.ndarray],
+                            ),
+                            "reports": raw_reports,
+                            "report_artifacts": [
+                                _jsonable(ref) for ref in source_refs
                             ],
-                        ] = {}
-                        for (
-                            slice_name,
-                            compiled_context,
-                        ) in loaded_profile_contexts.items():
-                            def execute_profile(
-                                slice_inputs: Mapping[str, np.ndarray],
-                                invocation: Any,
-                                *,
-                                context: Any = compiled_context,
-                                bound_slice: str = str(slice_name),
-                            ) -> Mapping[str, np.ndarray]:
-                                return capture_profile(
-                                    context,
-                                    slice_inputs,
-                                    slice_id=bound_slice,
-                                    graph_name=invocation.graph_name,
-                                    step_index=int(invocation.step_index),
-                                )
+                            "normalized_op_count": len(records),
+                        }
+                    )
+                    normalized_profile_ops.extend(records)
+                    profile_source_refs.extend(source_refs)
+                    return _output_mapping(
+                        getattr(profiled, "execution_result", None),
+                        graph_name=graph_name,
+                    )
 
-                            profile_executors[str(slice_name)] = (
-                                execute_profile
+                if profile_routes is not None:
+                    assert profile_contexts is not None
+                    loaded_profile_contexts: dict[str, Any] = {}
+                    for (
+                        slice_name,
+                        context_path,
+                    ) in profile_contexts.items():
+                        if hasattr(adapter, "load_compiled"):
+                            loaded_profile_contexts[str(slice_name)] = (
+                                adapter.load_compiled(context_path)
                             )
-                        profile_runner = SliceChainRunner(
-                            profile_routes,
-                            profile_executors,
-                        )
-                        if "steps" in effective:
-                            profile_runner.run_sequence(
-                                steps,
-                                mode="device_chain",
-                                initial_native_state=initial_native_state,
+                        elif hasattr(adapter, "_compiled_model"):
+                            loaded_profile_contexts[str(slice_name)] = (
+                                adapter._compiled_model(context_path)
                             )
                         else:
-                            if profile_inputs is None or profile_ar is None:
-                                raise InvalidSpecError(
-                                    "optrace chain execution is missing exact "
-                                    "inputs or AR selection",
-                                    stage="benchmark",
-                                )
-                            profile_runner.run_device_chain(
-                                profile_inputs,
-                                ar=profile_ar,
-                                initial_native_state=(
-                                    profile_initial_native_state
-                                ),
+                            loaded_profile_contexts[str(slice_name)] = (
+                                context_path
                             )
+                    profile_executors: dict[
+                        str,
+                        Callable[
+                            [Mapping[str, np.ndarray], Any],
+                            Mapping[str, np.ndarray],
+                        ],
+                    ] = {}
+                    for (
+                        slice_name,
+                        compiled_context,
+                    ) in loaded_profile_contexts.items():
+                        def execute_profile(
+                            slice_inputs: Mapping[str, np.ndarray],
+                            invocation: Any,
+                            *,
+                            context: Any = compiled_context,
+                            bound_slice: str = str(slice_name),
+                        ) -> Mapping[str, np.ndarray]:
+                            return capture_profile(
+                                context,
+                                slice_inputs,
+                                slice_id=bound_slice,
+                                graph_name=invocation.graph_name,
+                                step_index=int(invocation.step_index),
+                            )
+
+                        profile_executors[str(slice_name)] = (
+                            execute_profile
+                        )
+                    profile_runner = SliceChainRunner(
+                        profile_routes,
+                        profile_executors,
+                    )
+                    if "steps" in effective:
+                        profile_runner.run_sequence(
+                            steps,
+                            mode="device_chain",
+                            initial_native_state=initial_native_state,
+                        )
                     else:
-                        capture_profile(
-                            compiled,
-                            inputs,
-                            slice_id=str(
-                                effective.get("slice_id") or "model"
+                        if profile_inputs is None or profile_ar is None:
+                            raise InvalidSpecError(
+                                "optrace chain execution is missing exact "
+                                "inputs or AR selection",
+                                stage="benchmark",
+                            )
+                        profile_runner.run_device_chain(
+                            profile_inputs,
+                            ar=profile_ar,
+                            initial_native_state=(
+                                profile_initial_native_state
                             ),
-                            graph_name=str(effective["graph_name"]),
-                            step_index=0,
                         )
-                    if not normalized_profile_ops:
-                        raise InvalidSpecError(
-                            "benchmark.optrace produced no structured per-op "
-                            "cycle records; raw profiler reports cannot support "
-                            "automatic latency attribution",
-                            stage="benchmark",
-                            details={
-                                "profile_count": len(profile_entries),
-                                "required_fields": [
-                                    "op_id/name",
-                                    "cycles or thread_cycles",
-                                ],
-                            },
-                        )
-                device_identifier = device_stage.identifier
-                remote_attempt_dir = device_stage.adb.attempt_dir
-            optrace_ref: ArtifactRef | None = None
-            if optrace_enabled:
-                runtime_indexes = [
-                    artifact
-                    for artifact in manifest.artifacts
-                    if artifact.logical_name == "runtime_index"
-                ]
-                if len(runtime_indexes) != 1:
+                else:
+                    capture_profile(
+                        compiled,
+                        inputs,
+                        slice_id=str(
+                            effective.get("slice_id") or "model"
+                        ),
+                        graph_name=str(effective["graph_name"]),
+                        step_index=0,
+                    )
+                if not normalized_profile_ops:
                     raise InvalidSpecError(
-                        "benchmark.optrace requires exactly one build "
-                        "runtime_index artifact",
+                        "benchmark.optrace produced no structured per-op "
+                        "cycle records; raw profiler reports cannot support "
+                        "automatic latency attribution",
                         stage="benchmark",
                         details={
-                            "runtime_index_count": len(runtime_indexes)
+                            "profile_count": len(profile_entries),
+                            "required_fields": [
+                                "op_id/name",
+                                "cycles or thread_cycles",
+                            ],
                         },
                     )
-                verify_artifact(runtime_indexes[0])
-                optrace_ref = atomic_publish_json(
-                    output_dir / f"optrace_evidence{report_suffix}.json",
-                    {
-                        "schema": "qairt-agent.optrace-evidence.v1",
-                        "source_manifest_sha256": manifest_sha256,
-                        "runtime_index": _jsonable(runtime_indexes[0]),
-                        "runtime_binding": {
-                            key: _jsonable(effective.get(key))
-                            for key in (
-                                "lane",
-                                "family",
-                                "ar",
-                                "context_length",
-                                "scope",
-                                "route_manifest",
-                                "context_path",
-                                "graph_name",
-                                "component",
-                                "coverage",
-                            )
-                            if effective.get(key) is not None
-                        },
-                        "device_identifier": device_identifier,
-                        "profile_level": profile_level,
-                        "profile_option": profile_option,
-                        "profiles": profile_entries,
-                        "ops": normalized_profile_ops,
-                        "profile_scope": profile_claim_scope,
-                        "claim_scope": (
-                            "reported_op_work_not_additive_wall_latency"
-                        ),
-                    },
-                    kind=ArtifactKind.REPORT,
-                    logical_name=f"optrace_evidence{report_suffix}",
-                )
-            payload: dict[str, Any] = {
-                "measurement": measurement.to_dict(),
-                "policy": "report_only",
-                "setup_excluded": True,
-                "scope": scope,
-                "runtime_binding": {
-                    key: _jsonable(effective.get(key))
-                    for key in (
-                        "lane",
-                        "family",
-                        "ar",
-                        "context_length",
-                        "scope",
-                        "route_manifest",
-                        "context_path",
-                        "graph_name",
-                        "container_path",
-                        "component",
-                        "coverage",
-                        "excluded_components",
-                        "graph_ar",
-                    )
-                    if effective.get(key) is not None
-                },
-            }
-            requested_ar_values = [
-                int(value) for value in spec.sequence.ars
+            device_identifier = device_stage.identifier
+            remote_attempt_dir = device_stage.adb.attempt_dir
+        optrace_ref: ArtifactRef | None = None
+        if optrace_enabled:
+            runtime_indexes = [
+                artifact
+                for artifact in manifest.artifacts
+                if artifact.logical_name == "runtime_index"
             ]
-            if scope == "genai_generation":
-                payload["coverage"] = {
-                    "mode": "executor_managed_generation",
-                    "requested_ars": requested_ar_values,
-                    "executed_ars": "not_observable_via_public_generation_api",
-                    "complete": None,
-                    "prefill_decode_scope": True,
-                    "graph_ar_coverage_proven": False,
-                    "limitation": (
-                        "the public GenAI generation executor reports end-to-end "
-                        "generation latency but does not expose which AR graph "
-                        "served each prefill/decode step"
-                    ),
-                }
-            elif effective.get("ar") is not None:
-                executed_ar = int(effective["ar"])
-                payload["coverage"] = {
-                    "mode": (
-                        "single_ar_override"
-                        if selected_config.get("ar") is not None
-                        and not report_suffix
-                        else "single_ar"
-                    ),
-                    "requested_ars": requested_ar_values,
-                    "executed_ars": [executed_ar],
-                    "missing_ars": [
-                        ar
-                        for ar in requested_ar_values
-                        if ar != executed_ar
-                    ],
-                    "complete": requested_ar_values == [executed_ar],
-                }
-            else:
-                payload["coverage"] = {
-                    "mode": "explicit_custom_runtime",
-                    "requested_ars": requested_ar_values,
-                    "executed_ars": "caller_defined",
-                    "complete": None,
-                }
-            if generation_metrics is not None:
-                payload["generation_metrics"] = generation_metrics
-            if generated_text_sha256 is not None:
-                payload["generated_text"] = {
-                    "sha256": generated_text_sha256,
-                    "character_count": generated_text_length,
-                }
-            token_count = effective.get("token_count")
-            if token_count is not None:
-                normalized_tokens = int(token_count)
-                if normalized_tokens <= 0:
-                    raise ValueError("benchmark token_count must be positive")
-                payload["token_count"] = normalized_tokens
-                payload["p50_ms_per_token"] = (
-                    measurement.summary.p50_ms / normalized_tokens
+            if len(runtime_indexes) != 1:
+                raise InvalidSpecError(
+                    "benchmark.optrace requires exactly one build "
+                    "runtime_index artifact",
+                    stage="benchmark",
+                    details={
+                        "runtime_index_count": len(runtime_indexes)
+                    },
                 )
-            if aa_measurement is not None:
-                payload["aa_calibration"] = aa_measurement.to_dict()
-            if optrace_ref is not None:
-                payload["optrace_evidence"] = _jsonable(optrace_ref)
-            report_ref = atomic_publish_json(
-                output_dir / f"latency_report{report_suffix}.json",
-                payload,
+            verify_artifact(runtime_indexes[0])
+            optrace_ref = atomic_publish_json(
+                output_dir / f"optrace_evidence{report_suffix}.json",
+                {
+                    "schema": "qairt-agent.optrace-evidence.v1",
+                    "source_manifest_sha256": manifest_sha256,
+                    "runtime_index": _jsonable(runtime_indexes[0]),
+                    "runtime_binding": {
+                        key: _jsonable(effective.get(key))
+                        for key in (
+                            "lane",
+                            "family",
+                            "ar",
+                            "context_length",
+                            "scope",
+                            "route_manifest",
+                            "context_path",
+                            "graph_name",
+                            "component",
+                            "coverage",
+                        )
+                        if effective.get(key) is not None
+                    },
+                    "device_identifier": device_identifier,
+                    "profile_level": profile_level,
+                    "profile_option": profile_option,
+                    "profiles": profile_entries,
+                    "ops": normalized_profile_ops,
+                    "profile_scope": profile_claim_scope,
+                    "claim_scope": (
+                        "reported_op_work_not_additive_wall_latency"
+                    ),
+                },
                 kind=ArtifactKind.REPORT,
-                logical_name=f"latency_report{report_suffix}",
+                logical_name=f"optrace_evidence{report_suffix}",
             )
-            output_refs = (
-                tuple(profile_source_refs)
-                + ((optrace_ref,) if optrace_ref is not None else ())
-                + (report_ref,)
-            )
-            return payload, output_refs, {
-                "warmup_runs": warmup,
-                "measured_runs": repeats,
-                "optrace": optrace_enabled,
-                "optrace_profile_count": len(profile_entries),
-                "optrace_op_count": len(normalized_profile_ops),
-                "policy": "report_only",
-                "device_identifier": device_identifier,
-                "remote_attempt_dir": remote_attempt_dir,
-                "remote_cleanup": "confirmed",
+        payload: dict[str, Any] = {
+            "measurement": measurement.to_dict(),
+            "policy": "report_only",
+            "setup_excluded": True,
+            "scope": scope,
+            "runtime_binding": {
+                key: _jsonable(effective.get(key))
+                for key in (
+                    "lane",
+                    "family",
+                    "ar",
+                    "context_length",
+                    "scope",
+                    "route_manifest",
+                    "context_path",
+                    "graph_name",
+                    "container_path",
+                    "component",
+                    "coverage",
+                    "excluded_components",
+                    "graph_ar",
+                )
+                if effective.get(key) is not None
+            },
+        }
+        requested_ar_values = [
+            int(value) for value in spec.sequence.ars
+        ]
+        if scope == "genai_generation":
+            payload["coverage"] = {
+                "mode": "executor_managed_generation",
+                "requested_ars": requested_ar_values,
+                "executed_ars": "not_observable_via_public_generation_api",
+                "complete": None,
+                "prefill_decode_scope": True,
+                "graph_ar_coverage_proven": False,
+                "limitation": (
+                    "the public GenAI generation executor reports end-to-end "
+                    "generation latency but does not expose which AR graph "
+                    "served each prefill/decode step"
+                ),
             }
+        elif effective.get("ar") is not None:
+            executed_ar = int(effective["ar"])
+            payload["coverage"] = {
+                "mode": (
+                    "single_ar_override"
+                    if selected_config.get("ar") is not None
+                    and not report_suffix
+                    else "single_ar"
+                ),
+                "requested_ars": requested_ar_values,
+                "executed_ars": [executed_ar],
+                "missing_ars": [
+                    ar
+                    for ar in requested_ar_values
+                    if ar != executed_ar
+                ],
+                "complete": requested_ar_values == [executed_ar],
+            }
+        else:
+            payload["coverage"] = {
+                "mode": "explicit_custom_runtime",
+                "requested_ars": requested_ar_values,
+                "executed_ars": "caller_defined",
+                "complete": None,
+            }
+        if generation_metrics is not None:
+            payload["generation_metrics"] = generation_metrics
+        if generated_text_sha256 is not None:
+            payload["generated_text"] = {
+                "sha256": generated_text_sha256,
+                "character_count": generated_text_length,
+            }
+        token_count = effective.get("token_count")
+        if token_count is not None:
+            normalized_tokens = int(token_count)
+            if normalized_tokens <= 0:
+                raise ValueError("benchmark token_count must be positive")
+            payload["token_count"] = normalized_tokens
+            payload["p50_ms_per_token"] = (
+                measurement.summary.p50_ms / normalized_tokens
+            )
+        if aa_measurement is not None:
+            payload["aa_calibration"] = aa_measurement.to_dict()
+        if optrace_ref is not None:
+            payload["optrace_evidence"] = _jsonable(optrace_ref)
+        report_ref = atomic_publish_json(
+            output_dir / f"latency_report{report_suffix}.json",
+            payload,
+            kind=ArtifactKind.REPORT,
+            logical_name=f"latency_report{report_suffix}",
+        )
+        output_refs = (
+            tuple(profile_source_refs)
+            + ((optrace_ref,) if optrace_ref is not None else ())
+            + (report_ref,)
+        )
+        return payload, output_refs, {
+            "warmup_runs": warmup,
+            "measured_runs": repeats,
+            "optrace": optrace_enabled,
+            "optrace_profile_count": len(profile_entries),
+            "optrace_op_count": len(normalized_profile_ops),
+            "policy": "report_only",
+            "device_identifier": device_identifier,
+            "remote_attempt_dir": remote_attempt_dir,
+            "remote_cleanup": "confirmed",
+        }
+
+    def benchmark(
+        self,
+        manifest_uri: str | Path,
+        manifest_sha256: str,
+        *,
+        config: Mapping[str, Any] | None = None,
+        execution_context: StageExecutionContext | None = None,
+    ) -> ToolResult[dict[str, Any]]:
+        """Measure warmed wall latency with optional A/A calibration."""
+
+        selected = dict(config or {})
+
+        def run_selected(
+            manifest: RunManifest,
+            adapter: Any,
+            output_dir: Path,
+            selected_config: Mapping[str, Any],
+            *,
+            report_suffix: str = "",
+        ) -> tuple[dict[str, Any], tuple[ArtifactRef, ...], dict[str, Any]]:
+            return self._benchmark_one(
+                manifest,
+                adapter,
+                output_dir,
+                selected_config,
+                manifest_sha256=manifest_sha256,
+                report_suffix=report_suffix,
+            )
 
         def operation(
             manifest: RunManifest, adapter: Any, output_dir: Path
@@ -5953,7 +6102,7 @@ class QairtAgent:
                 or selected.get("ar") is not None
                 or len(requested_ars) <= 1
             ):
-                return run_one(
+                return run_selected(
                     manifest,
                     adapter,
                     output_dir,
@@ -5988,7 +6137,7 @@ class QairtAgent:
                 # One public generate() call is the production GenAI wall-time
                 # unit. run_one publishes an explicit non-claim about internal
                 # AR graph selection rather than pretending it profiled each AR.
-                return run_one(
+                return run_selected(
                     manifest,
                     adapter,
                     output_dir,
@@ -6001,70 +6150,38 @@ class QairtAgent:
                     details={"lane": lane},
                 )
 
-            vectors = runtime_index.get("vectors") or {}
-            exact_vectors = (
-                vectors.get("validation_manifests_by_ar") or {}
-                if isinstance(vectors, Mapping)
-                else {}
+            self._require_exact_multi_ar_vectors(
+                runtime_index,
+                requested_ars,
+                stage="benchmark",
             )
-            missing_vector_ars = [
-                ar for ar in requested_ars if not exact_vectors.get(str(ar))
-            ]
-            if missing_vector_ars:
-                raise InvalidSpecError(
-                    "automatic multi-AR benchmark requires one exact vector "
-                    "manifest for every requested AR",
-                    stage="benchmark",
-                    details={
-                        "requested_ars": list(requested_ars),
-                        "missing_vector_ars": missing_vector_ars,
-                        "hint": (
-                            "build must publish runtime_index.vectors."
-                            "validation_manifests_by_ar for every AR"
-                        ),
-                    },
-                )
-
-            results_by_ar: dict[str, Any] = {}
-            output_refs: list[ArtifactRef] = []
-            per_ar_metrics: dict[str, Any] = {}
+            (
+                results_by_ar,
+                output_refs,
+                per_ar_metrics,
+                refs_by_ar,
+            ) = self._fanout_reports_by_ar(
+                manifest,
+                adapter,
+                output_dir,
+                selected,
+                requested_ars,
+                stage="benchmark",
+                report_logical_prefix="latency_report",
+                run_one=run_selected,
+            )
             per_ar_optrace: dict[str, tuple[ArtifactRef, dict[str, Any]]] = {}
-            for ar in requested_ars:
-                ar_key = str(ar)
-                payload, refs, metrics = run_one(
-                    manifest,
-                    adapter,
-                    output_dir / f"ar{ar}",
-                    {**selected, "ar": ar},
-                    report_suffix=f"_ar{ar}",
-                )
-                report_refs = [
-                    ref
-                    for ref in refs
-                    if ref.logical_name == f"latency_report_ar{ar}"
-                ]
-                if len(report_refs) != 1:
-                    raise InvalidSpecError(
-                        "multi-AR benchmark did not publish exactly one "
-                        f"AR{ar} latency report",
-                        stage="benchmark",
-                    )
-                results_by_ar[ar_key] = {
-                    "report": payload,
-                    "report_artifact": _jsonable(report_refs[0]),
-                }
-                per_ar_metrics[ar_key] = _jsonable(metrics)
-                output_refs.extend(refs)
+            for ar_key, refs in refs_by_ar.items():
                 if optrace_requested:
                     optrace_refs = [
                         ref
                         for ref in refs
-                        if ref.logical_name == f"optrace_evidence_ar{ar}"
+                        if ref.logical_name == f"optrace_evidence_ar{ar_key}"
                     ]
                     if len(optrace_refs) != 1:
                         raise InvalidSpecError(
                             "multi-AR benchmark did not publish exactly one "
-                            f"AR{ar} optrace report",
+                            f"AR{ar_key} optrace report",
                             stage="benchmark",
                         )
                     verify_artifact(optrace_refs[0])
@@ -6078,12 +6195,12 @@ class QairtAgent:
                         json.JSONDecodeError,
                     ) as exc:
                         raise InvalidSpecError(
-                            f"AR{ar} optrace report is not readable JSON",
+                            f"AR{ar_key} optrace report is not readable JSON",
                             stage="benchmark",
                         ) from exc
                     if not isinstance(optrace_payload, Mapping):
                         raise InvalidSpecError(
-                            f"AR{ar} optrace report must be an object",
+                            f"AR{ar_key} optrace report must be an object",
                             stage="benchmark",
                         )
                     per_ar_optrace[ar_key] = (
@@ -6091,17 +6208,7 @@ class QairtAgent:
                         dict(optrace_payload),
                     )
 
-            coverage = {
-                "mode": "all_requested_ars",
-                "requested_ars": list(requested_ars),
-                "executed_ars": list(requested_ars),
-                "missing_ars": [],
-                "complete": True,
-                "context_lengths": [
-                    int(value)
-                    for value in manifest.build_spec.sequence.context_lengths
-                ],
-            }
+            coverage = self._multi_ar_coverage(manifest, requested_ars)
             aggregate_optrace_ref: ArtifactRef | None = None
             if optrace_requested:
                 runtime_indexes = [

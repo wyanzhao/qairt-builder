@@ -38,6 +38,53 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def validate_attached_models_by_ar(
+    attached: Any,
+    ars: tuple[int, ...],
+    *,
+    require_all: bool,
+    require_encodings: bool = True,
+) -> None:
+    """Validate the one authoritative GenAI per-AR source contract."""
+
+    if attached is None and not require_all:
+        return
+    if not isinstance(attached, dict):
+        raise ValueError("attached_models_by_ar must be an object keyed by AR")
+    missing_entries: list[int] = []
+    missing_models: list[int] = []
+    missing_encodings: list[int] = []
+    for ar in ars:
+        entry = attached.get(str(ar), attached.get(ar))
+        if entry is None:
+            if require_all:
+                missing_entries.append(ar)
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"attached_models_by_ar[{ar}] must be an object"
+            )
+        if not entry.get("model_path"):
+            missing_models.append(ar)
+        if require_encodings and not entry.get("encodings_path"):
+            missing_encodings.append(ar)
+    if missing_entries:
+        raise ValueError(
+            "attached_models_by_ar is missing requested ARs: "
+            f"{missing_entries}"
+        )
+    if missing_models:
+        raise ValueError(
+            "attached_models_by_ar requires model_path for ARs: "
+            f"{missing_models}"
+        )
+    if missing_encodings:
+        raise ValueError(
+            "attached_models_by_ar requires encodings_path for ARs: "
+            f"{missing_encodings}"
+        )
+
+
 class FrozenContract(BaseModel):
     """Base class for immutable, strict public contracts."""
 
@@ -370,7 +417,7 @@ class TargetSpec(FrozenContract):
     backend: Literal["HTP"] = "HTP"
     chipset: str = "SM8850"
     dsp_arch: str = "v81"
-    soc_model: Literal[660] = 660
+    soc_model: Literal[87] = 87
     platform: Literal["android", "x86_64_linux"] = "android"
     device_id: str | None = None
     qairt_version: str = Field(
@@ -704,6 +751,15 @@ class BuildSpec(FrozenContract):
                 "validation_manifests_by_ar contains ARs not requested by sequence.ars: "
                 f"{sorted(unexpected_vector_ars)}"
             )
+        if self.vectors.validation_manifests_by_ar:
+            missing_vector_ars = set(self.sequence.ars).difference(
+                self.vectors.validation_manifests_by_ar
+            )
+            if missing_vector_ars:
+                raise ValueError(
+                    "validation_manifests_by_ar is missing requested "
+                    f"sequence.ars: {sorted(missing_vector_ars)}"
+                )
 
         if self.sequence.native_kv and not self.transforms.mha2sha:
             raise ValueError("native_kv requires the MHA2SHA transform")
@@ -717,8 +773,13 @@ class BuildSpec(FrozenContract):
                 raise ValueError(
                     "Qwen3-VL requires vision_projector_location='inside_vision_onnx'"
                 )
-        elif self.sources.vision_projector_location is not None:
-            raise ValueError("vision_projector_location is only valid for Qwen3-VL")
+        else:
+            if self.sources.vision is not None:
+                raise ValueError("sources.vision is only valid for Qwen3-VL")
+            if self.sources.vision_projector_location is not None:
+                raise ValueError(
+                    "vision_projector_location is only valid for Qwen3-VL"
+                )
 
         if self.family == ModelFamily.QWEN3_5_OMNI:
             if self.sources.audio is None:
@@ -729,20 +790,23 @@ class BuildSpec(FrozenContract):
             raise ValueError("sources.audio is only valid for Qwen3.5-Omni")
 
         attached_models = self.metadata.get("attached_models_by_ar")
-        attached_ars = (
-            {str(key) for key in attached_models}
-            if isinstance(attached_models, dict)
-            else set()
-        )
-        if (
-            self.family in {ModelFamily.QWEN3_5, ModelFamily.QWEN3_5_OMNI}
-            and len(self.sequence.ars) > 1
-            and not self.sequence.qwen35_experimental_auto_ar
-            and not {str(ar) for ar in self.sequence.ars}.issubset(attached_ars)
-        ):
-            raise ValueError(
-                "Qwen3.5 multi-AR requires attached_models_by_ar for every AR or "
-                "sequence.qwen35_experimental_auto_ar=true"
+        if self.family in {
+            ModelFamily.QWEN3_5,
+            ModelFamily.QWEN3_5_OMNI,
+        }:
+            requires_attached_models = (
+                len(self.sequence.ars) > 1
+                and not self.sequence.qwen35_experimental_auto_ar
+            )
+            if requires_attached_models and attached_models is None:
+                raise ValueError(
+                    "Qwen3.5 multi-AR requires metadata.attached_models_by_ar "
+                    "or explicit experimental auto-AR opt-in"
+                )
+            validate_attached_models_by_ar(
+                attached_models,
+                tuple(self.sequence.ars),
+                require_all=requires_attached_models,
             )
         if (
             self.family in {ModelFamily.QWEN3_5, ModelFamily.QWEN3_5_OMNI}
@@ -1483,5 +1547,6 @@ __all__ = [
     "WorkflowSpec",
     "WorkflowStageConfigs",
     "preset_id_for_family",
+    "validate_attached_models_by_ar",
     "to_workflow_spec",
 ]

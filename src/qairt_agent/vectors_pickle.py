@@ -4,19 +4,33 @@ Pickle is disabled everywhere else in the agent: normal builds never call
 ``pickle.load`` implicitly.  This module is the *only* sanctioned path that can
 reconstruct a pickle, and it is deliberately narrow:
 
-* :class:`RestrictedUnpickler` resolves globals through an explicit allowlist
-  containing just the NumPy entry points required to rebuild arrays/scalars.
-  Anything else (``os.system``, ``posix.*``, ``torch.*``, user classes, arbitrary
-  callables) is rejected with :class:`PickleRejectedError`.
+* :class:`RestrictedUnpickler` resolves globals through an explicit
+  ``(module, name)`` allowlist containing just the NumPy entry points required
+  to rebuild arrays/scalars.  Dotted attribute paths in the ``name`` argument
+  are rejected unconditionally as defense-in-depth against CPython's
+  ``pickle._getattribute`` traversal.  Anything else (``os.system``,
+  ``posix.*``, ``torch.*``, user classes, arbitrary callables) is rejected with
+  :class:`PickleRejectedError`.
 * :func:`safe_load_pickle` layers a size cap, a recursive tree validator, and an
   optional subprocess+``resource.setrlimit`` isolation sandbox on top of that
-  unpickler.
-* :func:`import_pickle_vectors` is the explicit, ``--trusted-local``-gated
+  unpickler.  When isolation is active, the child serializes the validated
+  tree through a non-pickle binary protocol (JSON header + raw array bytes) so
+  the parent never calls pickle on child-produced data.
+* :func:`import_pickle_artifacts` is the explicit, ``--trusted-local``-gated
   operation that converts a validated container tree into a
   :class:`~qairt_agent.contracts.VectorBundle`.
 
+Security notes:
+
+* The rlimit sandbox constrains CPU, file size, and address space but does
+  **not** provide filesystem isolation.  The allowlist is the authoritative
+  gate; rlimits are a secondary mitigation.
+* ``--trusted-local`` is an operator's declaration about the *source* of the
+  pickle file, not a security proof.  The restricted unpickler remains the
+  enforcement boundary regardless of this flag.
+
 The module has no QAIRT SDK dependency and never opens a file for writing except
-the raw tensor artifacts that :func:`import_pickle_vectors` is asked to emit.
+the raw tensor artifacts that :func:`import_pickle_artifacts` is asked to emit.
 """
 
 from __future__ import annotations
@@ -26,6 +40,7 @@ import io
 import json
 import os
 import pickle
+import struct
 import subprocess
 import sys
 import zipfile
@@ -42,6 +57,7 @@ from qairt_agent.vectors import (
     TensorRecord,
     VectorManifest,
     VectorPreparer,
+    _atomic_write,
     _canonical_array,
     _safe_name,
 )
@@ -63,26 +79,63 @@ _SECTIONS = frozenset({"auto", "inputs", "goldens"})
 # ``numpy.core.multiarray.scalar``; NumPy 2.x moved these to ``numpy._core``.
 # ``numpy.ndarray`` and ``numpy.dtype`` are themselves referenced as globals
 # during reconstruction, so they must be admitted too.  ``numpy.dtypes.*`` holds
-# the scalar dtype classes used by newer NumPy pickles.  Basic containers
-# (dict/list/tuple) and primitives are encoded with dedicated pickle opcodes and
-# therefore need no globals at all -- in particular ``builtins.getattr`` is never
-# admitted.
+# the scalar dtype classes used by newer NumPy pickles; each is listed
+# explicitly so that a dotted attribute path (e.g.
+# ``numpy.dtypes.__loader__.set_data``) can never sneak through a prefix match.
+# Basic containers (dict/list/tuple) and primitives are encoded with dedicated
+# pickle opcodes and therefore need no globals at all -- in particular
+# ``builtins.getattr`` is never admitted.
 _ALLOWED_GLOBALS: dict[str, frozenset[str]] = {
     "numpy.core.multiarray": frozenset({"_reconstruct", "scalar"}),
     "numpy._core.multiarray": frozenset({"_reconstruct", "scalar"}),
     "numpy": frozenset({"dtype", "ndarray"}),
+    "numpy.dtypes": frozenset({
+        "BoolDType",
+        "ByteDType",
+        "UByteDType",
+        "ShortDType",
+        "UShortDType",
+        "IntDType",
+        "UIntDType",
+        "LongDType",
+        "ULongDType",
+        "LongLongDType",
+        "ULongLongDType",
+        "Int8DType",
+        "Int16DType",
+        "Int32DType",
+        "Int64DType",
+        "UInt8DType",
+        "UInt16DType",
+        "UInt32DType",
+        "UInt64DType",
+        "Float16DType",
+        "Float32DType",
+        "Float64DType",
+        "LongDoubleDType",
+        "Complex64DType",
+        "Complex128DType",
+        "CLongDoubleDType",
+    }),
 }
-_ALLOWED_MODULE_PREFIXES: tuple[str, ...] = ("numpy.dtypes",)
 
 
 class RestrictedUnpickler(pickle.Unpickler):
     """An unpickler that only resolves an explicit NumPy-only global allowlist."""
 
     def find_class(self, module: str, name: str) -> Any:
+        # Defense-in-depth: CPython's pickle._getattribute traverses dotted
+        # attribute paths in protocol >= 4, so a name like "__loader__.set_data"
+        # would resolve through intermediate objects.  Reject unconditionally.
+        if "." in name:
+            raise PickleRejectedError(
+                f"Pickle global {module}.{name} contains a dotted name and is "
+                f"not permitted by the restricted unpickler",
+                stage="unpickle",
+                details={"module": module, "name": name},
+            )
         allowed_names = _ALLOWED_GLOBALS.get(module)
         if allowed_names is not None and name in allowed_names:
-            return super().find_class(module, name)
-        if any(module == prefix or module.startswith(prefix + ".") for prefix in _ALLOWED_MODULE_PREFIXES):
             return super().find_class(module, name)
         raise PickleRejectedError(
             f"Pickle global {module}.{name} is not permitted by the restricted unpickler",
@@ -208,6 +261,177 @@ def _validate_tree(obj: Any) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Non-pickle isolation channel
+#
+# The rlimit child serializes the validated tree as a length-prefixed JSON
+# header followed by raw array bytes.  The parent reconstructs the tree from
+# this binary protocol *without* ever calling pickle, so a compromised child
+# cannot re-attack the parent through the same unpickler.
+#
+# Wire format:
+#   [4 bytes: uint32-LE header length][JSON header (UTF-8)][raw array bytes]
+# ---------------------------------------------------------------------------
+
+def _serialize_validated_tree(obj: Any) -> bytes:
+    """Encode a validated tree as JSON header + raw array bytes (no pickle)."""
+
+    raw_parts: list[bytes] = []
+    current_offset = 0
+
+    def encode(node: Any) -> Any:
+        nonlocal current_offset
+        if node is None:
+            return {"__type__": "none"}
+        if isinstance(node, np.generic):
+            raw = node.tobytes()
+            offset = current_offset
+            current_offset += len(raw)
+            raw_parts.append(raw)
+            return {
+                "__type__": "npscalar",
+                "dtype": node.dtype.str,
+                "offset": offset,
+                "nbytes": len(raw),
+            }
+        if isinstance(node, bool):
+            return {"__type__": "primitive", "value": node}
+        if isinstance(node, (str, int, float)):
+            return {"__type__": "primitive", "value": node}
+        if isinstance(node, np.ndarray):
+            raw = node.tobytes(order="C")
+            offset = current_offset
+            current_offset += len(raw)
+            raw_parts.append(raw)
+            return {
+                "__type__": "ndarray",
+                "dtype": node.dtype.str,
+                "shape": list(node.shape),
+                "offset": offset,
+                "nbytes": len(raw),
+            }
+        if isinstance(node, dict):
+            return {
+                "__type__": "dict",
+                "items": [[encode(k), encode(v)] for k, v in node.items()],
+            }
+        if isinstance(node, list):
+            return {"__type__": "list", "items": [encode(item) for item in node]}
+        if isinstance(node, tuple):
+            return {"__type__": "tuple", "items": [encode(item) for item in node]}
+        raise PickleRejectedError(
+            f"Type {type(node).__name__} cannot be serialized through the "
+            f"isolation channel",
+            stage="isolate",
+            details={"type": type(node).__name__},
+        )
+
+    header = json.dumps(encode(obj), ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    return struct.pack("<I", len(header)) + header + b"".join(raw_parts)
+
+
+def _deserialize_validated_tree(data: bytes) -> Any:
+    """Reconstruct a validated tree from the non-pickle isolation channel."""
+
+    if len(data) < 4:
+        raise PickleRejectedError(
+            "Truncated isolation channel data",
+            stage="isolate",
+            details={"nbytes": len(data)},
+        )
+    (header_len,) = struct.unpack("<I", data[:4])
+    if len(data) < 4 + header_len:
+        raise PickleRejectedError(
+            "Truncated isolation channel header",
+            stage="isolate",
+            details={"header_len": header_len, "nbytes": len(data)},
+        )
+    try:
+        header = json.loads(data[4 : 4 + header_len].decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise PickleRejectedError(
+            f"Invalid isolation channel header: {exc}",
+            stage="isolate",
+            details={"error": str(exc)},
+        ) from exc
+    raw_section = data[4 + header_len :]
+
+    def decode(node: Any) -> Any:
+        if not isinstance(node, dict) or "__type__" not in node:
+            raise PickleRejectedError(
+                "Invalid isolation channel node",
+                stage="isolate",
+                details={"node": repr(node)[:200]},
+            )
+        tag = node["__type__"]
+        if tag == "none":
+            return None
+        if tag == "primitive":
+            value = node["value"]
+            if not isinstance(value, (str, int, float, bool)) and value is not None:
+                raise PickleRejectedError(
+                    f"Invalid primitive type in isolation channel: {type(value).__name__}",
+                    stage="isolate",
+                )
+            return value
+        if tag == "ndarray":
+            dtype = np.dtype(node["dtype"])
+            shape = tuple(int(d) for d in node["shape"])
+            nbytes = int(node["nbytes"])
+            offset = int(node["offset"])
+            if offset + nbytes > len(raw_section):
+                raise PickleRejectedError(
+                    "Isolation channel array data out of bounds",
+                    stage="isolate",
+                    details={"offset": offset, "nbytes": nbytes, "available": len(raw_section)},
+                )
+            expected = dtype.itemsize * int(np.prod(shape)) if shape else dtype.itemsize
+            if nbytes != expected:
+                raise PickleRejectedError(
+                    "Isolation channel array size mismatch",
+                    stage="isolate",
+                    details={"nbytes": nbytes, "expected": expected},
+                )
+            return np.frombuffer(raw_section[offset : offset + nbytes], dtype=dtype).reshape(shape).copy()
+        if tag == "npscalar":
+            dtype = np.dtype(node["dtype"])
+            nbytes = int(node["nbytes"])
+            offset = int(node["offset"])
+            if (
+                nbytes != dtype.itemsize
+                or offset < 0
+                or offset + nbytes > len(raw_section)
+            ):
+                raise PickleRejectedError(
+                    "Isolation channel scalar data is invalid",
+                    stage="isolate",
+                    details={
+                        "offset": offset,
+                        "nbytes": nbytes,
+                        "expected": dtype.itemsize,
+                        "available": len(raw_section),
+                    },
+                )
+            return np.frombuffer(
+                raw_section[offset : offset + nbytes],
+                dtype=dtype,
+                count=1,
+            )[0]
+        if tag == "dict":
+            return {decode(k): decode(v) for k, v in node["items"]}
+        if tag == "list":
+            return [decode(item) for item in node["items"]]
+        if tag == "tuple":
+            return tuple(decode(item) for item in node["items"])
+        raise PickleRejectedError(
+            f"Unknown isolation channel tag: {tag!r}",
+            stage="isolate",
+            details={"tag": tag},
+        )
+
+    return decode(header)
+
+
 def _load_in_process(data: bytes) -> Any:
     try:
         return RestrictedUnpickler(io.BytesIO(data)).load()
@@ -270,11 +494,11 @@ def _apply_resource_limits() -> None:  # pragma: no cover - runs in the child
 
 
 def _isolation_child_main() -> None:  # pragma: no cover - runs in the child
-    """Child entry point: load + validate under rlimits, re-emit a safe pickle.
+    """Child entry point: load + validate under rlimits, emit via safe channel.
 
-    The validated tree contains only NumPy arrays/scalars and plain containers,
-    so re-serializing it is safe; the parent reloads it through
-    :class:`RestrictedUnpickler` for a second independent check.
+    The validated tree is serialized through a non-pickle binary protocol
+    (JSON header + raw array bytes) so the parent never calls pickle on
+    child-produced data.
     """
 
     _apply_resource_limits()
@@ -291,7 +515,7 @@ def _isolation_child_main() -> None:  # pragma: no cover - runs in the child
         )
     obj = RestrictedUnpickler(io.BytesIO(raw)).load()
     _validate_tree(obj)
-    sys.stdout.buffer.write(pickle.dumps(obj, protocol=4))
+    sys.stdout.buffer.write(_serialize_validated_tree(obj))
     sys.stdout.buffer.flush()
 
 
@@ -399,7 +623,7 @@ def _torch_load_archive(data: bytes, *, torch_module: Any | None = None) -> Any:
 
 
 def _torch_isolation_child_main() -> None:  # pragma: no cover - runs in the child
-    """Load a torch archive in the rlimit child and emit NumPy-only pickle."""
+    """Load a torch archive in the rlimit child and emit via safe channel."""
 
     _apply_resource_limits()
     raw = sys.stdin.buffer.read()
@@ -414,7 +638,7 @@ def _torch_isolation_child_main() -> None:  # pragma: no cover - runs in the chi
             details={"nbytes": len(raw), "max_input_bytes": max_bytes},
         )
     obj = _torch_load_archive(raw)
-    sys.stdout.buffer.write(pickle.dumps(obj, protocol=4))
+    sys.stdout.buffer.write(_serialize_validated_tree(obj))
     sys.stdout.buffer.flush()
 
 
@@ -457,7 +681,7 @@ def _load_isolated(data: bytes, *, timeout: float, max_input_bytes: int) -> Any:
             details={"returncode": proc.returncode, "stderr": stderr_tail},
         )
 
-    obj = _load_in_process(proc.stdout)
+    obj = _deserialize_validated_tree(proc.stdout)
     _validate_tree(obj)
     return obj
 
@@ -500,7 +724,7 @@ def _load_torch_isolated(data: bytes, *, timeout: float, max_input_bytes: int) -
             stage="torch_isolate",
             details={"returncode": proc.returncode, "stderr": stderr_tail},
         )
-    obj = _load_in_process(proc.stdout)
+    obj = _deserialize_validated_tree(proc.stdout)
     _validate_tree(obj)
     return obj
 
@@ -615,74 +839,27 @@ def import_pickle_vectors(
     isolate: bool = False,
     source_format: str = "auto",
 ) -> VectorBundle:
-    """Import a trusted local pickle into a content-addressed vector bundle.
+    """Deprecated compatibility wrapper over the canonical artifact importer."""
 
-    This is the explicit, ``--trusted-local``-gated pickle entry point.  With
-    ``trusted_local=False`` it fails closed.  Each leaf array is canonicalized
-    (little-endian, C-contiguous), written as ``<safe_name>-<sha256[:12]>.raw``,
-    and described by a :class:`VectorTensor` with ``role="golden"``.
-    """
-
-    if not trusted_local:
-        raise PickleRejectedError(
-            "Pickle import is disabled unless explicitly enabled with trusted_local=True "
-            "(--trusted-local)",
-            stage="gate",
-        )
-
-    data = _read_source_bytes(source)
-    effective_format = _effective_source_format(data, source_format)
-    obj = safe_load_pickle(
-        data,
+    imported = import_pickle_artifacts(
+        source,
+        output_dir=output_dir,
+        bundle_id=bundle_id,
+        case_id=bundle_id or "pickle-import",
+        trusted_local=trusted_local,
         isolate=isolate,
-        source_format=effective_format,
+        source_format=source_format,
+        section="goldens",
+        _raw_subdir=None,
     )
-    leaves = tuple(
-        _unique_leaves(obj, section="goldens").items()
-    )
-    if not leaves:
-        raise PickleRejectedError(
-            "Pickle contains no tensor leaves",
-            stage="flatten",
-        )
-
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    tensors: list[VectorTensor] = []
-    for name, array in leaves:
-        try:
-            canonical = _canonical_array(array)
-        except (TypeError, ValueError) as exc:
-            raise PickleRejectedError(
-                f"Leaf {name!r} cannot be stored as a vector: {exc}",
-                stage="canonicalize",
-                details={"name": name, "error": str(exc)},
-            ) from exc
-        raw_bytes = canonical.tobytes(order="C")
-        digest = hashlib.sha256(raw_bytes).hexdigest()
-        destination = out_dir / f"{_safe_name(name)}-{digest[:12]}.raw"
-        destination.write_bytes(raw_bytes)
-        tensors.append(
-            VectorTensor(
-                name=name,
-                path=destination.resolve(),
-                representation=TensorRepresentation.LOGICAL_FP,
-                dtype=str(canonical.dtype),
-                shape=tuple(int(dim) for dim in canonical.shape),
-                layout="C",
-                byte_order="little",
-                sha256=digest,
-                nbytes=canonical.nbytes,
-                role="golden",
+    root = Path(output_dir).expanduser().resolve()
+    return imported.bundle.model_copy(
+        update={
+            "tensors": tuple(
+                tensor.model_copy(update={"path": (root / tensor.path).resolve()})
+                for tensor in imported.bundle.tensors
             )
-        )
-
-    return VectorBundle(
-        bundle_id=bundle_id or uuid4().hex,
-        tensors=tuple(tensors),
-        source_sha256=hashlib.sha256(data).hexdigest(),
-        metadata={"source_format": effective_format},
+        }
     )
 
 
@@ -784,6 +961,7 @@ def import_pickle_artifacts(
     section: str = "auto",
     source_key: str | None = None,
     expected_source_sha256: str | None = None,
+    _raw_subdir: str | None = "raw",
 ) -> ImportedPickleArtifacts:
     """Convert a trusted pickle into raw tensors plus a usable VectorManifest.
 
@@ -845,7 +1023,9 @@ def import_pickle_artifacts(
         )
 
     output = Path(output_dir).expanduser().resolve()
-    raw_root = output / "raw"
+    # The legacy ``import_pickle_vectors`` API placed raw files directly in
+    # ``output_dir``.  Preserve that layout while sharing this implementation.
+    raw_root = output / _raw_subdir if _raw_subdir is not None else output
     raw_root.mkdir(parents=True, exist_ok=True)
     resolved_bundle_id = bundle_id or uuid4().hex
     tensors: list[VectorTensor] = []
@@ -870,9 +1050,7 @@ def import_pickle_artifacts(
                         stage="materialize",
                     )
             else:
-                temporary = destination.with_suffix(destination.suffix + ".tmp")
-                temporary.write_bytes(raw_bytes)
-                os.replace(temporary, destination)
+                _atomic_write(destination, raw_bytes)
             tensor = VectorTensor(
                 name=name,
                 path=destination.relative_to(output),
@@ -928,9 +1106,7 @@ def import_pickle_artifacts(
             stage="materialize",
         )
     if not bundle_path.exists():
-        temporary = bundle_path.with_suffix(".json.tmp")
-        temporary.write_bytes(bundle_payload)
-        os.replace(temporary, bundle_path)
+        _atomic_write(bundle_path, bundle_payload)
 
     manifest = VectorManifest(
         case_id=case_id,
@@ -974,6 +1150,5 @@ __all__ = [
     "RestrictedUnpickler",
     "detect_pickle_source_format",
     "import_pickle_artifacts",
-    "import_pickle_vectors",
     "safe_load_pickle",
 ]

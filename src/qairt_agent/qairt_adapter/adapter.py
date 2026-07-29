@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import importlib
 import hashlib
+import itertools
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -30,6 +32,7 @@ from .errors import (
     QairtConfigurationError,
     QairtPreflightError,
     QairtSdkImportError,
+    QairtCompilationError,
 )
 from .native_kv import (
     audit_native_kv_config,
@@ -88,6 +91,60 @@ def _first(value: Any, paths: Sequence[tuple[str, ...]], default: Any = None) ->
 
 def _path_or_none(value: Any) -> Path | None:
     return Path(value) if value not in (None, "") else None
+
+
+# Matches "socModel 0", "socModel: 0", "soc_model 0", "socModel=0", etc.
+_SOC_MODEL_ZERO_RE = re.compile(r"soc[_ ]?model[\s:=]*0\b", re.IGNORECASE)
+# Matches "CREATE_DEVICE" (the SDK error code) but not generic "device handle"
+# phrases that could appear in unrelated contexts.
+_CREATE_DEVICE_RE = re.compile(r"CREATE_DEVICE|failed to create a device handle", re.IGNORECASE)
+
+
+def _wrap_genai_build_error(
+    exc: Exception,
+    *,
+    prefix: str = "",
+    extra_diagnostics: dict[str, Any] | None = None,
+) -> QairtCompilationError:
+    """Translate a QAIRT compilation exception into lane-aware diagnostics."""
+
+    exc_text = str(exc)
+    diagnostics: dict[str, Any] = {
+        "target_soc": PINNED_TARGET_SOC,
+        "dsp_arch": PINNED_DSP_ARCH,
+        "soc_model": PINNED_SOC_MODEL,
+        "pipeline": "genai_builder",
+        **(extra_diagnostics or {}),
+    }
+    if _SOC_MODEL_ZERO_RE.search(exc_text):
+        return QairtCompilationError(
+            f"{prefix}the HTP backend reported effective socModel 0 during "
+            "context generation; the harness target pin is "
+            f"soc_model={PINNED_SOC_MODEL} for {PINNED_TARGET_SOC}. This "
+            "usually means the explicit device_custom_configs target was not "
+            "propagated. The pin is a Qnn_SocModel_t enum value from "
+            "include/QNN/QnnTypes.h, not the Android soc_id from "
+            "/sys/devices/soc0/soc_id.",
+            details=diagnostics,
+        )
+    if _CREATE_DEVICE_RE.search(exc_text):
+        return QairtCompilationError(
+            f"{prefix}SDK failed to create a device handle for "
+            "context-binary generation. On x86_64 this is usually an invalid "
+            f"device custom config: check that soc_model={PINNED_SOC_MODEL} "
+            f"and dsp_arch={PINNED_DSP_ARCH} match the Qnn_SocModel_t and "
+            "QnnHtpDevice_Arch_t enums for the pinned target.",
+            details=diagnostics,
+        )
+    failure = (
+        "context-binary compilation failed"
+        if diagnostics.get("pipeline") == "low_level"
+        else "container build failed"
+    )
+    return QairtCompilationError(
+        f"{prefix}{failure}: {exc}",
+        details=diagnostics,
+    )
 
 
 def _exported_data_paths(exported: Any) -> tuple[Path, ...]:
@@ -967,12 +1024,23 @@ class QairtSdkAdapter:
     def _validate_compiler_target(config: Any) -> None:
         device_configs = getattr(config, "device_custom_configs", None)
         if not device_configs:
-            return
+            raise QairtConfigurationError(
+                "CompileConfig has no device_custom_configs; the SDK would fall "
+                "back to a default dsp_arch/soc_model that does not match the "
+                "pinned target. Refusing to compile without an explicit device "
+                "configuration."
+            )
         for device_config in device_configs:
             soc_model = getattr(device_config, "soc_model", None)
             dsp_arch = getattr(device_config, "dsp_arch", None)
             dsp_value = getattr(dsp_arch, "value", dsp_arch)
-            if int(soc_model) != PINNED_SOC_MODEL or str(dsp_value).lower() != PINNED_DSP_ARCH:
+            try:
+                resolved_soc = int(soc_model)
+            except (TypeError, ValueError) as exc:
+                raise QairtConfigurationError(
+                    f"CompileConfig device soc_model is not a valid integer: {soc_model!r}"
+                ) from exc
+            if resolved_soc != PINNED_SOC_MODEL or str(dsp_value).lower() != PINNED_DSP_ARCH:
                 raise QairtConfigurationError(
                     "CompileConfig resolved a non-SM8850/V81 target; refusing SDK fallback"
                 )
@@ -1083,6 +1151,34 @@ class QairtSdkAdapter:
                 slice_name=resolved_slice,
             )
 
+        self._ensure_ready()
+        qairt = self._load_module("qairt")
+        sdk_models: list[Any] = []
+        for item in selected_models:
+            if (
+                isinstance(item, ConvertedModelArtifact)
+                and item.sdk_model is not None
+            ):
+                sdk_models.append(item.sdk_model)
+            elif isinstance(item, (str, Path)):
+                sdk_models.append(qairt.load(str(item)))
+            elif (
+                isinstance(item, ConvertedModelArtifact)
+                and item.model_path is not None
+            ):
+                sdk_models.append(qairt.load(str(item.model_path)))
+            else:
+                sdk_models.append(item)
+        authoritative_graph_names = tuple(
+            self._single_graph_name(model) for model in sdk_models
+        )
+        if authoritative_graph_names != selected_graph_names:
+            raise QairtConfigurationError(
+                "graph_names do not match QAIRT graphs_info; "
+                f"provided={selected_graph_names}, "
+                f"authoritative={authoritative_graph_names}"
+            )
+
         native_config_path: Path | None = None
         if expect_native_kv:
             if resolved_context is None or resolved_context % 256 != 0:
@@ -1129,8 +1225,6 @@ class QairtSdkAdapter:
                 f"compile_config_options cannot override pinned target/mode fields: {sorted(overlap)}"
             )
 
-        self._ensure_ready()
-        qairt = self._load_module("qairt")
         config = qairt.CompileConfig(
             backend="HTP",
             soc_details=(
@@ -1149,19 +1243,36 @@ class QairtSdkAdapter:
             )
         self._validate_compiler_target(config)
 
-        sdk_models: list[Any] = []
-        for item in selected_models:
-            if isinstance(item, ConvertedModelArtifact) and item.sdk_model is not None:
-                sdk_models.append(item.sdk_model)
-            elif isinstance(item, (str, Path)):
-                sdk_models.append(qairt.load(str(item)))
-            elif isinstance(item, ConvertedModelArtifact) and item.model_path is not None:
-                sdk_models.append(qairt.load(str(item.model_path)))
-            else:
-                sdk_models.append(item)
-
         compile_input: Any = sdk_models if weight_sharing else sdk_models[0]
-        compiled = qairt.compile(compile_input, config=config)
+        try:
+            compiled = qairt.compile(compile_input, config=config)
+        except Exception as exc:
+            configured_targets = [
+                {
+                    "soc_model": getattr(item, "soc_model", None),
+                    "dsp_arch": getattr(
+                        getattr(item, "dsp_arch", None),
+                        "value",
+                        getattr(item, "dsp_arch", None),
+                    ),
+                }
+                for item in tuple(
+                    getattr(config, "device_custom_configs", ()) or ()
+                )
+            ]
+            raise _wrap_genai_build_error(
+                exc,
+                extra_diagnostics={
+                    "pipeline": "low_level",
+                    "weight_sharing": weight_sharing,
+                    "graph_names": list(selected_graph_names),
+                    "configured_device_targets": configured_targets,
+                    "pinned_device_target": {
+                        "soc_model": PINNED_SOC_MODEL,
+                        "dsp_arch": PINNED_DSP_ARCH,
+                    },
+                },
+            ) from exc
         returned_path = compiled.save(str(destination))
         saved_path = Path(returned_path or destination)
         return CompiledContextArtifact(
@@ -1197,10 +1308,95 @@ class QairtSdkAdapter:
                 names = tuple(str(name) for name in graph_names())
         if len(names) != 1 or not names[0]:
             raise QairtConfigurationError(
-                "standalone ViT conversion must expose exactly one named graph; "
+                "converted QAIRT model must expose exactly one named graph; "
                 f"QAIRT reported {names or '<none>'}"
             )
         return names[0]
+
+    @staticmethod
+    def _graph_names_by_ar(
+        graphs: Sequence[Any],
+        ar_values: Sequence[int],
+        *,
+        split_id: str,
+    ) -> dict[int, str]:
+        """Bind graph identity to AR from TensorInfo dimensions, not order."""
+
+        normalized_graphs = tuple(graphs)
+        normalized_ars = tuple(int(ar) for ar in ar_values)
+        if len(normalized_graphs) == 1:
+            name = str(getattr(normalized_graphs[0], "name", "") or "")
+            if not name:
+                raise QairtConfigurationError(
+                    f"{split_id} exposes one graph without an authoritative name"
+                )
+            return {ar: name for ar in normalized_ars}
+        if len(normalized_graphs) != len(normalized_ars):
+            raise QairtConfigurationError(
+                f"{split_id} graph count {len(normalized_graphs)} cannot be "
+                f"bound to ARs {list(normalized_ars)}"
+            )
+
+        candidates_by_graph: list[set[int]] = []
+        for graph in normalized_graphs:
+            graph_name = str(getattr(graph, "name", "") or "")
+            tensors = tuple(getattr(graph, "inputs", None) or ()) + tuple(
+                getattr(graph, "outputs", None) or ()
+            )
+            if not graph_name or not tensors:
+                raise QairtConfigurationError(
+                    f"{split_id} graph metadata lacks a name or tensor ABI"
+                )
+            dimensions: set[int] = set()
+            for tensor in tensors:
+                raw_dimensions = getattr(tensor, "dimensions", None)
+                if callable(raw_dimensions):
+                    raw_dimensions = raw_dimensions()
+                if raw_dimensions is None:
+                    raise QairtConfigurationError(
+                        f"{split_id}.{graph_name} tensor "
+                        f"{getattr(tensor, 'name', '<unnamed>')} has no "
+                        "TensorInfo.dimensions"
+                    )
+                try:
+                    dimensions.update(
+                        int(getattr(item, "value", item))
+                        for item in raw_dimensions
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise QairtConfigurationError(
+                        f"{split_id}.{graph_name} exposes non-integral tensor "
+                        "dimensions"
+                    ) from exc
+            candidates = set(normalized_ars).intersection(dimensions)
+            if not candidates:
+                raise QairtConfigurationError(
+                    f"{split_id}.{graph_name} tensor shapes do not identify "
+                    f"any requested AR in {list(normalized_ars)}"
+                )
+            candidates_by_graph.append(candidates)
+
+        assignments = [
+            assignment
+            for assignment in itertools.permutations(normalized_ars)
+            if all(
+                ar in candidates
+                for ar, candidates in zip(
+                    assignment,
+                    candidates_by_graph,
+                )
+            )
+        ]
+        if len(assignments) != 1:
+            raise QairtConfigurationError(
+                f"{split_id} tensor shapes do not uniquely bind graphs to "
+                f"ARs {list(normalized_ars)}; candidates="
+                f"{[sorted(item) for item in candidates_by_graph]}"
+            )
+        return {
+            int(ar): str(getattr(graph, "name"))
+            for graph, ar in zip(normalized_graphs, assignments[0])
+        }
 
     def build_standalone_vit(
         self,
@@ -1663,25 +1859,14 @@ class QairtSdkAdapter:
                     False,
                     (f"split_{index} exposes no graph metadata",),
                 )
-            if len(graphs) == len(ar_values):
-                graph_names_by_ar = {
-                    int(ar): str(graph.name)
-                    for ar, graph in zip(ar_values, graphs)
-                }
-            elif len(graphs) == 1:
-                graph_names_by_ar = {
-                    int(ar): str(graphs[0].name)
-                    for ar in ar_values
-                }
-            else:
-                return (
-                    (),
-                    False,
-                    (
-                        f"split_{index} graph count {len(graphs)} cannot be "
-                        f"bound to ARs {list(ar_values)}",
-                    ),
+            try:
+                graph_names_by_ar = QairtSdkAdapter._graph_names_by_ar(
+                    graphs,
+                    ar_values,
+                    split_id=f"split_{index}",
                 )
+            except QairtConfigurationError as exc:
+                return (), False, (str(exc),)
 
             input_sets = {
                 tuple(str(tensor.name) for tensor in graph.inputs)
@@ -2125,9 +2310,15 @@ class QairtSdkAdapter:
                     workflow_graph,
                 )
             )
-            container = workflow_builder.build()
+            try:
+                container = workflow_builder.build()
+            except Exception as exc:
+                raise _wrap_genai_build_error(exc, prefix="GenAI Builder: ") from exc
         else:
-            container = builder.build()
+            try:
+                container = builder.build()
+            except Exception as exc:
+                raise _wrap_genai_build_error(exc, prefix="GenAI Builder: ") from exc
         container.save(str(destination), exist_ok=exist_ok)
         if not destination.is_dir():
             raise QairtConfigurationError(
@@ -2615,7 +2806,19 @@ class QairtSdkAdapter:
             },
             workflow_graph,
         )
-        container = workflow_builder.build()
+        try:
+            container = workflow_builder.build()
+        except Exception as exc:
+            raise _wrap_genai_build_error(
+                exc,
+                prefix="Qwen3.5-Omni GenAI Builder: ",
+                extra_diagnostics={
+                    "workflow_components": [
+                        "audioEncoder",
+                        "textGenerator",
+                    ]
+                },
+            ) from exc
         container.save(str(destination), exist_ok=exist_ok)
         audio_container_path = destination / "audioEncoder"
         text_container_path = destination / "textGenerator"
@@ -3163,10 +3366,7 @@ class QairtSdkAdapter:
                     )
                     converted.append(converted_artifact)
                     converted_for_slice.append(converted_artifact)
-                    graph_name = str(
-                        getattr(converted_artifact.sdk_model, "name", "")
-                        or slice_artifact.model_path.stem
-                    )
+                    graph_name = self._single_graph_name(converted_artifact.sdk_model)
                     graph_names.append(graph_name)
                     if native_kv and slice_name.startswith("decoder"):
                         info = self._onnx_inspector.inspect(slice_artifact.model_path)
@@ -3418,10 +3618,7 @@ class QairtSdkAdapter:
                 output_path=destination / "converted" / "vision_projector.dlc",
             )
             converted.append(converted_vision)
-            vision_graph_name = str(
-                getattr(converted_vision.sdk_model, "name", "")
-                or Path(vision_model_path).stem
-            )
+            vision_graph_name = self._single_graph_name(converted_vision.sdk_model)
             vision_context = self.compile_context(
                 [converted_vision],
                 output_path=destination / "contexts" / "vision_projector.bin",

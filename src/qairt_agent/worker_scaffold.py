@@ -157,6 +157,11 @@ def _merge_dockerignore(project_root: Path) -> Path:
             continue
         if not in_managed_block:
             retained.append(line)
+    if in_managed_block:
+        raise HarnessConstraintsError(
+            f"{path} contains an unmatched {_DOCKERIGNORE_BEGIN!r} marker; "
+            "refusing to discard subsequent user rules"
+        )
     while retained and not retained[-1].strip():
         retained.pop()
     managed = [
@@ -166,7 +171,26 @@ def _merge_dockerignore(project_root: Path) -> Path:
     ]
     content = "\n".join([*retained, *([""] if retained else []), *managed]) + "\n"
     if content != original:
-        path.write_text(content, encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            temporary.unlink(missing_ok=True)
     return path
 
 

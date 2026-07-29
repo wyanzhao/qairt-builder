@@ -39,7 +39,7 @@
     "backend": "HTP",
     "chipset": "SM8850",
     "dsp_arch": "v81",
-    "soc_model": 660,
+    "soc_model": 87,
     "device_id": "default"
   },
   "output_root": "/artifacts/qwen3"

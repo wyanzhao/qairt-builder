@@ -142,3 +142,80 @@ def test_invalid_harness_fails_closed(tmp_path) -> None:
 )
 def test_parse_version(text, expected) -> None:
     assert parse_version(text) == expected
+
+
+def test_checked_in_harness_has_worker_resource_pins() -> None:
+    constraints = DEFAULT_CONSTRAINTS
+
+    assert constraints.worker_memory == "96G"
+    assert constraints.worker_cpus == 8
+
+
+def test_harness_resource_defaults_for_legacy_constraints(tmp_path) -> None:
+    path = tmp_path / "constraints.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "qairt": {"version": "2.48.0", "build_id": "260626120635"},
+                "worker": {
+                    "ubuntu_version": "22.04",
+                    "python_version": "3.10",
+                    "platform": "linux/amd64",
+                    "image": "w:1",
+                    "dockerfile": "d.Dockerfile",
+                    "dependencies_file": "r.txt",
+                    "torch_version": "2.4.1",
+                    "torch_index_url": "https://example.com",
+                },
+                "runtime_cli": {
+                    "apple_container": {
+                        "version": "1.0.0",
+                        "host_alias": "h.ci",
+                    },
+                    "docker": {
+                        "minimum_version": "24.0.0",
+                        "host_alias": "h.di",
+                    },
+                },
+                "target": {
+                    "chipset": "SM8850",
+                    "dsp_arch": "v81",
+                    "soc_model": 87,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    constraints = load_harness_constraints(path)
+
+    assert constraints.worker_memory == "96G"
+    assert constraints.worker_cpus == 8
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("memory", {}, "worker.memory"),
+        ("memory", "0G", "worker.memory"),
+        ("cpus", "8", "worker.cpus"),
+        ("cpus", 0, "worker.cpus"),
+        ("cpus", True, "worker.cpus"),
+    ],
+)
+def test_harness_rejects_invalid_worker_resources(
+    tmp_path,
+    field,
+    value,
+    message,
+) -> None:
+    document = json.loads(
+        DEFAULT_CONSTRAINTS.source_path.read_text(encoding="utf-8")
+    )
+    document["worker"][field] = value
+    path = tmp_path / "constraints.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(HarnessConstraintsError, match=message):
+        load_harness_constraints(path)
