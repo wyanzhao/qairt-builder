@@ -599,3 +599,29 @@ def test_image_config_defaults_are_pinned() -> None:
     assert config.ubuntu_version == "22.04"
     assert config.python_version == "3.10"
     assert config.digest is None
+
+
+def test_build_run_argv_includes_memory_and_cpus() -> None:
+    runner = DockerRunner(image=DockerImageConfig(image_ref="img"))
+
+    argv = runner.build_run_argv(
+        mounts=_mounts(),
+        command=["true"],
+        memory="96G",
+        cpus=8,
+    )
+
+    assert argv[argv.index("--memory") + 1] == "96G"
+    assert argv[argv.index("--cpus") + 1] == "8"
+
+
+def test_build_run_argv_omits_resources_when_unset() -> None:
+    runner = DockerRunner(image=DockerImageConfig(image_ref="img"))
+
+    argv = runner.build_run_argv(
+        mounts=_mounts(),
+        command=["true"],
+    )
+
+    assert "--memory" not in argv
+    assert "--cpus" not in argv

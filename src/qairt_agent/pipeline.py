@@ -59,6 +59,7 @@ from qairt_agent.qairt_adapter import (
 from qairt_agent.qairt_adapter.errors import (
     ExperimentalFeatureError,
     QairtAdapterError,
+    QairtCompilationError,
     QairtConfigurationError,
     QairtPreflightError,
     QairtSdkImportError,
@@ -481,6 +482,8 @@ class QairtAgent:
         elif isinstance(exc, QairtPreflightError):
             code = ErrorCode.PREFLIGHT_FAILED
         elif isinstance(exc, (ExperimentalFeatureError, QairtConfigurationError)):
+            code = ErrorCode.STAGE_FAILED
+        elif isinstance(exc, QairtCompilationError):
             code = ErrorCode.STAGE_FAILED
         elif isinstance(exc, QairtAdapterError):
             code = ErrorCode.STAGE_FAILED

@@ -30,6 +30,7 @@ from .errors import (
     QairtConfigurationError,
     QairtPreflightError,
     QairtSdkImportError,
+    QairtCompilationError,
 )
 from .native_kv import (
     audit_native_kv_config,
@@ -1161,7 +1162,38 @@ class QairtSdkAdapter:
                 sdk_models.append(item)
 
         compile_input: Any = sdk_models if weight_sharing else sdk_models[0]
-        compiled = qairt.compile(compile_input, config=config)
+        try:
+            compiled = qairt.compile(compile_input, config=config)
+        except Exception as exc:
+            exc_text = str(exc)
+            diagnostics: dict[str, Any] = {
+                "target_soc": PINNED_TARGET_SOC,
+                "dsp_arch": PINNED_DSP_ARCH,
+                "soc_model": PINNED_SOC_MODEL,
+                "weight_sharing": weight_sharing,
+                "graph_names": list(selected_graph_names),
+            }
+            if "socModel 0" in exc_text or "socmodel 0" in exc_text.lower():
+                raise QairtCompilationError(
+                    "SDK native PnR received socModel 0 instead of "
+                    f"{PINNED_SOC_MODEL}: the soc_details config was not "
+                    "propagated to the native layer. This is a known SDK "
+                    "x86_64 offline-compilation issue; verify SDK version "
+                    "compatibility or compile on a connected HTP device.",
+                    details=diagnostics,
+                ) from exc
+            if "CREATE_DEVICE" in exc_text or "device handle" in exc_text.lower():
+                raise QairtCompilationError(
+                    "SDK failed to create a device handle for context-binary "
+                    "generation. On x86_64 hosts this requires the HTP "
+                    "offline-prepare path; on-device compilation requires "
+                    "QAIRT_AGENT_ADB_SERIAL and QAIRT_AGENT_ADB_SERVER.",
+                    details=diagnostics,
+                ) from exc
+            raise QairtCompilationError(
+                f"context-binary compilation failed: {exc}",
+                details=diagnostics,
+            ) from exc
         returned_path = compiled.save(str(destination))
         saved_path = Path(returned_path or destination)
         return CompiledContextArtifact(

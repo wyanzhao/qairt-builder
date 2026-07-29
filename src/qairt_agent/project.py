@@ -500,6 +500,45 @@ def _read_os_release() -> dict[str, str]:
     return values
 
 
+def _host_memory_gb() -> float | None:
+    """Return total physical memory in GB, or None if undetectable."""
+
+    import subprocess
+
+    try:
+        if platform.system() == "Darwin":
+            result = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return int(result.stdout.strip()) / (1024**3)
+        meminfo = Path("/proc/meminfo")
+        if meminfo.is_file():
+            for line in meminfo.read_text().splitlines():
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    return kb / (1024**2)
+    except (ValueError, OSError, IndexError):
+        pass
+    return None
+
+
+def _parse_memory_gb(value: str) -> float:
+    """Parse a memory string like '96G' or '4096M' into GB."""
+
+    value = value.strip().upper()
+    if value.endswith("G"):
+        return float(value[:-1])
+    if value.endswith("M"):
+        return float(value[:-1]) / 1024
+    if value.endswith("T"):
+        return float(value[:-1]) * 1024
+    return float(value) / (1024**3)
+
+
 def _probe_docker(
     image_ref: str,
     *,
@@ -770,6 +809,26 @@ def doctor(project_root: str | Path) -> dict[str, Any]:
                         else "; ".join(build_context_issues)
                     ),
                 ),
+            )
+        )
+
+    host_memory_gb = _host_memory_gb()
+    if host_memory_gb is not None:
+        required_gb = _parse_memory_gb(constraints.worker_memory)
+        memory_ok = host_memory_gb >= required_gb
+        checks.append(
+            DoctorCheck(
+                "host_resources",
+                memory_ok,
+                f"host memory {host_memory_gb:.0f} GB "
+                f"(worker requires {constraints.worker_memory}, "
+                f"{constraints.worker_cpus} CPUs)"
+                + (
+                    ""
+                    if memory_ok
+                    else "; insufficient memory for large model conversion"
+                ),
+                critical=False,
             )
         )
 

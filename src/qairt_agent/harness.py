@@ -80,6 +80,8 @@ class HarnessConstraints:
     target_chipset: str
     target_dsp_arch: str
     target_soc_model: int
+    worker_memory: str = "96G"
+    worker_cpus: int = 8
 
     @property
     def python_version_tuple(self) -> tuple[int, int]:
@@ -155,6 +157,8 @@ class HarnessConstraints:
             target_chipset=_require_string(target, "chipset", "target"),
             target_dsp_arch=_require_string(target, "dsp_arch", "target"),
             target_soc_model=_require_int(target, "soc_model", "target"),
+            worker_memory=str(worker.get("memory", "96G")),
+            worker_cpus=int(worker.get("cpus", 8)),
         )
         constraints.python_version_tuple
         constraints.platform_arch

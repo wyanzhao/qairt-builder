@@ -7,6 +7,7 @@ from qairt_agent.harness import HarnessConstraintsError
 from qairt_agent.project import (
     CONFIG_FILENAME,
     ProjectConfig,
+    _parse_memory_gb,
     discover_sdk_path,
     doctor,
     init,
@@ -183,3 +184,39 @@ def test_init_preserves_existing_explicit_backend(tmp_path) -> None:
     (tmp_path / CONFIG_FILENAME).write_text(text, encoding="utf-8")
 
     assert init(tmp_path).worker_backend == "native"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_gb"),
+    [
+        ("96G", 96.0),
+        ("4096M", 4.0),
+        ("1T", 1024.0),
+        ("32g", 32.0),
+    ],
+)
+def test_parse_memory_gb(value: str, expected_gb: float) -> None:
+    assert _parse_memory_gb(value) == pytest.approx(expected_gb)
+
+
+def test_doctor_includes_host_resources_check(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "qairt_agent.project._host_memory_gb", lambda: 128.0
+    )
+    config = init(tmp_path)
+    sdk = tmp_path / "qnn" / "qnn" / "qairt" / "2.48.0.260626"
+    sdk.mkdir(parents=True)
+    (sdk / "sdk.yaml").write_text(
+        "version: 2.48.0\nbuild_id: 260626120635\n",
+        encoding="utf-8",
+    )
+    (sdk / "lib" / "python").mkdir(parents=True)
+
+    result = doctor(tmp_path)
+
+    resource_checks = [
+        c for c in result["checks"] if c["name"] == "host_resources"
+    ]
+    assert len(resource_checks) == 1
+    assert resource_checks[0]["ok"] is True
+    assert "128 GB" in resource_checks[0]["message"]

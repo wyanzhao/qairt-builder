@@ -316,6 +316,8 @@ class AppleContainerRunner:
         workdir: str = "/workspace",
         env: dict[str, str] | None = None,
         user: str | None = None,
+        memory: str | None = None,
+        cpus: int | None = None,
     ) -> list[str]:
         """Render an Apple ``container run`` invocation without executing it."""
 
@@ -337,6 +339,10 @@ class AppleContainerRunner:
             # ``--no-dns`` makes offline smoke jobs deterministic with respect
             # to names, without pretending that IP egress is hard-isolated.
             argv.append("--no-dns")
+        if memory:
+            argv += ["-m", memory]
+        if cpus is not None:
+            argv += ["-c", str(cpus)]
         if user:
             argv += ["--user", user]
         argv += ["--workdir", workdir]
@@ -481,6 +487,8 @@ class AppleContainerRunner:
         workdir: str = "/workspace",
         env: dict[str, str] | None = None,
         user: str | None = None,
+        memory: str | None = None,
+        cpus: int | None = None,
     ) -> Any:
         self.require_available()
         result = self._executor(
@@ -492,6 +500,8 @@ class AppleContainerRunner:
                 workdir=workdir,
                 env=env,
                 user=user,
+                memory=memory,
+                cpus=cpus,
             )
         )
         if getattr(result, "returncode", 1) != 0:
@@ -516,6 +526,8 @@ class AppleContainerRunner:
         workdir: str = "/workspace",
         env: dict[str, str] | None = None,
         user: str | None = None,
+        memory: str | None = None,
+        cpus: int | None = None,
     ) -> Any:
         return self.run(
             mounts=mounts,
@@ -525,6 +537,8 @@ class AppleContainerRunner:
             workdir=workdir,
             env=env,
             user=user,
+            memory=memory,
+            cpus=cpus,
         )
 
 

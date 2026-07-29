@@ -370,3 +370,35 @@ def test_host_adb_alias_must_be_configured() -> None:
     )
     with pytest.raises(AppleContainerUnavailableError):
         false_positive.require_host_alias("host.container.internal")
+
+
+def test_build_run_argv_includes_memory_and_cpus() -> None:
+    runner = AppleContainerRunner(
+        image=WorkerImageConfig(image_ref="worker:test"),
+        host_arch=lambda: "arm64",
+    )
+
+    argv = runner.build_run_argv(
+        mounts=default_mounts("state", "artifacts", "cache"),
+        command=["true"],
+        memory="96G",
+        cpus=8,
+    )
+
+    assert argv[argv.index("-m") + 1] == "96G"
+    assert argv[argv.index("-c") + 1] == "8"
+
+
+def test_build_run_argv_omits_resources_when_unset() -> None:
+    runner = AppleContainerRunner(
+        image=WorkerImageConfig(image_ref="worker:test"),
+        host_arch=lambda: "arm64",
+    )
+
+    argv = runner.build_run_argv(
+        mounts=default_mounts("state", "artifacts", "cache"),
+        command=["true"],
+    )
+
+    assert "-m" not in argv
+    assert "-c" not in argv

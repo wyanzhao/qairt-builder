@@ -12,7 +12,9 @@
     "dockerfile": "docker/worker.Dockerfile",
     "dependencies_file": "docker/requirements-qairt-2.48.0.260626.txt",
     "torch_version": "2.4.1",
-    "torch_index_url": "https://download.pytorch.org/whl/cpu"
+    "torch_index_url": "https://download.pytorch.org/whl/cpu",
+    "memory": "96G",
+    "cpus": 8
   },
   "runtime_cli": {
     "apple_container": {

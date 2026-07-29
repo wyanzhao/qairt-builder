@@ -151,6 +151,8 @@ class DockerRunner:
         env: dict[str, str] | None = None,
         add_host_gateway: bool = False,
         user: str | None = None,
+        memory: str | None = None,
+        cpus: int | None = None,
     ) -> list[str]:
         """Render a docker-run argv without executing it."""
 
@@ -159,6 +161,10 @@ class DockerRunner:
         argv: list[str] = ["docker", "run", "--rm", "--platform", effective_platform]
         if not network:
             argv += ["--network", "none"]
+        if memory:
+            argv += ["--memory", memory]
+        if cpus is not None:
+            argv += ["--cpus", str(cpus)]
         if add_host_gateway:
             argv += [
                 "--add-host",
@@ -307,6 +313,8 @@ class DockerRunner:
         workdir: str = "/workspace",
         env: dict[str, str] | None = None,
         user: str | None = None,
+        memory: str | None = None,
+        cpus: int | None = None,
     ) -> Any:
         """Assemble and execute one ``docker run`` invocation.
 
@@ -325,6 +333,8 @@ class DockerRunner:
             workdir=workdir,
             env=env,
             user=user,
+            memory=memory,
+            cpus=cpus,
         )
         result = self._executor(argv)
         if getattr(result, "returncode", 1) != 0:
@@ -349,6 +359,8 @@ class DockerRunner:
         workdir: str = "/workspace",
         env: dict[str, str] | None = None,
         user: str | None = None,
+        memory: str | None = None,
+        cpus: int | None = None,
     ) -> Any:
         """Run a build-only / pickle-import job with the network disabled."""
 
@@ -360,6 +372,8 @@ class DockerRunner:
             workdir=workdir,
             env=env,
             user=user,
+            memory=memory,
+            cpus=cpus,
         )
 
 

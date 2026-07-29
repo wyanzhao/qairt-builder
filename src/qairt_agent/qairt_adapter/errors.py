@@ -25,3 +25,11 @@ class NativeKvConfigError(QairtConfigurationError):
 
 class ExperimentalFeatureError(QairtConfigurationError):
     """An experimental path was used without its explicit validation gates."""
+
+
+class QairtCompilationError(QairtAdapterError):
+    """Context-binary compilation failed in the QAIRT SDK native layer."""
+
+    def __init__(self, message: str, *, details: dict | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}

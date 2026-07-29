@@ -598,6 +598,8 @@ def _spawn_worker_impl(job_id: str, jobs_root: Path) -> int:
                 if hasattr(os, "getuid") and hasattr(os, "getgid")
                 else None
             ),
+            "memory": constraints.worker_memory,
+            "cpus": constraints.worker_cpus,
         }
         if backend == "docker":
             run_kwargs["add_host_gateway"] = True
