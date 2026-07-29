@@ -1,0 +1,44 @@
+{
+  "name": "qwen3-4b-full-genai",
+  "preset": "qwen3_5",
+  "sources": {
+    "text": {
+      "onnx": "/models/qwen3_4b/Qwen3-4B_onnx_w4a16/model.onnx",
+      "encodings": "/models/qwen3_4b/Qwen3-4B_onnx_w4a16/model.encodings",
+      "config_path": "/models/qwen3_4b/Qwen3-4B_onnx_w4a16/config.json"
+    }
+  },
+  "sequence": {
+    "ars": [128],
+    "context_lengths": [512],
+    "weight_sharing": false,
+    "native_kv": true
+  },
+  "split": {
+    "embedding_mode": "compiled",
+    "decoder_slice_count": 1,
+    "split_lm_head": false
+  },
+  "vectors": {
+    "mode": "capture"
+  },
+  "stage_configs": {
+    "benchmark": {
+      "prompt": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "attached_models_by_ar": {
+      "128": {
+        "model_path": "/models/qwen3_4b/Qwen3-4B_onnx_w4a16/model.onnx",
+        "encodings_path": "/models/qwen3_4b/Qwen3-4B_onnx_w4a16/model.encodings"
+      }
+    }
+  },
+  "output_root": "/artifacts/qwen3-4b-full-genai"
+}

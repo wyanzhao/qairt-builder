@@ -1,0 +1,45 @@
+{
+  "name": "qwen3-4b-full-lowlevel",
+  "preset": "qwen3_dense",
+  "sources": {
+    "text": {
+      "onnx": "/models/qwen3_4b/Qwen3-4B_onnx_w4a16/model.onnx",
+      "encodings": "/models/qwen3_4b/Qwen3-4B_onnx_w4a16/model.encodings",
+      "config_path": "/models/qwen3_4b/Qwen3-4B_onnx_w4a16/config.json"
+    }
+  },
+  "quantization": {
+    "mode": "apply_encodings"
+  },
+  "sequence": {
+    "ars": [128],
+    "context_lengths": [512],
+    "weight_sharing": false,
+    "native_kv": true
+  },
+  "split": {
+    "embedding_mode": "lut",
+    "decoder_slice_count": 1,
+    "split_lm_head": false
+  },
+  "vectors": {
+    "mode": "capture"
+  },
+  "quality": {
+    "sqnr_modes": ["full_reference"],
+    "dump_intermediates_on_failure": false
+  },
+  "benchmark": {
+    "warmup_runs": 2,
+    "measured_runs": 5,
+    "optrace": false
+  },
+  "target": {
+    "backend": "HTP",
+    "chipset": "SM8850",
+    "dsp_arch": "v81",
+    "soc_model": 87,
+    "device_id": "default"
+  },
+  "output_root": "/artifacts/qwen3-4b-full-lowlevel"
+}
