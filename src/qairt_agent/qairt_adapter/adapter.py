@@ -91,6 +91,39 @@ def _path_or_none(value: Any) -> Path | None:
     return Path(value) if value not in (None, "") else None
 
 
+def _wrap_genai_build_error(exc: Exception) -> QairtCompilationError:
+    """Translate a GenAI Builder build exception into a diagnostic error."""
+
+    exc_text = str(exc)
+    diagnostics: dict[str, Any] = {
+        "target_soc": PINNED_TARGET_SOC,
+        "dsp_arch": PINNED_DSP_ARCH,
+        "soc_model": PINNED_SOC_MODEL,
+        "pipeline": "genai_builder",
+    }
+    if "socModel 0" in exc_text or "socmodel 0" in exc_text.lower():
+        return QairtCompilationError(
+            "GenAI Builder: SDK native PnR received socModel 0 instead of "
+            f"{PINNED_SOC_MODEL}: the soc_details config was not propagated "
+            "to the native layer. This is a known SDK x86_64 "
+            "offline-compilation issue; verify SDK version compatibility "
+            "or compile on a connected HTP device.",
+            details=diagnostics,
+        )
+    if "CREATE_DEVICE" in exc_text or "device handle" in exc_text.lower():
+        return QairtCompilationError(
+            "GenAI Builder: SDK failed to create a device handle for "
+            "context-binary generation. On x86_64 hosts this requires the "
+            "HTP offline-prepare path; on-device compilation requires "
+            "QAIRT_AGENT_ADB_SERIAL and QAIRT_AGENT_ADB_SERVER.",
+            details=diagnostics,
+        )
+    return QairtCompilationError(
+        f"GenAI Builder: container build failed: {exc}",
+        details=diagnostics,
+    )
+
+
 def _exported_data_paths(exported: Any) -> tuple[Path, ...]:
     value = getattr(exported, "data_path", None)
     if value is None:
@@ -2157,9 +2190,15 @@ class QairtSdkAdapter:
                     workflow_graph,
                 )
             )
-            container = workflow_builder.build()
+            try:
+                container = workflow_builder.build()
+            except Exception as exc:
+                raise _wrap_genai_build_error(exc) from exc
         else:
-            container = builder.build()
+            try:
+                container = builder.build()
+            except Exception as exc:
+                raise _wrap_genai_build_error(exc) from exc
         container.save(str(destination), exist_ok=exist_ok)
         if not destination.is_dir():
             raise QairtConfigurationError(
