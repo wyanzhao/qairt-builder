@@ -1,0 +1,19 @@
+[project]
+sdk_root = "./qnn/qnn"
+
+[harness]
+constraints = "harness/constraints.json"
+
+[worker]
+backend = "auto"
+
+[state]
+jobs_dir = ".qairt-agent/jobs"
+state_dir = ".qairt-agent/state"
+artifacts_dir = "artifacts"
+cache_dir = ".qairt-agent/cache"
+
+[target]
+chipset = "SM8850"
+dsp_arch = "v81"
+soc_model = 660

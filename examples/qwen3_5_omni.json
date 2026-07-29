@@ -1,0 +1,47 @@
+{
+  "name": "qwen3.5-omni-components",
+  "preset": "qwen3_5_omni",
+  "sources": {
+    "text": {
+      "onnx": "/models/qwen3.5-omni/thinker/ar1/model.onnx",
+      "encodings": "/models/qwen3.5-omni/thinker/ar1/model.encodings",
+      "config_path": "/models/qwen3.5-omni/thinker/config.json"
+    },
+    "audio": {
+      "onnx": "/models/qwen3.5-omni/audio/model.onnx",
+      "encodings": "/models/qwen3.5-omni/audio/model.encodings",
+      "config_path": "/models/qwen3.5-omni/audio/config.json"
+    }
+  },
+  "sequence": {
+    "ars": [1, 128],
+    "context_lengths": [4096],
+    "weight_sharing": true,
+    "native_kv": true
+  },
+  "split": {
+    "embedding_mode": "compiled",
+    "decoder_slice_count": 4,
+    "split_lm_head": true
+  },
+  "vectors": {
+    "mode": "provided",
+    "validation_manifests_by_ar": {
+      "1": "/models/qwen3.5-omni/thinker/vectors/ar1/validation.json",
+      "128": "/models/qwen3.5-omni/thinker/vectors/ar128/validation.json"
+    }
+  },
+  "metadata": {
+    "attached_models_by_ar": {
+      "1": {
+        "model_path": "/models/qwen3.5-omni/thinker/ar1/model.onnx",
+        "encodings_path": "/models/qwen3.5-omni/thinker/ar1/model.encodings"
+      },
+      "128": {
+        "model_path": "/models/qwen3.5-omni/thinker/ar128/model.onnx",
+        "encodings_path": "/models/qwen3.5-omni/thinker/ar128/model.encodings"
+      }
+    }
+  },
+  "output_root": "/artifacts/qwen3.5-omni"
+}

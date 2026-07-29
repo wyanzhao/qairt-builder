@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "qairt": {
+    "version": "2.48.0",
+    "build_id": "260626120635"
+  },
+  "worker": {
+    "ubuntu_version": "22.04",
+    "python_version": "3.10",
+    "platform": "linux/amd64",
+    "image": "qairt-agent-worker:0.1.0-ubuntu22.04-py310",
+    "dockerfile": "docker/worker.Dockerfile",
+    "dependencies_file": "docker/requirements-qairt-2.48.0.260626.txt",
+    "torch_version": "2.4.1",
+    "torch_index_url": "https://download.pytorch.org/whl/cpu"
+  },
+  "runtime_cli": {
+    "apple_container": {
+      "version": "1.0.0",
+      "host_alias": "host.container.internal"
+    },
+    "docker": {
+      "minimum_version": "24.0.0",
+      "host_alias": "host.docker.internal"
+    }
+  },
+  "target": {
+    "chipset": "SM8850",
+    "dsp_arch": "v81",
+    "soc_model": 660
+  }
+}

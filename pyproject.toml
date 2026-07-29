@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qairt-agent"
+version = "0.1.0"
+description = "Agent-native, Python-only orchestration for QAIRT GenAI model build and diagnostics"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "Proprietary" }
+authors = [{ name = "qairt-agent contributors" }]
+dependencies = [
+  "numpy>=1.26,<3",
+  "onnx>=1.16,<2",
+  "onnxruntime>=1.17,<2",
+  "pydantic>=2.8,<3",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp==1.8.0"]
+dev = ["pytest==8.1.1", "pytest-cov>=5,<7"]
+
+[project.scripts]
+qairt-agent = "qairt_agent.cli:main"
+qairt-agent-mcp = "qairt_agent.mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qairt_agent"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"harness/constraints.json" = "qairt_agent/_data/harness_constraints.json"
+"docker/worker.Dockerfile" = "qairt_agent/_data/worker/docker/worker.Dockerfile"
+"docker/requirements-qairt-2.48.0.260626.txt" = "qairt_agent/_data/worker/docker/requirements-qairt-2.48.0.260626.txt"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.coverage.run]
+branch = true
+source = ["qairt_agent"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"

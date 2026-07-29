@@ -1,0 +1,17 @@
+# qairt-agent managed exclusions: begin
+.git/
+.venv/
+.qairt-agent/
+__pycache__/
+.pytest_cache/
+.coverage
+qnn/
+qairt/
+models/
+artifacts/
+*.onnx
+*.bin
+*.raw
+*.pkl
+*.pickle
+# qairt-agent managed exclusions: end

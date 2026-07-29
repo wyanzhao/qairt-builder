@@ -1,0 +1,30 @@
+{
+  "name": "standalone-vit",
+  "preset": "vit",
+  "sources": {
+    "text": {
+      "onnx": "/models/vit/model.onnx",
+      "encodings": "/models/vit/model.encodings",
+      "config_path": "/models/vit/config.json"
+    }
+  },
+  "sequence": {
+    "ars": [1],
+    "context_lengths": [4096],
+    "weight_sharing": false,
+    "native_kv": false
+  },
+  "split": {
+    "embedding_mode": "external",
+    "decoder_slice_count": 1,
+    "split_lm_head": false
+  },
+  "transforms": {
+    "mha2sha": false
+  },
+  "vectors": {
+    "mode": "provided",
+    "validation_manifest": "/models/vit/vectors/validation.json"
+  },
+  "output_root": "/artifacts/vit"
+}

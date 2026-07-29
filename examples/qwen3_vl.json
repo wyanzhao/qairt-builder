@@ -1,0 +1,60 @@
+{
+  "name": "qwen3-vl-low-level",
+  "preset": "qwen3_vl",
+  "sources": {
+    "text": {
+      "onnx": "/models/qwen3-vl/text-ar2073-cl4096.onnx",
+      "encodings": "/models/qwen3-vl/text-ar2073-cl4096.encodings",
+      "config_path": "/models/qwen3-vl/text_config.json"
+    },
+    "vision": {
+      "onnx": "/models/qwen3-vl/vision_with_projector.onnx",
+      "encodings": "/models/qwen3-vl/vision_with_projector.encodings",
+      "config_path": "/models/qwen3-vl/vision_config.json"
+    },
+    "vision_projector_location": "inside_vision_onnx"
+  },
+  "quantization": {
+    "mode": "apply_encodings"
+  },
+  "sequence": {
+    "ars": [1, 128],
+    "context_lengths": [4096],
+    "weight_sharing": true,
+    "native_kv": true
+  },
+  "split": {
+    "embedding_mode": "external",
+    "decoder_slice_count": 4,
+    "split_lm_head": true
+  },
+  "vectors": {
+    "mode": "provided",
+    "validation_manifest": "/models/qwen3-vl/vectors/text-chain.json"
+  },
+  "quality": {
+    "sqnr_modes": ["full_reference", "teacher_forced", "chain"],
+    "dump_intermediates_on_failure": true
+  },
+  "benchmark": {
+    "warmup_runs": 10,
+    "measured_runs": 50,
+    "optrace": false
+  },
+  "stage_configs": {
+    "validation": {
+      "component": "text"
+    },
+    "benchmark": {
+      "component": "text"
+    }
+  },
+  "target": {
+    "backend": "HTP",
+    "chipset": "SM8850",
+    "dsp_arch": "v81",
+    "soc_model": 660,
+    "device_id": "default"
+  },
+  "output_root": "/artifacts/qwen3-vl"
+}

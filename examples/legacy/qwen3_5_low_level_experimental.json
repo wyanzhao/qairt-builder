@@ -1,0 +1,72 @@
+{
+  "name": "legacy-qwen3.5-single-source-low-level-experiment",
+  "family": "qwen3_5",
+  "sources": {
+    "text": {
+      "onnx": "/models/qwen3.5/base.onnx",
+      "encodings": "/models/qwen3.5/base.encodings",
+      "config_path": "/models/qwen3.5/config.json"
+    }
+  },
+  "quantization": {
+    "mode": "apply_encodings"
+  },
+  "sequence": {
+    "ars": [1, 128],
+    "context_lengths": [4096],
+    "weight_sharing": true,
+    "native_kv": true,
+    "qwen35_experimental_auto_ar": true
+  },
+  "split": {
+    "embedding_mode": "compiled",
+    "decoder_slice_count": 4,
+    "split_lm_head": true
+  },
+  "vectors": {
+    "mode": "provided",
+    "validation_manifest": "/models/qwen3.5/vectors/transform_equivalence.json"
+  },
+  "quality": {
+    "sqnr_modes": ["full_reference", "teacher_forced", "chain"],
+    "dump_intermediates_on_failure": true
+  },
+  "benchmark": {
+    "warmup_runs": 10,
+    "measured_runs": 50,
+    "optrace": false
+  },
+  "metadata": {
+    "qwen35_runtime_validation": {
+      "cases": {
+        "decoder_00": {
+          "1": "/models/qwen3.5/vectors/decoder_00_ar1.json",
+          "128": "/models/qwen3.5/vectors/decoder_00_ar128.json"
+        },
+        "decoder_01": {
+          "1": "/models/qwen3.5/vectors/decoder_01_ar1.json",
+          "128": "/models/qwen3.5/vectors/decoder_01_ar128.json"
+        },
+        "decoder_02": {
+          "1": "/models/qwen3.5/vectors/decoder_02_ar1.json",
+          "128": "/models/qwen3.5/vectors/decoder_02_ar128.json"
+        },
+        "decoder_03": {
+          "1": "/models/qwen3.5/vectors/decoder_03_ar1.json",
+          "128": "/models/qwen3.5/vectors/decoder_03_ar128.json"
+        }
+      },
+      "rtol": 0.0,
+      "atol": 0.0,
+      "native_io": true
+    }
+  },
+  "target": {
+    "backend": "HTP",
+    "chipset": "SM8850",
+    "dsp_arch": "v81",
+    "soc_model": 660,
+    "device_id": "default"
+  },
+  "output_root": "/artifacts/qwen3.5"
+}
