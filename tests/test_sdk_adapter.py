@@ -75,12 +75,12 @@ class PreflightTests(unittest.TestCase):
                     "target": {
                         "chipset": "SM8850",
                         "dsp_arch": "v81",
-                        "soc_model": 660,
+                        "soc_model": 87,
                     },
                 }
             )
         self.assertTrue(report.ok, report.issues)
-        self.assertEqual(report.soc_model, 660)
+        self.assertEqual(report.soc_model, 87)
 
     def test_v79_or_implicit_target_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -94,6 +94,71 @@ class PreflightTests(unittest.TestCase):
         codes = {issue.code for issue in report.errors}
         self.assertIn("target.dsp_arch", codes)
         self.assertIn("target.soc_model", codes)
+
+    def test_device_factory_soc_model_cross_check_fails_closed(self) -> None:
+        checker = PreflightChecker(
+            environ={},
+            system=lambda: "Linux",
+            machine=lambda: "x86_64",
+            python_version=(3, 10),
+            os_release_reader=lambda: {
+                "ID": "ubuntu",
+                "VERSION_ID": "22.04",
+            },
+            soc_details_resolver=lambda backend, chipset: SimpleNamespace(
+                model=660,
+                dsp_arch=81,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            sdk = self._sdk(Path(directory))
+            report = checker.check(
+                {
+                    "sdk_root": sdk,
+                    "target": {
+                        "chipset": "SM8850",
+                        "dsp_arch": "v81",
+                        "soc_model": 87,
+                    },
+                }
+            )
+
+        self.assertIn(
+            "sdk.soc_model_map",
+            {issue.code for issue in report.errors},
+        )
+
+    def test_missing_sdk_python_import_is_reported_as_unverified(self) -> None:
+        checker = PreflightChecker(
+            environ={},
+            system=lambda: "Linux",
+            machine=lambda: "x86_64",
+            python_version=(3, 10),
+            os_release_reader=lambda: {
+                "ID": "ubuntu",
+                "VERSION_ID": "22.04",
+            },
+            soc_details_resolver=lambda backend, chipset: None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            sdk = self._sdk(Path(directory))
+            report = checker.check(
+                {
+                    "sdk_root": sdk,
+                    "target": {
+                        "chipset": "SM8850",
+                        "dsp_arch": "v81",
+                        "soc_model": 87,
+                    },
+                }
+            )
+
+        warning = next(
+            issue
+            for issue in report.warnings
+            if issue.code == "sdk.soc_details_unverified"
+        )
+        self.assertIn("could not be cross-checked", warning.message)
 
     def test_checker_uses_injected_harness_versions(self) -> None:
         constraints = replace(
@@ -182,7 +247,9 @@ class FakeCompileConfig:
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
-        self.device_custom_configs = []
+        self.device_custom_configs = [
+            SimpleNamespace(soc_model=87, dsp_arch=SimpleNamespace(value="v81"))
+        ]
         self.mode = None
         self.mode_kwargs = None
         type(self).created.append(self)
@@ -352,26 +419,58 @@ class AdapterTests(unittest.TestCase):
         adapter = self._adapter()
         with tempfile.TemporaryDirectory() as directory:
             result = adapter.compile_context(
-                [FakeModel("ar1"), FakeModel("ar128")],
+                [FakeModel("decoder_ar1"), FakeModel("decoder_ar128")],
                 output_path=Path(directory) / "decoder.bin",
                 graph_names=("decoder_ar1", "decoder_ar128"),
                 ar_values=(1, 128),
                 source_kinds=("derived", "derived"),
                 target_soc="SM8850",
                 dsp_arch="v81",
-                soc_model=660,
+                soc_model=87,
                 family=FamilyId.QWEN3_DENSE,
                 slice_name="decoder_00",
             )
         config = FakeCompileConfig.created[-1]
         self.assertEqual(config.mode, "weight_sharing")
-        self.assertEqual(config.mode_kwargs["soc_model"], 660)
+        self.assertEqual(config.mode_kwargs["soc_model"], 87)
         self.assertEqual(config.mode_kwargs["dsp_arch"], "v81")
         self.assertEqual(
             config.mode_kwargs["graph_names"],
             ["decoder_ar1", "decoder_ar128"],
         )
         self.assertEqual(result.ar_values, (1, 128))
+
+    def test_compile_rejects_empty_device_custom_configs(self) -> None:
+        with self.assertRaisesRegex(
+            QairtConfigurationError,
+            "no device_custom_configs",
+        ):
+            QairtSdkAdapter._validate_compiler_target(
+                SimpleNamespace(device_custom_configs=[])
+            )
+
+    def test_compile_uses_sdk_graph_name_when_model_stem_differs(self) -> None:
+        adapter = self._adapter()
+        model = FakeModel("decoder_file_stem")
+        model.graphs_info = [SimpleNamespace(name="sdk_decoder_graph")]
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = adapter.compile_context(
+                [model],
+                output_path=Path(directory) / "decoder.bin",
+                graph_names=("sdk_decoder_graph",),
+                ar_values=(1,),
+                source_kinds=("derived",),
+                target_soc="SM8850",
+                dsp_arch="v81",
+                soc_model=87,
+                family=FamilyId.QWEN3_DENSE,
+                slice_name="decoder_00",
+                weight_sharing=False,
+            )
+
+        self.assertEqual(result.graph_names, ("sdk_decoder_graph",))
+        self.assertEqual(len(self.compiles), 1)
 
     def test_saved_genai_container_executor_is_prepared_and_cleaned(self) -> None:
         calls: list[tuple[str, Any]] = []
@@ -430,19 +529,23 @@ class AdapterTests(unittest.TestCase):
         )
 
     def test_saved_genai_raw_slices_bind_public_graph_metadata(self) -> None:
-        def graph(name: str) -> Any:
+        def graph(name: str, ar: int) -> Any:
             return SimpleNamespace(
                 name=name,
-                inputs=[SimpleNamespace(name="x")],
-                outputs=[SimpleNamespace(name="y")],
+                inputs=[
+                    SimpleNamespace(name="x", dimensions=[1, ar, 16])
+                ],
+                outputs=[
+                    SimpleNamespace(name="y", dimensions=[1, ar, 16])
+                ],
             )
 
         container = SimpleNamespace(
             models=[
                 SimpleNamespace(
                     graphs_info=[
-                        graph("decoder_ar1"),
-                        graph("decoder_ar128"),
+                        graph("decoder_ar1", 1),
+                        graph("decoder_ar128", 128),
                     ]
                 )
             ]
@@ -486,7 +589,7 @@ class AdapterTests(unittest.TestCase):
                 "target": {
                     "chipset": "SM8850",
                     "dsp_arch": "v81",
-                    "soc_model": 660,
+                    "soc_model": 87,
                 },
             }
             result = adapter.build_standalone_vit(
@@ -532,7 +635,7 @@ class AdapterTests(unittest.TestCase):
                 "target": {
                     "chipset": "SM8850",
                     "dsp_arch": "v81",
-                    "soc_model": 660,
+                    "soc_model": 87,
                 },
             }
             result = adapter.build_standalone_vit(
@@ -560,7 +663,7 @@ class AdapterTests(unittest.TestCase):
             FakeCompileConfig.created[0].kwargs,
             {
                 "backend": "HTP",
-                "soc_details": "chipset:SM8850;dsp_arch:v81;soc_model:660",
+                "soc_details": "chipset:SM8850;dsp_arch:v81;soc_model:87",
                 "data_format_config": None,
                 "profiling_level": "detailed",
             },
@@ -569,7 +672,7 @@ class AdapterTests(unittest.TestCase):
             FakeCompileConfig.created[1].kwargs,
             {
                 "backend": "HTP",
-                "soc_details": "chipset:SM8850;dsp_arch:v81;soc_model:660",
+                "soc_details": "chipset:SM8850;dsp_arch:v81;soc_model:87",
                 "data_format_config": None,
                 "profiling_level": "detailed",
                 "set_output_tensors": ["encoder.layer.0/output"],
@@ -600,7 +703,7 @@ class AdapterTests(unittest.TestCase):
                 source_kinds=("derived", "derived"),
                 target_soc="SM8850",
                 dsp_arch="v81",
-                soc_model=660,
+                soc_model=87,
                 family=FamilyId.QWEN3_5,
             )
         self.assertEqual(imports, [])
@@ -617,7 +720,7 @@ class AdapterTests(unittest.TestCase):
                 source_kinds=("derived", "derived"),
                 target_soc="SM8850",
                 dsp_arch="v81",
-                soc_model=660,
+                soc_model=87,
                 family=FamilyId.QWEN3_5,
                 slice_name="decoder_00",
                 context_length=4096,
@@ -732,7 +835,7 @@ class AdapterTests(unittest.TestCase):
                 context_length=4096,
                 target_soc="SM8850",
                 dsp_arch="v81",
-                soc_model=660,
+                soc_model=87,
                 runtime_validator=lambda _request: Qwen35RuntimeValidationResult(
                     True,
                     True,
@@ -751,7 +854,7 @@ class AdapterTests(unittest.TestCase):
                 source_kinds=("derived", "derived"),
                 target_soc="SM8850",
                 dsp_arch="v81",
-                soc_model=660,
+                soc_model=87,
                 family=FamilyId.QWEN3_5,
                 slice_name="decoder_00",
                 context_length=4096,
@@ -771,7 +874,7 @@ class AdapterTests(unittest.TestCase):
                 source_kinds=("derived", "derived"),
                 target_soc="SM8850",
                 dsp_arch="v79",
-                soc_model=660,
+                soc_model=87,
             )
         self.assertEqual(self.compiles, [])
 
@@ -1087,7 +1190,7 @@ class GenAIBuilderPackagingTests(unittest.TestCase):
         self.assertIn(
             (
                 "set_targets",
-                ["chipset:SM8850;dsp_arch:v81;soc_model:660"],
+                ["chipset:SM8850;dsp_arch:v81;soc_model:87"],
             ),
             calls,
         )
@@ -1666,8 +1769,8 @@ class GenAIBuilderPackagingTests(unittest.TestCase):
         self.assertEqual(
             target_events,
             [
-                ["chipset:SM8850;dsp_arch:v81;soc_model:660"],
-                ["chipset:SM8850;dsp_arch:v81;soc_model:660"],
+                ["chipset:SM8850;dsp_arch:v81;soc_model:87"],
+                ["chipset:SM8850;dsp_arch:v81;soc_model:87"],
             ],
         )
         workflow_call = next(
@@ -1723,7 +1826,7 @@ class ComposedBuildTests(unittest.TestCase):
                 sdk_build_id="260626120635",
                 target_soc="SM8850",
                 dsp_arch="v81",
-                soc_model=660,
+                soc_model=87,
             )
 
         def ar_convert(self, model_path: str | Path, **kwargs: Any) -> ModelVariantArtifact:
@@ -1832,7 +1935,7 @@ class ComposedBuildTests(unittest.TestCase):
             "target": {
                 "chipset": "SM8850",
                 "dsp_arch": "v81",
-                "soc_model": 660,
+                "soc_model": 87,
             },
         }
 

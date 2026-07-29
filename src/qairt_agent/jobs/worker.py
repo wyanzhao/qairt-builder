@@ -139,6 +139,20 @@ class WorkflowWorker:
         self.heartbeat_interval = heartbeat_interval
         self.heartbeat_stale_after = heartbeat_stale_after
         self.clock = clock
+        configured_project_root = (
+            os.environ.get("QAIRT_AGENT_PROJECT_ROOT") or ""
+        ).strip()
+        if configured_project_root:
+            self.project_root = Path(
+                configured_project_root
+            ).expanduser().resolve()
+        elif (
+            journal.root.name == "jobs"
+            and journal.root.parent.name == ".qairt-agent"
+        ):
+            self.project_root = journal.root.parent.parent.resolve()
+        else:
+            self.project_root = journal.root.parent.resolve()
 
     # ------------------------------------------------------------------ #
     # Stage keys are stage-aware so an adjusted spec only invalidates the
@@ -198,7 +212,14 @@ class WorkflowWorker:
                 "spec": self._project(self._BUILD_KEYS),
                 "stage_config": self._stage_config("build"),
             }
-            return hashlib.sha256(canonical_json_bytes(content_identity(projection))).hexdigest()
+            return hashlib.sha256(
+                canonical_json_bytes(
+                    content_identity(
+                        projection,
+                        project_root=self.project_root,
+                    )
+                )
+            ).hexdigest()
         if manifest is not None:
             # A manifest is immutable input, not merely a trusted string from a
             # receipt. Re-hash it before deriving a continuation-stage key.
@@ -220,7 +241,10 @@ class WorkflowWorker:
             "config": projection,
             "stage_config": self._stage_config(stage_name),
         }
-        combined = content_identity(combined)
+        combined = content_identity(
+            combined,
+            project_root=self.project_root,
+        )
         return hashlib.sha256(canonical_json_bytes(combined)).hexdigest()
 
     @staticmethod
@@ -301,18 +325,22 @@ class WorkflowWorker:
                 return reused
         return None
 
-    @classmethod
-    def _build_spec_reuse_identity(cls, build_spec: BuildSpec) -> str:
+    def _build_spec_reuse_identity(self, build_spec: BuildSpec) -> str:
         """Hash only fields whose change requires rebuilding compiled artifacts."""
 
         payload = build_spec.model_dump(mode="python")
         projected = {
             key: payload[key]
-            for key in cls._BUILD_SPEC_REUSE_FIELDS
+            for key in self._BUILD_SPEC_REUSE_FIELDS
         }
         projected["stage_config"] = payload["stage_configs"]["build"]
         return hashlib.sha256(
-            canonical_json_bytes(content_identity(projected))
+            canonical_json_bytes(
+                content_identity(
+                    projected,
+                    project_root=self.project_root,
+                )
+            )
         ).hexdigest()
 
     def _has_verified_ancestor_build_receipt(self) -> bool:

@@ -26,6 +26,9 @@ else:
     _MCP_IMPORT_ERROR = None
 
 from qairt_agent.agent import QairtAgentClient
+from qairt_agent.contracts import JobState
+from qairt_agent.errors import InvalidSpecError
+from qairt_agent.jobs.worker import DEFAULT_WORKFLOW_STAGES
 from qairt_agent.pipeline import QairtAgent
 
 
@@ -76,7 +79,55 @@ def _invoke(method: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
 
 def _register_async_tools(server: Any, *, jobs_root: str | None, client: QairtAgentClient | None) -> None:
     if client is None:
-        client = QairtAgentClient(jobs_root=jobs_root or ".qairt-agent/jobs", background=True)
+        # Reuse the CLI's project-aware harness selection.  The control-plane
+        # process never hosts QAIRT work in a daemon thread.
+        from qairt_agent.cli import _default_client
+
+        client = _default_client(jobs_root)
+
+    def validated_stages(
+        raw: list[str] | None,
+        *,
+        from_job: str | None,
+    ) -> tuple[str, ...]:
+        stages = tuple(raw) if raw else ("build",)
+        allowed = set(DEFAULT_WORKFLOW_STAGES)
+        unknown = sorted(set(stages) - allowed)
+        if unknown:
+            raise InvalidSpecError(
+                f"unsupported MCP workflow stages: {unknown}",
+                stage="mcp",
+                details={"allowed_stages": list(DEFAULT_WORKFLOW_STAGES)},
+            )
+        if len(set(stages)) != len(stages):
+            raise InvalidSpecError(
+                "MCP workflow stages must be unique",
+                stage="mcp",
+            )
+        positions = [DEFAULT_WORKFLOW_STAGES.index(stage) for stage in stages]
+        if positions != sorted(positions):
+            raise InvalidSpecError(
+                "MCP workflow stages must follow build, validate, benchmark, "
+                "diagnose order",
+                stage="mcp",
+            )
+        requires_prior_build = any(
+            stage in {"validate", "benchmark", "diagnose"}
+            for stage in stages
+        ) and "build" not in stages
+        if requires_prior_build and from_job is None:
+            raise InvalidSpecError(
+                "validate, benchmark, and diagnose require from_job unless "
+                "the submitted stages include build",
+                stage="mcp",
+            )
+        return stages
+
+    def spawn_prepared(handle: Any) -> dict[str, Any]:
+        from qairt_agent.cli import _spawn_worker
+
+        pid = _spawn_worker(handle.job_id, client.jobs_root)
+        return {**handle.submission(), "worker_pid": pid}
 
     @server.tool(
         description=(
@@ -89,13 +140,19 @@ def _register_async_tools(server: Any, *, jobs_root: str | None, client: QairtAg
         stages: list[str] | None = None,
         from_job: str | None = None,
     ) -> dict[str, Any]:
-        return _safe(
-            lambda: client.submit(
-                spec,
-                stages=tuple(stages) if stages else ("build",),
+        def call() -> dict[str, Any]:
+            selected_stages = validated_stages(
+                stages,
                 from_job=from_job,
-            ).submission()
-        )
+            )
+            handle = client.prepare(
+                spec,
+                stages=selected_stages,
+                initial_manifest_job=from_job,
+            )
+            return spawn_prepared(handle)
+
+        return _safe(call)
 
     @server.tool(
         description=(
@@ -123,7 +180,13 @@ def _register_async_tools(server: Any, *, jobs_root: str | None, client: QairtAg
 
     @server.tool(description="Resume an interrupted (orphaned) job from its last verified receipt.")
     def resume_job(job_id: str) -> dict[str, Any]:
-        return _safe(lambda: client.resume(job_id).submission())
+        def call() -> dict[str, Any]:
+            handle = client.prepare_resume(job_id)
+            if handle.status().state is JobState.SUCCEEDED:
+                return handle.submission()
+            return spawn_prepared(handle)
+
+        return _safe(call)
 
 
 # --------------------------------------------------------------------------- #

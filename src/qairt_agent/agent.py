@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from qairt_agent.artifacts import canonical_json_bytes
 from qairt_agent.contracts import ArtifactRef, BuildSpec, utc_now
 from qairt_agent.contracts import (
@@ -201,26 +203,53 @@ class QairtAgentClient:
             return self._normalize_spec_active(spec)
 
     def _normalize_spec_active(self, spec: Any) -> WorkflowSpec:
-        if isinstance(spec, WorkflowSpec):
-            return WorkflowSpec.model_validate(
-                spec.model_dump(mode="python")
-            )
-        if isinstance(spec, BuildSpec):
-            return to_workflow_spec(
-                BuildSpec.model_validate(spec.model_dump(mode="python"))
-            )
-        if isinstance(spec, (str, Path)):
-            path = Path(spec).expanduser()
-            if not path.exists():
-                raise InvalidSpecError(f"spec file not found: {path}", stage="spec")
-            return self._normalize_spec_active(
-                json.loads(path.read_text(encoding="utf-8"))
-            )
-        if isinstance(spec, dict):
-            if "preset" in spec:
-                return WorkflowSpec.model_validate(spec)
-            return to_workflow_spec(BuildSpec.model_validate(spec))
-        raise InvalidSpecError(f"cannot interpret spec of type {type(spec).__name__}", stage="spec")
+        try:
+            if isinstance(spec, WorkflowSpec):
+                return WorkflowSpec.model_validate(
+                    spec.model_dump(mode="python")
+                )
+            if isinstance(spec, BuildSpec):
+                return to_workflow_spec(
+                    BuildSpec.model_validate(spec.model_dump(mode="python"))
+                )
+            if isinstance(spec, (str, Path)):
+                path = Path(spec).expanduser()
+                if not path.exists():
+                    raise InvalidSpecError(
+                        f"spec file not found: {path}",
+                        stage="spec",
+                    )
+                return self._normalize_spec_active(
+                    json.loads(path.read_text(encoding="utf-8"))
+                )
+            if isinstance(spec, dict):
+                if "preset" in spec:
+                    return WorkflowSpec.model_validate(spec)
+                return to_workflow_spec(BuildSpec.model_validate(spec))
+        except InvalidSpecError:
+            raise
+        except json.JSONDecodeError as exc:
+            raise InvalidSpecError(
+                "invalid spec JSON",
+                stage="spec",
+                details={
+                    "line": exc.lineno,
+                    "column": exc.colno,
+                    "reason": exc.msg,
+                },
+            ) from exc
+        except ValidationError as exc:
+            raise InvalidSpecError(
+                "invalid spec",
+                stage="spec",
+                details={
+                    "validation_errors": exc.errors(include_url=False)
+                },
+            ) from exc
+        raise InvalidSpecError(
+            f"cannot interpret spec of type {type(spec).__name__}",
+            stage="spec",
+        )
 
     def _default_engine(self) -> Any:
         if self._engine_factory is not None:
@@ -521,7 +550,10 @@ class QairtAgentClient:
         return self._launch(handle.journal, self._worker_for(handle.journal))
 
     def job(self, job_id: str) -> JobHandle:
-        return JobHandle(JobJournal.open(self.jobs_root, job_id), client=self)
+        return JobHandle(
+            JobJournal.open_readonly(self.jobs_root, job_id),
+            client=self,
+        )
 
     def list_jobs(self) -> list[str]:
         return JobJournal.list_jobs(self.jobs_root)

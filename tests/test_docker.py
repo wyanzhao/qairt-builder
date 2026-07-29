@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import subprocess
 
 import pytest
 from pydantic import ValidationError
@@ -17,7 +18,7 @@ from qairt_agent.docker import (
     image_provenance,
     resolve_image_digest,
 )
-from qairt_agent.errors import DockerUnavailableError
+from qairt_agent.errors import DockerUnavailableError, WorkerCommandError
 from qairt_agent.harness import DEFAULT_CONSTRAINTS
 
 
@@ -119,6 +120,38 @@ def test_runtime_mounts_include_jobs_and_host_compatibility_aliases() -> None:
     assert "/host/artifacts:/host/artifacts" in args
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "sdk_root",
+        "workspace",
+        "state_volume",
+        "artifacts_volume",
+        "cache_volume",
+        "jobs_volume",
+        "models_root",
+    ],
+)
+@pytest.mark.parametrize("delimiter", [":", ",", "="])
+def test_runtime_mounts_reject_option_delimiters(
+    field: str,
+    delimiter: str,
+) -> None:
+    values = {
+        "sdk_root": "./qnn/qnn",
+        "workspace": "./models",
+        "state_volume": "state-vol",
+        "artifacts_volume": "artifacts-vol",
+        "cache_volume": "cache-vol",
+        "jobs_volume": "jobs-vol",
+        "models_root": "./models-root",
+    }
+    values[field] = f"safe{delimiter}injected"
+
+    with pytest.raises(ValidationError, match="mount source"):
+        RuntimeMounts(**values)
+
+
 # --------------------------------------------------------------------------- #
 # DockerRunner.run argv
 # --------------------------------------------------------------------------- #
@@ -173,11 +206,13 @@ def test_run_nonzero_is_structured(docker_on_path) -> None:
         image=DockerImageConfig(image_ref="img"),
     )
 
-    with pytest.raises(DockerUnavailableError) as caught:
+    with pytest.raises(WorkerCommandError) as caught:
         runner.run(mounts=_mounts(), command=["true"])
 
     error = caught.value.to_tool_error()
     assert error.stage == "docker-run"
+    assert error.code.value == "stage_failed"
+    assert error.retryable is False
     assert error.details["returncode"] == 125
 
 
@@ -268,6 +303,28 @@ def test_sdk_smoke_argv_mounts_only_sdk_and_import_test_is_offline(tmp_path) -> 
         "-m",
         "qairt_agent.docker.smoke",
     ]
+
+
+def test_sdk_smoke_rejects_mount_delimiter_in_sdk_root(tmp_path) -> None:
+    runner = DockerRunner(image=DockerImageConfig(image_ref="worker:test"))
+
+    with pytest.raises(ValidationError, match="mount source"):
+        runner.build_sdk_smoke_argv(sdk_root=tmp_path / "sdk,source=evil")
+
+
+def test_image_inspection_timeout_is_structured() -> None:
+    def timeout(argv: list[str]) -> FakeCompleted:
+        raise subprocess.TimeoutExpired(argv, 12.5)
+
+    runner = DockerRunner(
+        command_executor=timeout,
+        image=DockerImageConfig(image_ref="worker:test"),
+    )
+
+    with pytest.raises(WorkerCommandError, match="timed out") as excinfo:
+        runner.require_image()
+    assert excinfo.value.retryable is True
+    assert excinfo.value.details["timeout_seconds"] == 12.5
 
 
 def test_sdk_smoke_executes_after_availability_and_image_checks(

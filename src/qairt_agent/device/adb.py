@@ -316,7 +316,10 @@ class AdbClient:
         return (getattr(result, "stdout", "") or "").strip()
 
     def shell(self, command: str) -> Any:
-        argv = [*self._config.adb_base_argv(), "shell", *shlex.split(command)]
+        # Pass the command as a single argument so adb delivers it intact to
+        # the device-side /bin/sh.  Splitting with shlex and re-joining via
+        # argv would discard host-side quoting.
+        argv = [*self._config.adb_base_argv(), "shell", command]
         return self._run(argv)
 
     def push(self, local: str, remote: str) -> None:
@@ -326,7 +329,7 @@ class AdbClient:
         self._run([*self._config.adb_base_argv(), "pull", remote, local])
 
     def remote_sha256(self, remote_path: str) -> str:
-        result = self.shell(f"sha256sum {remote_path}")
+        result = self.shell(f"sha256sum {shlex.quote(remote_path)}")
         tokens = (getattr(result, "stdout", "") or "").split()
         if not tokens:
             raise DeviceUnavailableError(
@@ -344,7 +347,13 @@ class AdbClient:
         return digest
 
     def remote_exists(self, remote_path: str) -> bool:
-        result = self._execute([*self._config.adb_base_argv(), "shell", "test", "-e", remote_path])
+        result = self._execute(
+            [
+                *self._config.adb_base_argv(),
+                "shell",
+                f"test -e {shlex.quote(remote_path)}",
+            ]
+        )
         return getattr(result, "returncode", 1) == 0
 
     def remove_exact(self, remote_dir: str) -> None:

@@ -51,3 +51,22 @@ def test_safe_wraps_exceptions_structurally() -> None:
 
     assert _safe(lambda: {"ok": True}) == {"ok": True}
     assert _safe(lambda: 5) == {"ok": True, "data": 5}
+
+
+def test_async_submit_enforces_stage_order_and_from_job_gate() -> None:
+    server = create_server(client=object())
+    submit = next(
+        tool.fn
+        for tool in server._tool_manager.list_tools()
+        if tool.name == "submit_job"
+    )
+
+    unordered = submit({}, stages=["benchmark", "build"])
+    assert unordered["ok"] is False
+    assert unordered["error"]["code"] == "invalid_spec"
+    assert "order" in unordered["error"]["message"]
+
+    continuation = submit({}, stages=["validate"])
+    assert continuation["ok"] is False
+    assert continuation["error"]["code"] == "invalid_spec"
+    assert "from_job" in continuation["error"]["message"]

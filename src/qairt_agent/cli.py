@@ -72,6 +72,58 @@ _PICKLE_WORKER_SOURCE_ROOT = "/qairt-agent-input"
 _PICKLE_WORKER_OUTPUT = "/qairt-agent-output"
 
 
+def _inside_worker_container() -> bool:
+    """Return True only when we can prove we are inside the pinned worker.
+
+    Checks for the SDK mount point and the injected agent source archive.
+    These paths are created by the container runtime and do not exist on a
+    normal host, so their presence is strong evidence of container execution.
+    """
+
+    return (
+        Path("/opt/qairt").is_dir()
+        and Path("/opt/qairt-agent/qairt-agent-src.zip").is_file()
+    )
+
+
+def _pickle_import_local_active() -> bool:
+    """Return True only when the in-container local-import marker is valid.
+
+    The marker env var is set by the container dispatch to prevent recursive
+    re-dispatch.  On a host shell it must be ignored so torch archives cannot
+    bypass the pinned Ubuntu worker.
+    """
+
+    if os.environ.get(_PICKLE_IMPORT_LOCAL_ENV) != "1":
+        return False
+    if not _inside_worker_container():
+        import sys as _sys
+
+        print(
+            f"warning: {_PICKLE_IMPORT_LOCAL_ENV}=1 is only honored inside the "
+            f"worker container; ignoring on host",
+            file=_sys.stderr,
+        )
+        return False
+    return True
+
+
+def _pickle_provenance_env() -> tuple[str | None, str | None]:
+    """Return (source_path, source_sha256) only when inside the worker.
+
+    These env vars are injected by the container dispatch to record the
+    original host path and hash.  On a host shell they must be ignored to
+    prevent forging source provenance in the manifest.
+    """
+
+    if not _inside_worker_container():
+        return None, None
+    return (
+        os.environ.get(_PICKLE_SOURCE_PATH_ENV),
+        os.environ.get(_PICKLE_SOURCE_SHA256_ENV),
+    )
+
+
 def _verified_pickle_sha256(
     path: Path,
     *,
@@ -729,7 +781,9 @@ def _run_stage_command(
     pid = spawner(handle.job_id, client.jobs_root)
     _emit(out, {**handle.submission(), "worker_pid": pid})
     if args.follow:
-        _follow(client, handle.job_id, out)
+        final = _follow(client, handle.job_id, out)
+        state = final.get("state", "")
+        return 0 if state == "succeeded" else 1
     return 0
 
 
@@ -753,7 +807,9 @@ def _run_rerun(args: argparse.Namespace, client: QairtAgentClient, out: TextIO, 
     pid = spawner(handle.job_id, client.jobs_root)
     _emit(out, {**handle.submission(), "worker_pid": pid})
     if args.follow:
-        _follow(client, handle.job_id, out)
+        final = _follow(client, handle.job_id, out)
+        state = final.get("state", "")
+        return 0 if state == "succeeded" else 1
     return 0
 
 
@@ -903,7 +959,7 @@ def _cmd_vectors(args: argparse.Namespace, client: QairtAgentClient, out: TextIO
 
     if (
         args.trusted_local
-        and os.environ.get(_PICKLE_IMPORT_LOCAL_ENV) != "1"
+        and not _pickle_import_local_active()
         and detect_pickle_source_format(
             args.pickle_path,
             source_format=args.source_format,
@@ -925,12 +981,10 @@ def _cmd_vectors(args: argparse.Namespace, client: QairtAgentClient, out: TextIO
         source_format=args.source_format,
         section=args.section,
         source_key=(
-            os.environ.get(_PICKLE_SOURCE_PATH_ENV)
+            _pickle_provenance_env()[0]
             or str(Path(args.pickle_path).expanduser().resolve())
         ),
-        expected_source_sha256=os.environ.get(
-            _PICKLE_SOURCE_SHA256_ENV
-        ),
+        expected_source_sha256=_pickle_provenance_env()[1],
     )
     _emit(
         out,
@@ -1369,6 +1423,21 @@ def main(
         return handler(args, client, out, spawner)
     except QairtAgentError as exc:
         _emit(out, {"ok": False, "error": exc.to_tool_error().as_dict()})
+        return 1
+    except json.JSONDecodeError as exc:
+        wrapped = InvalidSpecError(
+            "invalid JSON input",
+            stage="input",
+            details={
+                "line": exc.lineno,
+                "column": exc.colno,
+                "reason": exc.msg,
+            },
+        )
+        _emit(
+            out,
+            {"ok": False, "error": wrapped.to_tool_error().as_dict()},
+        )
         return 1
 
 

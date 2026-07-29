@@ -199,6 +199,12 @@ class AppleContainerUnavailableError(QairtAgentError):
     code = ErrorCode.APPLE_CONTAINER_UNAVAILABLE
 
 
+class WorkerCommandError(QairtAgentError):
+    """A container backend ran successfully but its workload failed."""
+
+    code = ErrorCode.STAGE_FAILED
+
+
 class DeviceUnavailableError(QairtAgentError):
     code = ErrorCode.DEVICE_UNAVAILABLE
 
@@ -247,5 +253,6 @@ __all__ = [
     "QairtAgentError",
     "ToolError",
     "ToolErrorData",
+    "WorkerCommandError",
     "UnsupportedSdkCapabilityError",
 ]

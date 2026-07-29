@@ -87,6 +87,7 @@ class OnnxInspector:
 
     def __init__(self, module_loader: Callable[[str], Any] | None = None) -> None:
         self._module_loader = module_loader or importlib.import_module
+        self._inspect_cache: dict[tuple[Any, ...], OnnxModelInfo] = {}
 
     def _tensor_infos(self, onnx_module: Any, values: Iterable[Any]) -> tuple[TensorInfo, ...]:
         return tuple(
@@ -186,8 +187,38 @@ class OnnxInspector:
 
     def inspect(self, model_path: str | Path) -> OnnxModelInfo:
         onnx_module = self._module_loader("onnx")
-        path = Path(model_path)
+        path = Path(model_path).expanduser().resolve()
         model = onnx_module.load(str(path), load_external_data=False)
+        external_paths: set[Path] = set()
+        for tensor in model.graph.initializer:
+            metadata = {
+                str(item.key): str(item.value)
+                for item in getattr(tensor, "external_data", ())
+            }
+            location = metadata.get("location")
+            if location:
+                external = Path(location)
+                if not external.is_absolute():
+                    external = path.parent / external
+                external_paths.add(external.resolve())
+
+        def fingerprint(candidate: Path) -> tuple[str, int | None, int | None]:
+            try:
+                stat = candidate.stat()
+            except OSError:
+                return str(candidate), None, None
+            return str(candidate), stat.st_size, stat.st_mtime_ns
+
+        cache_key: tuple[Any, ...] = (
+            fingerprint(path),
+            tuple(
+                fingerprint(candidate)
+                for candidate in sorted(external_paths)
+            ),
+        )
+        cached = self._inspect_cache.get(cache_key)
+        if cached is not None:
+            return cached
         graph = model.graph
         initializers = tuple(str(item.name) for item in graph.initializer)
         initializer_set = set(initializers)
@@ -209,7 +240,7 @@ class OnnxInspector:
             str(item.key): str(item.value)
             for item in getattr(model, "metadata_props", ())
         }
-        return OnnxModelInfo(
+        result = OnnxModelInfo(
             path=path,
             graph_name=str(graph.name),
             inputs=self._tensor_infos(onnx_module, graph_inputs),
@@ -222,3 +253,5 @@ class OnnxInspector:
             ),
             metadata=metadata,
         )
+        self._inspect_cache[cache_key] = result
+        return result

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -55,6 +56,25 @@ def test_artifact_ref_hashes_file_and_detects_tampering(tmp_path) -> None:
     assert len(ref.sha256) == 64
 
     artifact_path.write_bytes(b"tampered")
+    with pytest.raises(ArtifactIntegrityError, match="integrity"):
+        verify_artifact(ref)
+
+
+def test_verify_artifact_bypasses_metadata_keyed_hash_cache(tmp_path) -> None:
+    artifact_path = tmp_path / "model.bin"
+    artifact_path.write_bytes(b"original")
+    ref = ArtifactRef.from_path(artifact_path)
+    stat = artifact_path.stat()
+
+    # Warm the performance cache, then replace the bytes while deliberately
+    # preserving every cache-key field (resolved path, size, and mtime).
+    artifacts_module.sha256_file(artifact_path)
+    artifact_path.write_bytes(b"tampered")
+    os.utime(
+        artifact_path,
+        ns=(stat.st_atime_ns, stat.st_mtime_ns),
+    )
+
     with pytest.raises(ArtifactIntegrityError, match="integrity"):
         verify_artifact(ref)
 

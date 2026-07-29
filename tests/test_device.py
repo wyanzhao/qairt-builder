@@ -146,7 +146,7 @@ def test_push_pull_shell_build_correct_argv() -> None:
     assert executor.calls[-1] == [*BASE, "pull", "/remote/a.bin", "/local/a.bin"]
 
     client.shell("ls -la /data")
-    assert executor.calls[-1] == [*BASE, "shell", "ls", "-la", "/data"]
+    assert executor.calls[-1] == [*BASE, "shell", "ls -la /data"]
 
 
 def test_devices_runs_without_serial_and_parses() -> None:
@@ -162,7 +162,31 @@ def test_remote_sha256_parses_digest() -> None:
     executor = FakeExecutor(handler=lambda argv: FakeCompleted(stdout=f"{digest}  /remote/x\n"))
     client = AdbClient(CONFIG, command_executor=executor)
     assert client.remote_sha256("/remote/x") == digest
-    assert executor.calls[-1] == [*BASE, "shell", "sha256sum", "/remote/x"]
+    assert executor.calls[-1] == [*BASE, "shell", "sha256sum /remote/x"]
+
+
+def test_remote_helpers_quote_exported_api_paths() -> None:
+    digest = "b" * 64
+    executor = FakeExecutor(
+        handler=lambda argv: FakeCompleted(
+            stdout=f"{digest}  /remote/unsafe path;reboot\n"
+        )
+    )
+    client = AdbClient(CONFIG, command_executor=executor)
+    unsafe = "/remote/unsafe path;reboot"
+
+    assert client.remote_sha256(unsafe) == digest
+    assert executor.calls[-1] == [
+        *BASE,
+        "shell",
+        "sha256sum '/remote/unsafe path;reboot'",
+    ]
+    assert client.remote_exists(unsafe) is True
+    assert executor.calls[-1] == [
+        *BASE,
+        "shell",
+        "test -e '/remote/unsafe path;reboot'",
+    ]
 
 
 def test_nonzero_return_raises_device_unavailable() -> None:
@@ -181,7 +205,7 @@ def test_remote_exists_uses_returncode_without_raising() -> None:
     executor = FakeExecutor(handler=lambda argv: FakeCompleted(returncode=1))
     client = AdbClient(CONFIG, command_executor=executor)
     assert client.remote_exists("/remote/missing") is False
-    assert executor.calls[-1] == [*BASE, "shell", "test", "-e", "/remote/missing"]
+    assert executor.calls[-1] == [*BASE, "shell", "test -e /remote/missing"]
 
 
 # --------------------------------------------------------------------------- #
@@ -282,7 +306,7 @@ def test_stage_attempt_pushes_verifies_marks_ready_and_cleans_up(tmp_path) -> No
     digest = _sha(b"weights")
 
     def handler(argv):
-        if "sha256sum" in argv:
+        if any("sha256sum" in str(a) for a in argv):
             return FakeCompleted(stdout=f"{digest}  /remote\n")
         return FakeCompleted()
 
@@ -294,8 +318,8 @@ def test_stage_attempt_pushes_verifies_marks_ready_and_cleans_up(tmp_path) -> No
         incoming = ATTEMPT_DIR + "incoming"
         # pushed to incoming/, verified, then incoming moved to ready
         assert [*BASE, "push", str(local), f"{incoming}/model.bin"] in executor.calls
-        assert [*BASE, "shell", "mkdir", "-p", incoming] in executor.calls
-        assert [*BASE, "shell", "mv", incoming, ATTEMPT_DIR + "ready"] in executor.calls
+        assert [*BASE, "shell", f"mkdir -p {incoming}"] in executor.calls
+        assert [*BASE, "shell", f"mv {incoming} {ATTEMPT_DIR}ready"] in executor.calls
 
     # cleanup is the final action: rm -rf the exact attempt dir
     assert executor.calls[-1] == [*BASE, "shell", "rm", "-rf", ATTEMPT_DIR]
@@ -307,7 +331,7 @@ def test_stage_attempt_cleans_up_when_body_raises(tmp_path) -> None:
     digest = _sha(b"weights")
 
     def handler(argv):
-        if "sha256sum" in argv:
+        if any("sha256sum" in str(a) for a in argv):
             return FakeCompleted(stdout=f"{digest}  /remote\n")
         return FakeCompleted()
 
@@ -327,7 +351,7 @@ def test_stage_attempt_sha_mismatch_fails_and_cleans_up(tmp_path) -> None:
 
     executor = FakeExecutor(
         handler=lambda argv: FakeCompleted(stdout=f"{'b' * 64}  /remote\n")
-        if "sha256sum" in argv
+        if any("sha256sum" in str(a) for a in argv)
         else FakeCompleted()
     )
     client = AdbClient(CONFIG, command_executor=executor)
@@ -831,6 +855,50 @@ def test_device_gc_skips_live_leases(tmp_path) -> None:
     assert len(list(tmp_path.glob("*.json"))) == 1
 
 
+def test_device_gc_treats_cross_user_permission_error_as_alive(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    lease = _write_lease(
+        tmp_path,
+        CONFIG.serial,
+        server=CONFIG.server,
+        pid=4242,
+        owner="other-user-job",
+        attempt_dirs=[ATTEMPT_DIR],
+    )
+    token = "c" * 32
+    heartbeat = tmp_path / f".{lease.path.stem}.{token}.heartbeat"
+    heartbeat.write_text("old\n", encoding="utf-8")
+    payload = json.loads(lease.path.read_text(encoding="utf-8"))
+    payload.update(
+        {
+            "owner_token": token,
+            "heartbeat_mode": "process-sidecar-v1",
+            "heartbeat_file": heartbeat.name,
+        }
+    )
+    lease.path.write_text(json.dumps(payload), encoding="utf-8")
+    old = time.time() - 100.0
+    os.utime(heartbeat, (old, old))
+
+    def permission_denied(_pid: int, _signal: int) -> None:
+        raise PermissionError("owned by another uid")
+
+    monkeypatch.setattr("qairt_agent.device.lease.os.kill", permission_denied)
+    executor = FakeExecutor()
+    report = device_gc(
+        tmp_path,
+        client=AdbClient(CONFIG, command_executor=executor),
+        stale_after=30.0,
+    )
+
+    assert report["cleaned"] == []
+    assert report["skipped"][0]["reason"] == "owner_process_alive"
+    assert lease.path.exists()
+    assert executor.calls == []
+
+
 def test_device_gc_skips_stale_lease_for_another_device(tmp_path) -> None:
     foreign = _write_lease(
         tmp_path,
@@ -919,7 +987,7 @@ def test_device_gc_reclaims_json_schema_invalid_owner_locally(
     report = device_gc(
         tmp_path,
         client=AdbClient(CONFIG, command_executor=executor),
-        alive=lambda _pid: True,
+        alive=lambda _pid: False,
         invalid_grace_after=30.0,
     )
     assert report["cleaned"][0]["stale_reason"] == "invalid_owner_record"
@@ -1086,7 +1154,7 @@ def test_device_runtime_stages_records_device_and_cleans(tmp_path) -> None:
     digest = _sha(b"context")
 
     def handler(argv):
-        if "sha256sum" in argv:
+        if any("sha256sum" in str(a) for a in argv):
             return FakeCompleted(stdout=f"{digest}  /remote/context.bin\n")
         return FakeCompleted()
 
@@ -1137,7 +1205,7 @@ def test_device_runtime_cleanup_failure_retains_gc_pointer(tmp_path) -> None:
     digest = _sha(b"context")
 
     def handler(argv):
-        if "sha256sum" in argv:
+        if any("sha256sum" in str(a) for a in argv):
             return FakeCompleted(stdout=f"{digest}  /remote/context.bin\n")
         if "rm" in argv:
             return FakeCompleted(returncode=1, stderr="cleanup failed")
@@ -1167,6 +1235,40 @@ def test_device_runtime_cleanup_failure_retains_gc_pointer(tmp_path) -> None:
     assert json.loads(owner_path.read_text())["attempt_dirs"] == [
         "/data/local/tmp/qairt-agent/job1/stage-key/attempt-001/"
     ]
+
+
+def test_device_cleanup_failure_preserves_stage_exception_as_cause(
+    tmp_path,
+) -> None:
+    def handler(argv):
+        if "rm" in argv:
+            return FakeCompleted(returncode=1, stderr="cleanup failed")
+        return FakeCompleted()
+
+    runtime = DeviceRuntime(
+        config_factory=lambda: CONFIG,
+        adb_client_factory=lambda config: AdbClient(
+            config,
+            command_executor=FakeExecutor(handler=handler),
+        ),
+        leases_dir=tmp_path / "leases",
+    )
+    with pytest.raises(
+        DeviceUnavailableError,
+        match="cleanup failed after the stage operation failed",
+    ) as caught:
+        with runtime.stage(
+            FakeDeviceAdapter(),
+            output_root=tmp_path / "artifacts",
+            job_id="job1",
+            stage_key="stage-key",
+            attempt_id="attempt-001",
+            push_files={},
+        ):
+            raise RuntimeError("original stage failure")
+
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert str(caught.value.__cause__) == "original stage failure"
 
 
 def test_device_runtime_releases_empty_lease_when_record_fails(tmp_path) -> None:
@@ -1220,7 +1322,7 @@ def _doctor_handler(devices_stdout, *, state="device", state_rc=0, df_stdout=DF_
             return FakeCompleted(stdout=devices_stdout)
         if "get-state" in argv:
             return FakeCompleted(returncode=state_rc, stdout=state, stderr="state-err")
-        if "df" in argv:
+        if any(str(a).startswith("df ") for a in argv):
             return FakeCompleted(stdout=df_stdout)
         return FakeCompleted()
 

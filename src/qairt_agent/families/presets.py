@@ -19,6 +19,7 @@ from qairt_agent.contracts import (
     ModelFamily,
     OutputLayoutSpec,
     QuantizationMode,
+    validate_attached_models_by_ar,
 )
 from qairt_agent.contracts import (
     ComponentKind,
@@ -333,33 +334,22 @@ def resolve_workflow(spec: WorkflowSpec) -> ResolvedWorkflow:
             )
         if preset.requires_per_ar_onnx:
             attached = spec.metadata.get("attached_models_by_ar")
-            provided = set()
-            if isinstance(attached, dict):
-                provided = {str(key) for key in attached}
-            missing = [str(ar) for ar in ars if str(ar) not in provided]
-            if missing:
-                raise InvalidSpecError(
-                    f"{preset.preset_id} requires an independent ONNX+encodings pair for every AR "
-                    "via metadata.attached_models_by_ar",
-                    stage="preset",
-                    details={"preset_id": preset.preset_id, "missing_ars": missing},
+            try:
+                validate_attached_models_by_ar(
+                    attached,
+                    tuple(ars),
+                    require_all=True,
+                    require_encodings=True,
                 )
-            missing_encodings = [
-                str(ar)
-                for ar in ars
-                if not isinstance(attached, dict)
-                or not isinstance(attached.get(str(ar), attached.get(ar)), dict)
-                or attached.get(str(ar), attached.get(ar)).get("encodings_path") is None
-            ]
-            if missing_encodings:
+            except ValueError as exc:
                 raise InvalidSpecError(
-                    f"{preset.preset_id} requires explicit AIMET encodings for every attached AR",
+                    f"{preset.preset_id} requires an independent ONNX+encodings "
+                    f"pair for every AR via metadata.attached_models_by_ar: {exc}",
                     stage="preset",
                     details={
                         "preset_id": preset.preset_id,
-                        "missing_encodings_ars": missing_encodings,
                     },
-                )
+                ) from exc
 
     if preset.preset_id == "qwen3_5_omni" and spec.sources.audio is None:
         raise InvalidSpecError(

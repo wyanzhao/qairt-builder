@@ -13,7 +13,7 @@ The QAIRT adapter is pinned by `harness/constraints.json` to QAIRT
 `2.48.0.260626`, build `260626120635`. Any other version is rejected before a
 transform or build. The same contract owns the worker image, Ubuntu/Python,
 dependency file, and host-runtime CLI versions.
-`SM8850 / HTP v81 / soc_model 660` must resolve explicitly through the SDK.
+`SM8850 / HTP v81 / soc_model 87` must resolve explicitly through the SDK.
 The canonical target fields are `chipset`, `dsp_arch`, and `soc_model`. There is
 no V79 or default-SoC fallback.
 

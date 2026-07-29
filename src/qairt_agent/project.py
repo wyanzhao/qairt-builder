@@ -50,7 +50,7 @@ WORKER_BACKENDS = frozenset({"apple_container", "auto", "docker", "native"})
 
 
 # --------------------------------------------------------------------------- #
-# Minimal TOML subset (flat tables of str/int/bool/array) — no dependency.
+# TOML serialization and standards-compliant parsing.
 # --------------------------------------------------------------------------- #
 
 
@@ -78,43 +78,15 @@ def _load_toml(text: str) -> dict[str, dict[str, Any]]:
     try:
         import tomllib  # type: ignore[import-not-found]
     except ModuleNotFoundError:
-        return _load_toml_minimal(text)
+        try:
+            import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+        except ModuleNotFoundError as exc:
+            raise HarnessConstraintsError(
+                "Python 3.10 requires the declared 'tomli' dependency to "
+                "parse qairt-agent.toml"
+            ) from exc
     parsed = tomllib.loads(text)
     return {section: dict(values) for section, values in parsed.items()}
-
-
-def _load_toml_minimal(text: str) -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
-    current: dict[str, Any] = {}
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            current = {}
-            result[line[1:-1].strip()] = current
-            continue
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        current[key.strip()] = _parse_toml_scalar(value.strip())
-    return result
-
-
-def _parse_toml_scalar(token: str) -> Any:
-    if token.startswith("[") and token.endswith("]"):
-        inner = token[1:-1].strip()
-        if not inner:
-            return []
-        return [_parse_toml_scalar(part.strip()) for part in inner.split(",")]
-    if token in {"true", "false"}:
-        return token == "true"
-    if token.startswith('"') and token.endswith('"'):
-        return token[1:-1].replace('\\"', '"').replace("\\\\", "\\")
-    try:
-        return int(token)
-    except ValueError:
-        return token
 
 
 # --------------------------------------------------------------------------- #
@@ -210,18 +182,6 @@ class ProjectConfig:
                 "soc_model": self.target_soc_model,
             },
         }
-        constraints = self.harness
-        docker_overrides: dict[str, Any] = {}
-        if self.docker_image != constraints.worker_image:
-            docker_overrides["image"] = self.docker_image
-        if self.docker_platform != constraints.platform:
-            docker_overrides["platform"] = self.docker_platform
-        if self.dockerfile != constraints.dockerfile:
-            docker_overrides["dockerfile"] = self.dockerfile
-        if docker_overrides:
-            # Legacy table name retained for backwards compatibility.  New
-            # projects keep all default pins solely in harness constraints.
-            sections["docker"] = docker_overrides
         return _dump_toml(sections)
 
     @classmethod
@@ -250,6 +210,22 @@ class ProjectConfig:
                 f"{harness_logical!r}"
             )
         constraints = load_harness_constraints(harness_path)
+        expected_docker = {
+            "image": constraints.worker_image,
+            "platform": constraints.platform,
+            "dockerfile": constraints.dockerfile,
+        }
+        mismatched_docker = {
+            key: {"configured": docker[key], "expected": expected}
+            for key, expected in expected_docker.items()
+            if key in docker and str(docker[key]) != str(expected)
+        }
+        if mismatched_docker:
+            raise HarnessConstraintsError(
+                "[docker] may not override harness worker pins; update "
+                "harness/constraints.json instead. Mismatches: "
+                f"{mismatched_docker}"
+            )
         return cls(
             project_root=project_root,
             harness_constraints=harness_logical,
@@ -259,9 +235,9 @@ class ProjectConfig:
             state_dir=str(state.get("state_dir", ".qairt-agent/state")),
             artifacts_dir=str(state.get("artifacts_dir", "artifacts")),
             cache_dir=str(state.get("cache_dir", ".qairt-agent/cache")),
-            docker_image=str(docker.get("image", constraints.worker_image)),
-            docker_platform=str(docker.get("platform", constraints.platform)),
-            dockerfile=str(docker.get("dockerfile", constraints.dockerfile)),
+            docker_image=constraints.worker_image,
+            docker_platform=constraints.platform,
+            dockerfile=constraints.dockerfile,
             target_chipset=str(
                 target.get("chipset", constraints.target_chipset)
             ),
@@ -548,16 +524,16 @@ def _probe_docker(
     """Return daemon/image availability without mutating Docker state."""
 
     active = constraints or DEFAULT_CONSTRAINTS
-    runner = DockerRunner(
-        image=WorkerImageConfig(
-            image_ref=image_ref,
-            platform=platform_name,
-            ubuntu_version=active.ubuntu_version,
-            python_version=active.python_version,
-        ),
-        constraints=active,
-    )
     try:
+        runner = DockerRunner(
+            image=WorkerImageConfig(
+                image_ref=image_ref,
+                platform=platform_name,
+                ubuntu_version=active.ubuntu_version,
+                python_version=active.python_version,
+            ),
+            constraints=active,
+        )
         runner.require_available()
     except Exception as exc:  # noqa: BLE001 - doctor reports a check
         return False, False, str(exc)
@@ -577,16 +553,16 @@ def _probe_apple_container(
     """Probe Apple ``container`` without starting services or pulling images."""
 
     active = constraints or DEFAULT_CONSTRAINTS
-    runner = AppleContainerRunner(
-        image=WorkerImageConfig(
-            image_ref=image_ref,
-            platform=platform_name,
-            ubuntu_version=active.ubuntu_version,
-            python_version=active.python_version,
-        ),
-        constraints=active,
-    )
     try:
+        runner = AppleContainerRunner(
+            image=WorkerImageConfig(
+                image_ref=image_ref,
+                platform=platform_name,
+                ubuntu_version=active.ubuntu_version,
+                python_version=active.python_version,
+            ),
+            constraints=active,
+        )
         runner.require_available()
     except Exception as exc:  # noqa: BLE001 - doctor reports a check
         return False, False, str(exc)

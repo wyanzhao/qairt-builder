@@ -259,7 +259,8 @@ class SliceChainRunner:
         if mode not in {"device_chain", "teacher_forced"}:
             raise ValueError("mode must be 'device_chain' or 'teacher_forced'")
 
-        available = self._copy_tensor_map(initial_inputs)
+        initial_external_inputs = self._copy_tensor_map(initial_inputs)
+        available = dict(initial_external_inputs)
         teacher_by_slice = {
             str(slice_id): self._copy_tensor_map(tensors)
             for slice_id, tensors in (teacher_inputs or {}).items()
@@ -304,11 +305,17 @@ class SliceChainRunner:
                         ) from error
                     continue
 
+                source = (
+                    initial_external_inputs
+                    if mode == "teacher_forced"
+                    else available
+                )
                 try:
-                    slice_inputs[input_name] = available[input_name]
+                    slice_inputs[input_name] = source[input_name]
                 except KeyError as error:
                     raise ChainExecutionError(
-                        f"Slice {route.slice_id!r} requires missing external input {input_name!r}"
+                        f"Slice {route.slice_id!r} requires missing external "
+                        f"input {input_name!r}"
                     ) from error
 
             graph_name = route.graph_for_ar(ar)

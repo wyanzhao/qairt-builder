@@ -26,7 +26,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             _write_heartbeat(path, owner_token)
         except OSError:
-            return 1
+            # A lease heartbeat is a safety mechanism.  A transient filesystem
+            # error must not permanently disable it while the owner is alive.
+            time.sleep(min(interval, 1.0))
+            continue
         time.sleep(interval)
     return 0
 

@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from qairt_agent.runtime.state import state_slot
+
 RUNTIME_INDEX_SCHEMA = "qairt-agent.runtime-index.v1"
 SLICE_ROUTES_SCHEMA = "qairt-agent.slice-routes"
 
@@ -46,40 +48,6 @@ def _execution_contract(*, lane: str, family: str) -> dict[str, Any]:
         ],
         "boundary_binding": "not_applicable",
     }
-
-
-def _state_slot(tensor_name: str) -> str | None:
-    lowered = tensor_name.lower()
-    if not any(
-        token in lowered
-        for token in (
-            "past_key",
-            "past_value",
-            "present_key",
-            "present_value",
-            "key_cache",
-            "value_cache",
-            "kv_cache",
-            "recurrent_state",
-            "conv_state",
-        )
-    ):
-        return None
-    normalized = lowered
-    for old, new in (
-        ("present_key", "key"),
-        ("past_key", "key"),
-        ("present_value", "value"),
-        ("past_value", "value"),
-        ("_input", ""),
-        ("_output", ""),
-        ("_in", ""),
-        ("_out", ""),
-    ):
-        normalized = normalized.replace(old, new)
-    import re
-
-    return re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
 
 
 def _path(value: Any) -> str | None:
@@ -235,12 +203,12 @@ def make_runtime_index(
         state_inputs = {
             name: slot
             for name in input_names
-            if (slot := _state_slot(name)) is not None
+            if (slot := state_slot(name)) is not None
         }
         state_outputs = {
             name: slot
             for name in output_names
-            if (slot := _state_slot(name)) is not None
+            if (slot := state_slot(name)) is not None
         }
         from_previous = {
             name: name
@@ -396,7 +364,15 @@ def select_runtime_binding(
             )
     vectors = dict(index.get("vectors") or {})
     exact_vectors = dict(vectors.get("validation_manifests_by_ar") or {})
-    vector_manifest = exact_vectors.get(ar_key) or vectors.get("validation_manifest")
+    if exact_vectors:
+        if ar_key not in exact_vectors:
+            raise ValueError(
+                "runtime index has per-AR validation manifests but no exact "
+                f"entry for AR{selected_ar}"
+            )
+        vector_manifest = exact_vectors[ar_key]
+    else:
+        vector_manifest = vectors.get("validation_manifest")
 
     binding: dict[str, Any] = {
         "lane": index["lane"],
@@ -542,6 +518,10 @@ def select_runtime_binding(
         (slice_name, value)
         for slice_name, value in contexts.items()
         if ar_key in dict(value.get("graphs_by_ar") or {})
+        and (
+            requested_component != "text"
+            or value.get("component") == "text"
+        )
     ]
     if len(candidates) != 1:
         raise ValueError(
@@ -555,6 +535,15 @@ def select_runtime_binding(
             "context_path": context["context_path"],
             "graph_name": context["graphs_by_ar"][ar_key],
             "slice_id": slice_name,
+            **(
+                {
+                    "component": "text",
+                    "coverage": "text_only",
+                    "excluded_components": ["vision"],
+                }
+                if requested_component == "text"
+                else {}
+            ),
         }
     )
     return binding

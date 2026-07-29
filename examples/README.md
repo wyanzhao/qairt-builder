@@ -20,6 +20,14 @@ them point at mounted files in your project.
 | `qwen3_5.json` | GenAI Builder | independent AR1/AR128 ONNX+encodings and validation manifest per AR | `/artifacts/qwen3.5` |
 | `qwen3_5_omni_thinker.json` | GenAI Builder text lane | independent Thinker AR1/AR128 ONNX+encodings and validation manifest per AR | `/artifacts/qwen3.5-omni-thinker` |
 | `qwen3_5_omni.json` | GenAI Builder packaging | Thinker AR1/AR128 plus audio ONNX+encodings; validation manifest per text AR | `/artifacts/qwen3.5-omni` |
+| `qwen3_4b_2layer_genai.json` | GenAI Builder (debug) | 2-layer Qwen3-4B sliced ONNX+encodings per AR | `/artifacts/qwen3-4b-2layer-genai` |
+| `qwen3_4b_2layer_lowlevel.json` | low-level Python API (debug) | 2-layer Qwen3-4B sliced ONNX+encodings, vectors | `/artifacts/qwen3-4b-2layer-lowlevel` |
+
+⚠️ `qwen3_4b_2layer_*.json` are **debug/slicing-test templates**. The GenAI
+example deliberately applies the `qwen3_5` preset to a Qwen3-4B model; the
+low-level example uses the route-correct `qwen3_dense` preset. They exist for
+validating the ONNX slicing pipeline and do not represent supported production
+configurations.
 
 `qwen3_5_omni.json` is build/package-only on the pinned SDK because its preset
 sets `runtime_supported=false`; do not run the default validate/benchmark

@@ -16,4 +16,4 @@ cache_dir = ".qairt-agent/cache"
 [target]
 chipset = "SM8850"
 dsp_arch = "v81"
-soc_model = 660
+soc_model = 87

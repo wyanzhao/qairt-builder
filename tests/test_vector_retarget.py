@@ -6,11 +6,13 @@ from typing import Sequence
 import numpy as np
 import onnx
 import pytest
-from onnx import TensorProto, helper
+from onnx import TensorProto, helper, numpy_helper
 
 from qairt_agent.vector_retarget import (
+    GoldenAbiMismatchError,
     VectorRetargetError,
     inspect_onnx_abi,
+    onnx_bundle_sha256,
     retarget_vector_manifest,
     validate_provided_ar_manifest,
 )
@@ -400,7 +402,10 @@ def test_inspect_onnx_abi_excludes_initializer_inputs(tmp_path: Path) -> None:
     x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1])
     weight_input = helper.make_tensor_value_info("weight", TensorProto.FLOAT, [1])
     y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])
-    weight = helper.make_tensor("weight", TensorProto.FLOAT, [1], [2.0])
+    weight = numpy_helper.from_array(
+        np.array([2.0], dtype=np.float32),
+        name="weight",
+    )
     graph = helper.make_graph(
         [helper.make_node("Add", ["x", "weight"], ["y"])],
         "initializer-input",
@@ -416,3 +421,58 @@ def test_inspect_onnx_abi_excludes_initializer_inputs(tmp_path: Path) -> None:
     inputs, outputs = inspect_onnx_abi(path)
     assert [item.name for item in inputs] == ["x"]
     assert [item.name for item in outputs] == ["y"]
+
+
+def test_supplied_golden_abi_mismatch_fails_closed(tmp_path: Path) -> None:
+    target = _identity_model(
+        tmp_path / "target.onnx",
+        (("input_ids", TensorProto.INT64, (1, 1)),),
+    )
+    provided = VectorPreparer(tmp_path / "provided").prepare_case(
+        "wrong-golden",
+        {"input_ids": np.array([[7]], dtype=np.int64)},
+        goldens={"input_ids_out": np.array([[7.0]], dtype=np.float32)},
+    )
+
+    with pytest.raises(GoldenAbiMismatchError, match="dtype mismatch"):
+        validate_provided_ar_manifest(
+            provided,
+            target,
+            family="qwen3.5",
+            ar=1,
+            cl=4096,
+        )
+
+
+def test_onnx_bundle_hash_includes_external_weight_bytes(
+    tmp_path: Path,
+) -> None:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])
+    weight = numpy_helper.from_array(
+        np.array([2.0], dtype=np.float32),
+        name="weight",
+    )
+    graph = helper.make_graph(
+        [helper.make_node("Add", ["x", "weight"], ["y"])],
+        "external-weight",
+        [x],
+        [y],
+        [weight],
+    )
+    model = helper.make_model(graph)
+    path = tmp_path / "external.onnx"
+    onnx.save_model(
+        model,
+        path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location="external.onnx.data",
+        size_threshold=0,
+    )
+    data_path = tmp_path / "external.onnx.data"
+    before = onnx_bundle_sha256(path)
+    payload = data_path.read_bytes()
+    data_path.write_bytes(bytes([payload[0] ^ 0xFF]) + payload[1:])
+
+    assert onnx_bundle_sha256(path) != before

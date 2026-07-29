@@ -14,6 +14,8 @@ from qairt_agent.cli import (
     _default_client,
     _apple_container_adb_server,
     _docker_adb_server,
+    _pickle_import_local_active,
+    _pickle_provenance_env,
     _spawn_worker,
     main,
 )
@@ -172,6 +174,24 @@ def test_invalid_harness_is_one_structured_cli_error(tmp_path) -> None:
     assert lines[0]["ok"] is False
     assert lines[0]["error"]["code"] == "invalid_spec"
     assert lines[0]["error"]["stage"] == "harness"
+
+
+def test_invalid_spec_json_is_one_structured_cli_error(tmp_path) -> None:
+    client, _ = make_client(tmp_path)
+    spec_path = tmp_path / "invalid.json"
+    spec_path.write_text("{not-json", encoding="utf-8")
+
+    code, lines = run(
+        ["workflow", "--spec", str(spec_path), "--inline"],
+        client,
+    )
+
+    assert code == 1
+    assert len(lines) == 1
+    assert lines[0]["ok"] is False
+    assert lines[0]["error"]["code"] == "invalid_spec"
+    assert lines[0]["error"]["stage"] == "spec"
+    assert lines[0]["error"]["details"]["line"] == 1
 
 
 def test_image_build_requires_mounted_sdk_api_smoke(tmp_path, monkeypatch) -> None:
@@ -720,6 +740,20 @@ def test_container_environment_populates_stage_provenance(tmp_path, monkeypatch)
     assert provenance.host_arch == "arm64"
     assert provenance.emulation is True
     assert provenance.resolved_preset_sha256 == "d" * 64
+
+
+def test_host_cannot_activate_pickle_worker_markers(
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr("qairt_agent.cli._inside_worker_container", lambda: False)
+    monkeypatch.setenv("QAIRT_AGENT_PICKLE_IMPORT_LOCAL", "1")
+    monkeypatch.setenv("QAIRT_AGENT_PICKLE_SOURCE_PATH", "/forged/archive.pt")
+    monkeypatch.setenv("QAIRT_AGENT_PICKLE_SOURCE_SHA256", "f" * 64)
+
+    assert _pickle_import_local_active() is False
+    assert _pickle_provenance_env() == (None, None)
+    assert "only honored inside the worker container" in capsys.readouterr().err
 
 
 def test_native_spawner_injects_device_provenance_without_image(

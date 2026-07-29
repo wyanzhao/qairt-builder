@@ -133,6 +133,7 @@ def test_import_vectors_writes_raw_and_builds_bundle(tmp_path: Path) -> None:
     assert hashlib.sha256(expected_logits).hexdigest() == by_name["logits"].sha256
     assert len(expected_logits) == by_name["logits"].nbytes
     assert by_name["logits"].path == logits_file.resolve()
+    assert not tuple(out_dir.rglob("*.tmp"))
 
 
 def test_import_artifacts_writes_consumable_sectioned_manifest(
@@ -524,6 +525,28 @@ def test_isolate_matches_in_process() -> None:
     _assert_trees_equal(in_process, isolated)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        np.complex64(1.5 + 2.25j),
+        np.longdouble("1.234567890123456789"),
+        np.bytes_(b"binary-value"),
+    ],
+    ids=["complex64", "longdouble", "bytes"],
+)
+def test_isolate_round_trips_numpy_scalars(value: np.generic) -> None:
+    isolated = safe_load_pickle(
+        pickle.dumps({"value": value}),
+        isolate=True,
+        timeout=60.0,
+    )
+
+    result = isolated["value"]
+    assert isinstance(result, np.generic)
+    assert result.dtype == value.dtype
+    assert result.tobytes() == value.tobytes()
+
+
 def test_isolate_rejects_malicious_input() -> None:
     pytest.importorskip("resource")
 
@@ -533,3 +556,58 @@ def test_isolate_rejects_malicious_input() -> None:
 
     with pytest.raises(PickleRejectedError):
         safe_load_pickle(pickle.dumps(Evil()), isolate=True, timeout=60.0)
+
+
+def test_dotted_global_is_rejected(tmp_path: Path) -> None:
+    """STACK_GLOBAL with a dotted name must be rejected and produce no file write.
+
+    Constructs a protocol-4 pickle that attempts to resolve
+    ``numpy.dtypes.__loader__.set_data`` (a bound SourceFileLoader method that
+    is an arbitrary-file-write primitive).  The restricted unpickler must reject
+    this before any callable is returned.
+    """
+
+    sentinel = tmp_path / "pwned.txt"
+    # Protocol 4: SHORT_BINUNICODE pushes module, then name; STACK_GLOBAL resolves.
+    payload = (
+        b"\x80\x04"  # PROTO 4
+        b"\x8c\x0c" b"numpy.dtypes"  # SHORT_BINUNICODE "numpy.dtypes"
+        b"\x8c\x13" b"__loader__.set_data"  # SHORT_BINUNICODE dotted path
+        b"\x93"  # STACK_GLOBAL
+        b"."  # STOP
+    )
+    with pytest.raises(PickleRejectedError, match="dotted name"):
+        safe_load_pickle(payload)
+    assert not sentinel.exists()
+
+
+def test_dotted_global_rejected_even_under_allowed_module() -> None:
+    """A dotted name under an allowlisted module prefix is still rejected."""
+
+    unpickler = RestrictedUnpickler(io.BytesIO(b""))
+    with pytest.raises(PickleRejectedError, match="dotted name"):
+        unpickler.find_class("numpy.dtypes", "__loader__.set_data")
+
+
+def test_numpy_dtypes_scalar_classes_still_resolve() -> None:
+    """Explicitly allowlisted numpy.dtypes classes resolve correctly."""
+
+    unpickler = RestrictedUnpickler(io.BytesIO(b""))
+    import numpy.dtypes as dt
+
+    assert unpickler.find_class("numpy.dtypes", "Float32DType") is dt.Float32DType
+    assert unpickler.find_class("numpy.dtypes", "Int64DType") is dt.Int64DType
+
+
+def test_isolation_channel_round_trips_without_pickle() -> None:
+    """The non-pickle isolation channel preserves the full tree structure."""
+
+    from qairt_agent.vectors_pickle import (
+        _deserialize_validated_tree,
+        _serialize_validated_tree,
+    )
+
+    payload = _sample_payload()
+    serialized = _serialize_validated_tree(payload)
+    restored = _deserialize_validated_tree(serialized)
+    _assert_trees_equal(payload, restored)

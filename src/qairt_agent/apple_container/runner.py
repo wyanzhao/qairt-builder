@@ -8,7 +8,6 @@ an image, or changes privileged DNS settings on the user's behalf.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import platform
 import shutil
@@ -16,26 +15,54 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
+from qairt_agent.container_runner import (
+    WorkerRunnerMixin,
+    execute_command,
+    harness_build_args,
+    harness_build_path,
+)
 from qairt_agent.docker.image import (
+    BindMount,
     DEFAULT_IMAGE_REF,
     DEFAULT_PLATFORM,
     RuntimeMounts,
     WORKER_PYTHONPATH,
     WorkerImageConfig,
 )
-from qairt_agent.errors import AppleContainerUnavailableError
+from qairt_agent.errors import (
+    AppleContainerUnavailableError,
+)
 from qairt_agent.harness import (
     DEFAULT_CONSTRAINTS,
-    DEFAULT_CONSTRAINTS_LOGICAL_PATH,
     HarnessConstraints,
     parse_version,
 )
 
 CommandExecutor = Callable[[list[str]], Any]
+_PROBE_TIMEOUT_SECONDS = 10.0
+_COMMAND_TIMEOUT_SECONDS = 7200.0
 
 
 def _default_executor(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, capture_output=True, text=True, check=False)
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_COMMAND_TIMEOUT_SECONDS,
+    )
+
+
+def _default_probe_executor(
+    argv: list[str],
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_PROBE_TIMEOUT_SECONDS,
+    )
 
 
 def _platform_present(document: Any, platform_name: str) -> bool:
@@ -91,8 +118,11 @@ def _has_dns_alias(document: Any, alias: str) -> bool:
     return False
 
 
-class AppleContainerRunner:
+class AppleContainerRunner(WorkerRunnerMixin):
     """Build and dispatch QAIRT workers with Apple ``container`` 1.x."""
+
+    worker_backend_name = "Apple container"
+    worker_run_stage = "apple-container-run"
 
     def __init__(
         self,
@@ -103,6 +133,9 @@ class AppleContainerRunner:
         host_arch: Callable[[], str] = platform.machine,
     ) -> None:
         self._executor: CommandExecutor = command_executor or _default_executor
+        self._probe_executor: CommandExecutor = (
+            command_executor or _default_probe_executor
+        )
         self.image = image
         self.constraints = constraints or DEFAULT_CONSTRAINTS
         self._host_arch = host_arch
@@ -132,7 +165,7 @@ class AppleContainerRunner:
                 },
             )
         try:
-            version_result = self._executor(["container", "--version"])
+            version_result = self._probe_executor(["container", "--version"])
         except Exception as exc:  # noqa: BLE001 - normalized below
             return AppleContainerUnavailableError(
                 "Apple container CLI version probe failed",
@@ -169,7 +202,7 @@ class AppleContainerRunner:
                 },
             )
         try:
-            status = self._executor(
+            status = self._probe_executor(
                 ["container", "system", "status", "--format", "json"]
             )
         except Exception as exc:  # noqa: BLE001 - normalized below
@@ -235,10 +268,13 @@ class AppleContainerRunner:
             raise error
 
     def require_image(self) -> str:
-        """Return a stable hash of the local inspect document."""
+        """Return the content digest exposed by the selected image platform."""
 
-        result = self._executor(
-            ["container", "image", "inspect", self.image_ref]
+        result = execute_command(
+            self._probe_executor,
+            ["container", "image", "inspect", self.image_ref],
+            backend_name="Apple container",
+            stage="apple-container",
         )
         stdout = (getattr(result, "stdout", "") or "").strip()
         if getattr(result, "returncode", 1) != 0 or not stdout:
@@ -270,18 +306,29 @@ class AppleContainerRunner:
                     "platform": self.platform_name,
                 },
             )
-        canonical = json.dumps(
-            document,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return "sha256:" + hashlib.sha256(canonical).hexdigest()
+        image_digest = _find_string_field(document, "digest")
+        if (
+            image_digest is None
+            or not image_digest.startswith("sha256:")
+            or len(image_digest) != len("sha256:") + 64
+        ):
+            raise AppleContainerUnavailableError(
+                "Apple container image inspect did not expose a content "
+                "digest for the selected platform",
+                stage="apple-container",
+                retryable=False,
+                details={"image_ref": self.image_ref},
+            )
+        return image_digest
 
     def require_host_alias(self, alias: str) -> None:
         """Require the privileged localhost DNS bridge used for host ADB."""
 
-        result = self._executor(
-            ["container", "system", "dns", "list", "--format", "json"]
+        result = execute_command(
+            self._probe_executor,
+            ["container", "system", "dns", "list", "--format", "json"],
+            backend_name="Apple container",
+            stage="apple-container-adb",
         )
         stdout = (getattr(result, "stdout", "") or "").strip()
         if getattr(result, "returncode", 1) == 0:
@@ -356,24 +403,12 @@ class AppleContainerRunner:
     def build_image(self, *, context: str | Path, dockerfile: str | Path) -> Any:
         self.require_available()
         context_path = Path(context).expanduser().resolve()
-        constraints_path = self.constraints.source_path.expanduser().resolve()
-        try:
-            harness_build_path = constraints_path.relative_to(
-                context_path
-            ).as_posix()
-        except ValueError:
-            if constraints_path == DEFAULT_CONSTRAINTS.source_path.resolve():
-                harness_build_path = DEFAULT_CONSTRAINTS_LOGICAL_PATH
-            else:
-                raise AppleContainerUnavailableError(
-                    "selected harness constraints must be inside the image "
-                    "build context",
-                    stage="apple-container-build",
-                    details={
-                        "constraints": str(constraints_path),
-                        "context": str(context_path),
-                    },
-                )
+        visible_constraints = harness_build_path(
+            context_path,
+            self.constraints,
+            error_type=AppleContainerUnavailableError,
+            stage="apple-container-build",
+        )
         argv = [
             "container",
             "build",
@@ -385,21 +420,15 @@ class AppleContainerRunner:
             self.image_ref,
             "--progress",
             "plain",
-            "--build-arg",
-            f"UBUNTU_VERSION={self.constraints.ubuntu_version}",
-            "--build-arg",
-            f"PYTHON_VERSION={self.constraints.python_version}",
-            "--build-arg",
-            f"QAIRT_DEPENDENCIES_FILE={self.constraints.dependencies_file}",
-            "--build-arg",
-            f"HARNESS_CONSTRAINTS_FILE={harness_build_path}",
-            "--build-arg",
-            f"TORCH_VERSION={self.constraints.torch_version}",
-            "--build-arg",
-            f"TORCH_INDEX_URL={self.constraints.torch_index_url}",
+            *harness_build_args(self.constraints, visible_constraints),
             str(context_path),
         ]
-        result = self._executor(argv)
+        result = execute_command(
+            self._executor,
+            argv,
+            backend_name="Apple container",
+            stage="apple-container-build",
+        )
         if getattr(result, "returncode", 1) != 0:
             raise AppleContainerUnavailableError(
                 f"failed to build Apple container worker image "
@@ -415,6 +444,11 @@ class AppleContainerRunner:
 
     def build_sdk_smoke_argv(self, *, sdk_root: str | Path) -> list[str]:
         resolved_sdk = Path(sdk_root).expanduser().resolve()
+        sdk_mount = BindMount(
+            source=str(resolved_sdk),
+            target="/opt/qairt",
+            read_only=True,
+        )
         # Smoke only needs the SDK mount; avoid exposing unrelated writable
         # aliases by constructing this short argv directly.
         argv = [
@@ -444,7 +478,10 @@ class AppleContainerRunner:
             "--env",
             "LD_LIBRARY_PATH=/opt/qairt/lib/x86_64-linux-clang",
             "--mount",
-            f"type=bind,source={resolved_sdk},target=/opt/qairt,readonly",
+            (
+                f"type=bind,source={sdk_mount.source},"
+                f"target={sdk_mount.target},readonly"
+            ),
             self.image_ref,
             "/opt/venv/bin/python",
             "-m",
@@ -463,7 +500,12 @@ class AppleContainerRunner:
             )
         self.require_available()
         self.require_image()
-        result = self._executor(self.build_sdk_smoke_argv(sdk_root=resolved_sdk))
+        result = execute_command(
+            self._executor,
+            self.build_sdk_smoke_argv(sdk_root=resolved_sdk),
+            backend_name="Apple container",
+            stage="image-smoke",
+        )
         if getattr(result, "returncode", 1) != 0:
             raise AppleContainerUnavailableError(
                 "Apple container worker image failed the mounted QAIRT Python "
@@ -476,70 +518,5 @@ class AppleContainerRunner:
                 },
             )
         return result
-
-    def run(
-        self,
-        *,
-        mounts: RuntimeMounts,
-        command: list[str],
-        network: bool = True,
-        platform: str | None = None,
-        workdir: str = "/workspace",
-        env: dict[str, str] | None = None,
-        user: str | None = None,
-        memory: str | None = None,
-        cpus: int | None = None,
-    ) -> Any:
-        self.require_available()
-        result = self._executor(
-            self.build_run_argv(
-                mounts=mounts,
-                command=command,
-                network=network,
-                platform=platform,
-                workdir=workdir,
-                env=env,
-                user=user,
-                memory=memory,
-                cpus=cpus,
-            )
-        )
-        if getattr(result, "returncode", 1) != 0:
-            raise AppleContainerUnavailableError(
-                "Apple container worker command failed",
-                stage="apple-container-run",
-                retryable=True,
-                details={
-                    "returncode": getattr(result, "returncode", None),
-                    "stdout": getattr(result, "stdout", "") or "",
-                    "stderr": getattr(result, "stderr", "") or "",
-                },
-            )
-        return result
-
-    def run_build_isolated(
-        self,
-        *,
-        mounts: RuntimeMounts,
-        command: list[str],
-        platform: str | None = None,
-        workdir: str = "/workspace",
-        env: dict[str, str] | None = None,
-        user: str | None = None,
-        memory: str | None = None,
-        cpus: int | None = None,
-    ) -> Any:
-        return self.run(
-            mounts=mounts,
-            command=command,
-            network=False,
-            platform=platform,
-            workdir=workdir,
-            env=env,
-            user=user,
-            memory=memory,
-            cpus=cpus,
-        )
-
 
 __all__ = ["AppleContainerRunner", "CommandExecutor"]

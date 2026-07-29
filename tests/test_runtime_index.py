@@ -115,6 +115,9 @@ def test_low_level_index_selects_exact_ar_chain_binding(tmp_path: Path) -> None:
     assert binding["contexts"]["decoder"] == str(decoder)
     assert binding["routes"][1]["graph_names"]["128"] == "head_ar128"
 
+    with pytest.raises(ValueError, match="no exact entry for AR1"):
+        select_runtime_binding(index, ar=1)
+
 
 def test_genai_index_stays_explicit_about_runtime_support(tmp_path: Path) -> None:
     container = tmp_path / "container"

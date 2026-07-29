@@ -48,7 +48,7 @@ def test_load_round_trips_and_missing_raises(tmp_path) -> None:
     init(tmp_path)
     config = load(tmp_path)
     assert config.docker_platform == "linux/amd64"
-    assert config.target_soc_model == 660
+    assert config.target_soc_model == 87
     assert config.docker_image.startswith("qairt-agent-worker:")
 
     with pytest.raises(ProjectNotInitializedError, match="not initialized"):

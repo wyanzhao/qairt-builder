@@ -57,6 +57,29 @@ def _require_int(section: Mapping[str, Any], key: str, name: str) -> int:
     return value
 
 
+def _worker_memory(worker: Mapping[str, Any]) -> str:
+    value = worker.get("memory", "96G")
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[1-9]\d*(?:\.\d+)?[KMGT]?",
+        value.strip(),
+        re.IGNORECASE,
+    ):
+        raise HarnessConstraintsError(
+            "worker.memory must be a positive Docker memory string such as "
+            "'96G' or '4096M'"
+        )
+    return value.strip().upper()
+
+
+def _worker_cpus(worker: Mapping[str, Any]) -> int:
+    value = worker.get("cpus", 8)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise HarnessConstraintsError(
+            "worker.cpus must be a positive integer"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class HarnessConstraints:
     """Validated compatibility contract shared by every worker backend."""
@@ -157,8 +180,8 @@ class HarnessConstraints:
             target_chipset=_require_string(target, "chipset", "target"),
             target_dsp_arch=_require_string(target, "dsp_arch", "target"),
             target_soc_model=_require_int(target, "soc_model", "target"),
-            worker_memory=str(worker.get("memory", "96G")),
-            worker_cpus=int(worker.get("cpus", 8)),
+            worker_memory=_worker_memory(worker),
+            worker_cpus=_worker_cpus(worker),
         )
         constraints.python_version_tuple
         constraints.platform_arch

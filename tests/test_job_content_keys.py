@@ -396,3 +396,44 @@ def test_build_key_does_not_walk_output_or_sdk_directories(tmp_path: Path) -> No
     generated.write_bytes(b"output-after")
 
     assert worker._stage_key("build", None) == before  # noqa: SLF001
+
+
+def test_relative_input_paths_are_resolved_from_project_not_cwd(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    spec, _ = _make_spec(tmp_path)
+    path_fields = (
+        (spec["sources"]["text"], "onnx_path"),
+        (spec["sources"]["text"], "encodings_path"),
+        (spec["sources"]["text"], "config_path"),
+        (spec["vectors"], "validation_manifest"),
+        (spec["metadata"]["attached_models_by_ar"]["128"], "model_path"),
+        (
+            spec["metadata"]["attached_models_by_ar"]["128"],
+            "encodings_path",
+        ),
+    )
+    for owner, key in path_fields:
+        owner[key] = str(Path(owner[key]).relative_to(tmp_path))
+
+    first_cwd = tmp_path / "cwd-a"
+    second_cwd = tmp_path / "cwd-b"
+    first_cwd.mkdir()
+    second_cwd.mkdir()
+    (first_cwd / "ordinary-label").write_text("one", encoding="utf-8")
+    (second_cwd / "ordinary-label").write_text("two", encoding="utf-8")
+    spec["metadata"]["label"] = "ordinary-label"
+
+    monkeypatch.chdir(first_cwd)
+    first = _worker(tmp_path, spec, "relative-a")._stage_key(  # noqa: SLF001
+        "build",
+        None,
+    )
+    monkeypatch.chdir(second_cwd)
+    second = _worker(tmp_path, spec, "relative-b")._stage_key(  # noqa: SLF001
+        "build",
+        None,
+    )
+
+    assert second == first

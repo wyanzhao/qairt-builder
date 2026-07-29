@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import threading
 
 import pytest
 
@@ -12,6 +13,7 @@ from qairt_agent.contracts import (
 )
 from qairt_agent.errors import JobConflictError, JobNotFoundError
 from qairt_agent.jobs.journal import JobJournal
+import qairt_agent.jobs.journal as journal_module
 from qairt_agent.jobs.keys import compute_stage_key, hash_inputs
 
 
@@ -73,6 +75,22 @@ def test_create_rejects_duplicate(tmp_path) -> None:
 def test_open_missing_raises(tmp_path) -> None:
     with pytest.raises(JobNotFoundError, match="not found"):
         JobJournal.open(tmp_path / "jobs", "nope")
+
+
+def test_open_readonly_does_not_reconcile_or_take_the_write_path(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _make_journal(tmp_path, "job-readonly")
+
+    def fail_if_reconciled(_self) -> None:
+        raise AssertionError("read-only job observation must not reconcile receipts")
+
+    monkeypatch.setattr(JobJournal, "_reconcile_locked", fail_if_reconciled)
+    reopened = JobJournal.open_readonly(tmp_path / "jobs", "job-readonly")
+
+    assert reopened.state().job_id == "job-readonly"
+    assert reopened.events()[-1]["type"] == "job_created"
 
 
 def test_state_transitions_and_event_sequence(tmp_path) -> None:
@@ -150,6 +168,92 @@ def test_recording_same_receipt_is_idempotent(tmp_path) -> None:
     journal.record_receipt(receipt)
     journal.record_receipt(receipt)  # identical -> no conflict, no duplicate stage
     assert len(journal.state().stages) == 1
+
+
+def test_concurrent_state_and_receipt_commits_do_not_lose_stages(
+    tmp_path,
+) -> None:
+    journal = _make_journal(tmp_path)
+    receipts = [
+        _receipt_with_output(
+            tmp_path,
+            f"stage-{index}",
+            f"{index:064x}",
+        )
+        for index in range(8)
+    ]
+    barrier = threading.Barrier(len(receipts) + 1)
+    errors: list[BaseException] = []
+
+    def record(receipt: StageReceipt) -> None:
+        try:
+            barrier.wait()
+            journal.record_receipt(receipt)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=record, args=(receipt,))
+        for receipt in receipts
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    journal.set_state(JobState.RUNNING, current_stage="concurrent")
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert {
+        (receipt.stage_key, receipt.attempt)
+        for receipt in journal.state().stages
+    } == {
+        (receipt.stage_key, receipt.attempt)
+        for receipt in receipts
+    }
+    assert journal.state().seq == len(journal.events())
+
+
+def test_open_recovers_receipt_after_event_before_state_crash(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    journal = _make_journal(tmp_path)
+    receipt = _receipt_with_output(
+        tmp_path,
+        "build",
+        "k" * 64,
+    )
+    original = journal_module._atomic_write_bytes
+    injected = False
+
+    def fail_state_once(path, data):
+        nonlocal injected
+        if path.name == "state.json" and not injected:
+            injected = True
+            raise OSError("injected state commit crash")
+        return original(path, data)
+
+    monkeypatch.setattr(
+        journal_module,
+        "_atomic_write_bytes",
+        fail_state_once,
+    )
+    with pytest.raises(OSError, match="injected"):
+        journal.record_receipt(receipt)
+
+    monkeypatch.setattr(
+        journal_module,
+        "_atomic_write_bytes",
+        original,
+    )
+    reopened = JobJournal.open(journal.root, journal.job_id)
+
+    assert [item.stage_key for item in reopened.state().stages] == [
+        receipt.stage_key
+    ]
+    assert reopened.events()[-1]["type"] == "receipts_recovered"
+    assert reopened.state().seq == len(reopened.events())
 
 
 def test_heartbeat_cancel_logs_specs(tmp_path) -> None:

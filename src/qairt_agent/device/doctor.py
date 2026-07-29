@@ -24,6 +24,7 @@ from qairt_agent.device.adb import (
 from qairt_agent.device.lease import (
     INVALID_LEASE_GRACE_SECONDS,
     LEASE_STALE_AFTER_SECONDS,
+    _default_alive,
     lease_file_lock,
     lease_snapshot,
     scan_stale_lease_snapshots,
@@ -283,6 +284,8 @@ def device_gc(
         )
     cleaned: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    owner_alive = alive or _default_alive
+
     for candidate in stale:
         lease_path = candidate.path
         with lease_file_lock(lease_path):
@@ -323,6 +326,22 @@ def device_gc(
                 continue
 
             data = current.data or {}
+            owner_pid = data.get("pid")
+            if (
+                not dry_run
+                and isinstance(owner_pid, int)
+                and owner_pid > 0
+                and owner_alive(owner_pid)
+            ):
+                skipped.append(
+                    {
+                        "lease": str(lease_path),
+                        "owner": data.get("owner"),
+                        "pid": owner_pid,
+                        "reason": "owner_process_alive",
+                    }
+                )
+                continue
             expected_server_value = (
                 client.config.server if client is not None else ""
             )
