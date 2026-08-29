@@ -233,6 +233,21 @@ so its report states that internal graph-AR selection is executor-managed.
 Multi-AR GenAI optrace fails closed; use an explicit `ar` for a raw
 CompiledModel profiling run instead of presenting one AR as complete coverage.
 
+Benchmark sampling is lane-aware. The low-level lane keeps 10 warmup and 50
+measured graph invocations. A GenAI sample is a whole `generate()` call, so
+that lane resolves 3 warmup and 10 measured at spec-parse time and records the
+result in the `BuildSpec`; `qairt-agent plan` renders the effective numbers
+under `effective_config.benchmark`, and any value the spec sets explicitly
+wins. A/A calibration doubles whichever numbers apply. Every latency report
+carries a `measurement_scope` block stating that samples are warmed host
+wall-clock around one call including the host-to-SDK-to-device round trip —
+the QAIRT Python API exposes no device-side synchronization barrier — and that
+per-op attribution comes from optrace. `p50_ms_per_token` is published only
+with an explicit `ms_per_token_source`: `caller` for a supplied `token_count`,
+`sdk_metrics` only if the SDK reports a generated-token count. QAIRT 2.49 does
+not (its `GenerationMetrics` carries a rate and a duration but no count), and a
+count is never derived from their product.
+
 Device work requires `QAIRT_AGENT_ADB_SERIAL` and
 `QAIRT_AGENT_ADB_SERVER`. Remote artifacts live only under the exact leased
 `/data/local/tmp/qairt-agent/<job>/<stage>/<attempt>/` path and must be cleaned

@@ -294,6 +294,41 @@ def test_plan_resolves_preset(tmp_path) -> None:
         "chain",
     ]
     assert lines[0]["effective_compile"]["enable_intermediate_outputs"] is True
+    assert lines[0]["effective_benchmark"] == {
+        "warmup_runs": 10,
+        "measured_runs": 50,
+        "optrace": False,
+        "lane": "low_level",
+        "sample_unit": "graph_invocation",
+        "aa_calibration_doubles_runs": True,
+    }
+
+
+def test_plan_shows_the_genai_lane_benchmark_defaults(tmp_path) -> None:
+    client, _ = make_client(tmp_path)
+    spec = spec_dict()
+    del spec["family"]
+    spec["preset"] = "qwen3_5"
+    spec["metadata"] = {
+        "attached_models_by_ar": {
+            ar: {
+                "model_path": f"/m/ar{ar}.onnx",
+                "encodings_path": f"/m/ar{ar}.encodings",
+            }
+            for ar in ("1", "128")
+        }
+    }
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+
+    code, lines = run(["plan", "--spec", str(spec_path)], client)
+
+    assert code == 0
+    assert lines[0]["resolved"]["pipeline"] == "genai_builder"
+    # `plan` must show what a run will actually execute, not the schema default.
+    assert lines[0]["effective_benchmark"]["warmup_runs"] == 3
+    assert lines[0]["effective_benchmark"]["measured_runs"] == 10
+    assert lines[0]["effective_benchmark"]["sample_unit"] == "generate_call"
 
 
 def test_build_inline_succeeds(tmp_path) -> None:

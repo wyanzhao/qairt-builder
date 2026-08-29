@@ -233,6 +233,29 @@ normalized, content-addressed `optrace_evidence` artifact. Thread-cycle records
 use the maximum overlapping thread value rather than a sum, and all per-op
 claims remain reported work attribution rather than additive wall latency.
 
+### Benchmark sampling and token accounting
+
+Sampling policy is lane-aware. The low-level lane measures 10 warmup and 50
+measured graph invocations. One GenAI sample is an entire `generate()` call, so
+that lane resolves 3 warmup and 10 measured — materialized into the `BuildSpec`
+when the spec is parsed, so `qairt-agent plan` shows the numbers that will run
+under `effective_config.benchmark` (with `lane` and `sample_unit`), and every
+later stage reads the same values. Explicit spec values always win, per field.
+A/A calibration doubles whichever numbers apply.
+
+Every latency report carries a `measurement_scope` block: samples are warmed
+host `perf_counter_ns` wall time around one call and include the
+host-to-SDK-to-device round trip, because the QAIRT Python API exposes no
+device-side synchronization barrier. On-device per-op attribution comes from
+optrace, never from arithmetic on these samples.
+
+`p50_ms_per_token` appears only alongside an explicit `ms_per_token_source`.
+`caller` means the benchmark config supplied `token_count`. `sdk_metrics` is
+reserved for an SDK that reports a generated-token count; QAIRT 2.49 does not —
+its public `GenerationMetrics` exposes `token_generation_rate` and
+`token_generation_time` but no count, and multiplying them would manufacture a
+number the SDK never reported. Sources are never mixed silently.
+
 ### Static footprint
 
 Every build publishes a `static_footprint` block in its stage data and metrics:

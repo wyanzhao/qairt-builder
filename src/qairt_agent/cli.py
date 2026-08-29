@@ -46,6 +46,7 @@ from qairt_agent.errors import (
     ToolErrorData,
 )
 from qairt_agent.families.presets import (
+    effective_benchmark_policy,
     family_for_preset,
     resolve_workflow,
     to_build_spec,
@@ -849,6 +850,7 @@ def _cmd_plan(args: argparse.Namespace, client: QairtAgentClient, out: TextIO, s
             "resolved": resolved.to_dict(),
             "quality": workflow_spec.quality.model_dump(mode="json"),
             "effective_compile": effective_build.compile.model_dump(mode="json"),
+            "effective_benchmark": effective_benchmark_policy(effective_build),
             "workflow_stages": list(DEFAULT_WORKFLOW_STAGES),
         },
     )

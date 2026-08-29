@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 from qairt_agent.artifacts import canonical_json_bytes
 from qairt_agent.contracts import (
+    BenchmarkSpec,
     BuildSpec,
     ModelFamily,
     OutputLayoutSpec,
@@ -432,6 +433,52 @@ def family_for_preset(preset_id: str) -> ModelFamily | None:
     return _PRESET_TO_FAMILY.get(preset_id)
 
 
+# One GenAI ``generate()`` call is a whole prompt-to-text workload, not a single
+# graph invocation, so the low-level 10 warmup + 50 measured policy (doubled
+# again by A/A calibration) would run 180 full generations per benchmark.
+GENAI_BENCHMARK_DEFAULTS: dict[str, int] = {"warmup_runs": 3, "measured_runs": 10}
+
+
+def is_genai_builder_family(family: ModelFamily | str) -> bool:
+    """Whether a family's preset binds the GenAI Builder lane."""
+
+    return get_preset(preset_id_for_family(family)).pipeline is PipelineKind.GENAI_BUILDER
+
+
+def apply_lane_benchmark_defaults(
+    family: ModelFamily | str,
+    benchmark: BenchmarkSpec,
+) -> BenchmarkSpec:
+    """Fill unset benchmark fields with the resolved lane's defaults.
+
+    Resolution must happen where the caller's input is still distinguishable
+    from the schema default — ``model_fields_set`` reads as complete after a
+    manifest round-trip — so both spec entry points call this and no later stage
+    re-resolves.  A field the caller set always wins.
+    """
+
+    if not is_genai_builder_family(family):
+        return benchmark
+    unset = {
+        field: value
+        for field, value in GENAI_BENCHMARK_DEFAULTS.items()
+        if field not in benchmark.model_fields_set
+    }
+    return benchmark.model_copy(update=unset) if unset else benchmark
+
+
+def effective_benchmark_policy(spec: BuildSpec) -> dict[str, object]:
+    """Render the benchmark sampling policy a run will actually execute."""
+
+    genai = is_genai_builder_family(spec.family)
+    return {
+        **spec.benchmark.model_dump(mode="json"),
+        "lane": "genai_builder" if genai else "low_level",
+        "sample_unit": "generate_call" if genai else "graph_invocation",
+        "aa_calibration_doubles_runs": True,
+    }
+
+
 def to_build_spec(spec: WorkflowSpec) -> BuildSpec:
     """Convert a workflow spec into the build spec the stage engine consumes.
 
@@ -468,7 +515,7 @@ def to_build_spec(spec: WorkflowSpec) -> BuildSpec:
         compile=compile_policy,
         target=spec.target,
         quality=spec.quality,
-        benchmark=spec.benchmark,
+        benchmark=apply_lane_benchmark_defaults(family, spec.benchmark),
         stage_configs=spec.stage_configs,
         metadata=dict(spec.metadata),
     )
@@ -476,6 +523,7 @@ def to_build_spec(spec: WorkflowSpec) -> BuildSpec:
 
 __all__ = [
     "PRESET_REGISTRY",
+    "GENAI_BENCHMARK_DEFAULTS",
     "GENAI_OUTPUT_LAYOUT",
     "LOW_LEVEL_OUTPUT_LAYOUT",
     "QWEN3_5_OMNI_PRESET",
@@ -486,8 +534,11 @@ __all__ = [
     "QWEN3_VL_PRESET",
     "ResolvedWorkflow",
     "VIT_PRESET",
+    "apply_lane_benchmark_defaults",
+    "effective_benchmark_policy",
     "family_for_preset",
     "get_preset",
+    "is_genai_builder_family",
     "preset_id_for_family",
     "preset_sha256",
     "resolve_workflow",

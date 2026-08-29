@@ -32,6 +32,7 @@ from qairt_agent.contracts import (
     BuildSpec,
     EmbeddingMode,
     ModelFamily,
+    PipelineKind,
     QuantizationMode,
     RunManifest,
     SqnrMode,
@@ -40,6 +41,7 @@ from qairt_agent.contracts import (
     StageStatus,
     ToolResult,
     VectorMode,
+    preset_id_for_family,
     utc_now,
 )
 from qairt_agent.diagnostics.latency import LatencyDiagnoser
@@ -47,7 +49,13 @@ from qairt_agent.diagnostics.sqnr import QualityDiagnoser
 from qairt_agent.device import DeviceRuntime
 from qairt_agent.errors import ErrorCode, InvalidSpecError, ToolErrorData
 from qairt_agent.errors import ManifestConflictError
-from qairt_agent.families import FamilyConfigGenerator, GeneratedFamilyConfig, OnnxInspector
+from qairt_agent.families import (
+    FamilyConfigGenerator,
+    GeneratedFamilyConfig,
+    OnnxInspector,
+    apply_lane_benchmark_defaults,
+    effective_benchmark_policy,
+)
 from qairt_agent.harness import load_harness_constraints
 from qairt_agent.qairt_adapter import (
     NativeKvGraphExpectation,
@@ -281,6 +289,34 @@ def _path_artifacts(value: Any, *, logical_prefix: str = "") -> tuple[ArtifactRe
 
     visit(value, prefix=logical_prefix)
     return tuple(collected)
+
+
+# Keys under which an SDK might *report* a generated-token count. QAIRT 2.49's
+# public GenerationMetrics exposes token_generation_rate and
+# token_generation_time but no count, so on this SDK the caller's explicit
+# token_count is the only source; multiplying a rate by a duration would
+# manufacture a number the SDK never reported.
+_SDK_GENERATED_TOKEN_COUNT_KEYS = (
+    "num_generated_tokens",
+    "generated_token_count",
+    "num-generated-tokens",
+)
+
+
+def _sdk_generated_token_count(metrics: Any) -> int | None:
+    """Return a generated-token count the SDK reported, never a derived one."""
+
+    if not isinstance(metrics, Mapping):
+        return None
+    for key in _SDK_GENERATED_TOKEN_COUNT_KEYS:
+        value = metrics.get(key)
+        if isinstance(value, Mapping):
+            value = value.get("value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if float(value).is_integer() and int(value) > 0:
+            return int(value)
+    return None
 
 
 _STATIC_FOOTPRINT_SCHEMA = "qairt-agent.static-footprint/1"
@@ -624,6 +660,16 @@ class QairtAgent:
                         )
                     }
                 )
+            # Same discipline for the GenAI lane's benchmark sampling policy:
+            # resolve it once, here, where "the caller did not set this" is
+            # still knowable, so plan output, the manifest, and every later
+            # stage read the numbers that will actually run.  `to_build_spec`
+            # applies the identical rule for the workflow-spec entry point.
+            benchmark = apply_lane_benchmark_defaults(
+                parsed.family, parsed.benchmark
+            )
+            if benchmark != parsed.benchmark:
+                parsed = parsed.model_copy(update={"benchmark": benchmark})
             return parsed
         except ValidationError as exc:
             raise InvalidSpecError(
@@ -1254,6 +1300,7 @@ class QairtAgent:
                 },
                 "quantization": spec.quantization.model_dump(mode="json"),
                 "compile": spec.compile.model_dump(mode="json"),
+                "benchmark": effective_benchmark_policy(spec),
                 "target": spec.target.model_dump(mode="json"),
                 "sources": spec.sources.model_dump(mode="json", exclude_none=True),
                 "embedding_packaging": {
@@ -1322,6 +1369,7 @@ class QairtAgent:
             "transforms": spec.transforms.model_dump(mode="json"),
             "quantization": spec.quantization.model_dump(mode="json"),
             "compile": spec.compile.model_dump(mode="json"),
+            "benchmark": effective_benchmark_policy(spec),
             "target": spec.target.model_dump(mode="json"),
             "stages": ["qairt.convert", "qairt.compile"],
             "context_binary_grouping": "one_standalone_vit_context",
@@ -6056,6 +6104,22 @@ class QairtAgent:
                 "policy": "report_only",
                 "setup_excluded": True,
                 "scope": scope,
+                "measurement_scope": {
+                    "clock": "host_perf_counter_ns",
+                    "includes": "host_to_sdk_to_device_round_trip",
+                    "device_side_sync_barrier": False,
+                    "note": (
+                        "the QAIRT Python API exposes no device-side "
+                        "synchronization barrier, so each sample is the warmed "
+                        "host wall time around one call; per-op attribution "
+                        "comes from optrace, not from these samples"
+                    ),
+                    "sample_unit": (
+                        "generate_call"
+                        if scope == "genai_generation"
+                        else "graph_invocation"
+                    ),
+                },
                 "runtime_binding": {
                     key: _jsonable(effective.get(key))
                     for key in (
@@ -6126,11 +6190,20 @@ class QairtAgent:
                     "character_count": generated_text_length,
                 }
             token_count = effective.get("token_count")
+            token_source: str | None = None
             if token_count is not None:
                 normalized_tokens = int(token_count)
                 if normalized_tokens <= 0:
                     raise ValueError("benchmark token_count must be positive")
+                token_source = "caller"
+            else:
+                reported = _sdk_generated_token_count(generation_metrics)
+                if reported is not None:
+                    normalized_tokens = reported
+                    token_source = "sdk_metrics"
+            if token_source is not None:
                 payload["token_count"] = normalized_tokens
+                payload["ms_per_token_source"] = token_source
                 payload["p50_ms_per_token"] = (
                     measurement.summary.p50_ms / normalized_tokens
                 )

@@ -14,6 +14,7 @@ from onnx import TensorProto, helper
 from qairt_agent.artifacts import ManifestStore, verify_artifact
 from qairt_agent.contracts import (
     ArtifactRef,
+    BenchmarkSpec,
     BuildSpec,
     QuantizationMode,
     RunManifest,
@@ -21,7 +22,7 @@ from qairt_agent.contracts import (
     StageStatus,
 )
 from qairt_agent.errors import ErrorCode
-from qairt_agent.pipeline import QairtAgent
+from qairt_agent.pipeline import QairtAgent, _sdk_generated_token_count
 from qairt_agent.qairt_adapter import (
     BuildResult,
     CompiledContextArtifact,
@@ -2161,6 +2162,160 @@ def test_genai_builder_saved_container_auto_benchmarks_with_public_executor(
         name == "profile" and details["graph_name"] == "decoder_ar128"
         for _, name, details in factory.log.calls
     )
+
+
+def _genai_spec(tmp_path: Path, **overrides: Any) -> BuildSpec:
+    model = _write_onnx(tmp_path / "qwen35" / "ar1.onnx")
+    encodings = _write(tmp_path / "qwen35" / "ar1.encodings", b"{}")
+    return BuildSpec(
+        name="genai-benchmark-defaults",
+        family="qwen3_5",
+        sources={"text": {"onnx_path": model, "encodings_path": encodings}},
+        output_root=tmp_path / "artifacts",
+        sequence={
+            "ars": [1],
+            "context_lengths": [4096],
+            "weight_sharing": False,
+            "native_kv": False,
+        },
+        metadata={
+            "model_config": {
+                "architectures": ["Qwen3_5ForCausalLM"],
+                "model_type": "qwen3_5",
+                "hidden_size": 16,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 4096,
+                "vocab_size": 32,
+            },
+            "attached_models_by_ar": {
+                "1": {"model_path": str(model), "encodings_path": str(encodings)}
+            },
+        },
+        **overrides,
+    )
+
+
+def test_genai_lane_resolves_cheaper_benchmark_defaults(tmp_path: Path) -> None:
+    agent = _fake_agent(FakeAdapterFactory())
+
+    planned = agent.plan(_genai_spec(tmp_path), offline=True)
+
+    assert planned.ok, planned.error
+    assert planned.data is not None and planned.manifest is not None
+    benchmark = planned.data["effective_config"]["benchmark"]
+    assert benchmark["warmup_runs"] == 3
+    assert benchmark["measured_runs"] == 10
+    assert benchmark["lane"] == "genai_builder"
+    assert benchmark["sample_unit"] == "generate_call"
+    assert benchmark["aa_calibration_doubles_runs"] is True
+
+    # The resolved policy is materialized into the recorded BuildSpec, so every
+    # later stage reads the numbers plan showed.
+    recorded = _load_run(planned.manifest).build_spec.benchmark
+    assert (recorded.warmup_runs, recorded.measured_runs) == (3, 10)
+
+    built = agent.build_genai_container(_genai_spec(tmp_path))
+    assert built.ok, built.error
+    assert built.manifest is not None
+    benchmarked = agent.benchmark(
+        built.manifest.path,
+        built.manifest.sha256,
+        config={
+            "prompt": [{"role": "user", "content": "hello"}],
+            "aa_calibration": False,
+        },
+    )
+    assert benchmarked.ok, benchmarked.error
+    assert benchmarked.data is not None
+    measurement = benchmarked.data["measurement"]
+    assert measurement["warmup_count"] == 3
+    assert measurement["repeat_count"] == 10
+    assert benchmarked.data["measurement_scope"]["sample_unit"] == "generate_call"
+
+
+def test_explicit_benchmark_values_beat_the_genai_lane_defaults(
+    tmp_path: Path,
+) -> None:
+    agent = _fake_agent(FakeAdapterFactory())
+
+    planned = agent.plan(
+        _genai_spec(tmp_path, benchmark={"warmup_runs": 1}),
+        offline=True,
+    )
+
+    assert planned.ok, planned.error
+    assert planned.data is not None
+    benchmark = planned.data["effective_config"]["benchmark"]
+    # The caller set warmup only; the unset field still takes the lane default.
+    assert benchmark["warmup_runs"] == 1
+    assert benchmark["measured_runs"] == 10
+
+
+def test_low_level_lane_keeps_the_original_benchmark_defaults(
+    tmp_path: Path,
+) -> None:
+    agent = _fake_agent(FakeAdapterFactory())
+    spec = _make_spec(tmp_path).model_copy(update={"benchmark": BenchmarkSpec()})
+
+    planned = agent.plan(spec, offline=True)
+
+    assert planned.ok, planned.error
+    assert planned.data is not None
+    benchmark = planned.data["effective_config"]["benchmark"]
+    assert benchmark["warmup_runs"] == 10
+    assert benchmark["measured_runs"] == 50
+    assert benchmark["lane"] == "low_level"
+    assert benchmark["sample_unit"] == "graph_invocation"
+
+
+def test_latency_report_labels_the_token_metric_source_and_wall_scope(
+    tmp_path: Path,
+) -> None:
+    vector = _vector_case(tmp_path)
+    agent = _fake_agent(FakeAdapterFactory())
+    plan = agent.plan(_make_spec(tmp_path), offline=True)
+    assert plan.manifest is not None
+
+    benchmarked = agent.benchmark(
+        plan.manifest.path,
+        plan.manifest.sha256,
+        config={
+            "context_path": tmp_path / "main.bin",
+            "graph_name": "main_ar1",
+            "vector_manifest": vector,
+            "warmup_runs": 0,
+            "measured_runs": 1,
+            "aa_calibration": False,
+            "token_count": 4,
+        },
+    )
+
+    assert benchmarked.ok, benchmarked.error
+    assert benchmarked.data is not None
+    assert benchmarked.data["token_count"] == 4
+    assert benchmarked.data["ms_per_token_source"] == "caller"
+    scope = benchmarked.data["measurement_scope"]
+    assert scope["clock"] == "host_perf_counter_ns"
+    assert scope["device_side_sync_barrier"] is False
+    assert scope["sample_unit"] == "graph_invocation"
+
+
+def test_sdk_generated_token_count_never_derives_from_a_rate() -> None:
+    # QAIRT 2.49 reports a rate and a duration but no count; deriving one would
+    # manufacture a number the SDK never reported.
+    assert (
+        _sdk_generated_token_count(
+            {"token_generation_rate": 50.0, "token_generation_time": 200000}
+        )
+        is None
+    )
+    assert _sdk_generated_token_count({"num_generated_tokens": 12}) == 12
+    assert _sdk_generated_token_count({"num-generated-tokens": {"value": 7}}) == 7
+    assert _sdk_generated_token_count({"num_generated_tokens": 0}) is None
+    assert _sdk_generated_token_count({"num_generated_tokens": 3.5}) is None
+    assert _sdk_generated_token_count(None) is None
 
 
 def _footprint_bytes_on_disk(footprint: Mapping[str, Any]) -> int:
