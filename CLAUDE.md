@@ -30,8 +30,11 @@ Settled program decisions (2026-08-29; details and rationale in
   drilldown has not. Neither is ever a default, and neither alters production
   reports.
 - Hardware: SM8850 and SM8750 through a reviewed target registry (T02). Until
-  T02 lands, the single pinned target below stands. The SDK pin moves to QAIRT
-  2.49.0.260730 with T01; until then the 2.48 pin stands.
+  T02 lands there is one pinned target, and it is **SM8750 / v79 / soc_model
+  69** — the device this program is currently accepted on. `soc_model` is the
+  `Qnn_SocModel_t` value, not the Android SoC ID (SM8750's SoC IDs are 618 and
+  639); conflating the two is what made the earlier SM8850 pin wrong. SM8850 is
+  `v81 / soc_model 87` and returns with T02.
 - **Out of scope by decision** — do not build or claim: direct Genie API
   integration, power/thermal measurement, token-level accuracy metrics,
   end-to-end Omni audio runtime, end-to-end Qwen3-VL multimodal execution.
@@ -328,8 +331,17 @@ For an upgrade:
 6. Update examples and capability claims only after those gates pass.
 
 Do not relax a version mismatch into a warning. Until a new SDK is proven,
-preflight must fail closed. The next planned upgrade is
-[T01](docs/plan/T01-sdk-upgrade-2.49.md) to QAIRT 2.49.0.260730.
+preflight must fail closed. The pin is QAIRT 2.49.0.260730 (build
+`260730134355`), landed by [T01](docs/plan/T01-sdk-upgrade-2.49.md).
+
+The target tuple has the same single source: `harness/constraints.json`.
+`TargetSpec` defaults from it and rejects a spec that names a different tuple,
+so a wrong device fails at spec time rather than at compile time. One guard
+needs care on SM8750: QAIRT's own compile default is `v79`/`soc_model 69`,
+which is exactly the SM8750 tuple, so a resolved-value check cannot distinguish
+an intended target from a silent fallback. An empty `device_custom_configs`
+list — the SDK's "skipping device config creation" path — therefore fails
+closed in its own right.
 
 ## Development checks
 

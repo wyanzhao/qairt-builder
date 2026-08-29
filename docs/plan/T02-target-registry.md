@@ -71,6 +71,32 @@ runs while being compiled for the wrong SoC. The registry work must therefore:
 If the device run shows 660 is what SM8850 accepts, the finding is recorded and
 the seed corrected; either way the ambiguity stops being invisible.
 
+## Interim state after T01 (2026-08-29)
+
+T01 needed a device, and the device available is SM8750, so the single pinned
+target moved to **SM8750 / v79 / soc_model 69** — using the `Qnn_SocModel_t`
+value the table above establishes. SM8850 is not buildable until this task
+lands its registry. Three things T02 must absorb:
+
+- **The `soc_model` correction is now live for SM8750 only.** SM8850's entry
+  must be seeded as `v81 / soc_model 87`, not the old 660, and that value has
+  never been proven on hardware.
+- **`TargetSpec` now defaults from and validates against
+  `harness/constraints.json`,** so a spec naming a different tuple fails at
+  spec time. The registry has to replace that single-tuple check with a
+  named-target lookup without losing the early failure.
+- **`qairt-agent.toml` carries its own `[target]` block** that duplicates the
+  harness tuple; today doctor compares them and fails closed on drift. With a
+  registry the project config should select a target *name* instead of
+  restating the tuple, removing the duplication rather than doubling it.
+
+Also landed in T01 and worth keeping: `_validate_compiler_target` now fails
+closed on an empty `device_custom_configs` list, because QAIRT's own compile
+default (`v79`/`soc_model 69`) is exactly the SM8750 tuple, so the old
+"resolved value must not be v79" heuristic can no longer distinguish an
+intended target from a silent fallback. Any registry entry whose tuple happens
+to match an SDK default inherits that same hazard.
+
 ## Design
 
 1. **Registry** — `harness/targets/<name>.json`, one reviewed file per target:

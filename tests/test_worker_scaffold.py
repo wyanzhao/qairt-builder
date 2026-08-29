@@ -134,9 +134,9 @@ def test_wheel_declares_every_non_python_init_asset() -> None:
         '"qairt_agent/_data/worker/docker/worker.Dockerfile"'
     ) in pyproject
     assert (
-        '"docker/requirements-qairt-2.48.0.260626.txt" = '
+        '"docker/requirements-qairt-2.49.0.260730.txt" = '
         '"qairt_agent/_data/worker/docker/'
-        'requirements-qairt-2.48.0.260626.txt"'
+        'requirements-qairt-2.49.0.260730.txt"'
     ) in pyproject
 
 

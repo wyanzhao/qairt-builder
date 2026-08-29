@@ -31,7 +31,7 @@ packages = ["src/qairt_agent"]
 [tool.hatch.build.targets.wheel.force-include]
 "harness/constraints.json" = "qairt_agent/_data/harness_constraints.json"
 "docker/worker.Dockerfile" = "qairt_agent/_data/worker/docker/worker.Dockerfile"
-"docker/requirements-qairt-2.48.0.260626.txt" = "qairt_agent/_data/worker/docker/requirements-qairt-2.48.0.260626.txt"
+"docker/requirements-qairt-2.49.0.260730.txt" = "qairt_agent/_data/worker/docker/requirements-qairt-2.49.0.260730.txt"
 
 [tool.pytest.ini_options]
 addopts = "-ra"

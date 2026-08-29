@@ -28,13 +28,13 @@ def test_init_creates_config_and_dirs(tmp_path) -> None:
     assert (tmp_path / "harness" / "constraints.json").is_file()
     assert (tmp_path / "docker" / "worker.Dockerfile").is_file()
     assert (
-        tmp_path / "docker" / "requirements-qairt-2.48.0.260626.txt"
+        tmp_path / "docker" / "requirements-qairt-2.49.0.260730.txt"
     ).is_file()
     assert (tmp_path / "docker" / ".generated" / "qairt-agent-src.zip").is_file()
     assert (tmp_path / ".dockerignore").is_file()
     assert config.sdk_root == "./qnn/qnn"
     assert config.worker_backend == "auto"
-    assert config.target_chipset == "SM8850"
+    assert config.target_chipset == "SM8750"
 
 
 def test_init_does_not_require_sdk(tmp_path) -> None:
@@ -47,7 +47,7 @@ def test_load_round_trips_and_missing_raises(tmp_path) -> None:
     init(tmp_path)
     config = load(tmp_path)
     assert config.docker_platform == "linux/amd64"
-    assert config.target_soc_model == 660
+    assert config.target_soc_model == 69
     assert config.docker_image.startswith("qairt-agent-worker:")
 
     with pytest.raises(ProjectNotInitializedError, match="not initialized"):
@@ -119,7 +119,7 @@ def test_doctor_passes_with_prepared_sdk(tmp_path, monkeypatch) -> None:
     sdk = config.sdk_path
     sdk.mkdir(parents=True)
     (sdk / "sdk.yaml").write_text(
-        "version: 2.48.0.260626\nbuild_id: 260626120635\n", encoding="utf-8"
+        "version: 2.49.0.260730\nbuild_id: 260730134355\n", encoding="utf-8"
     )
     (sdk / "lib" / "python").mkdir(parents=True)
     config.dockerfile_path.parent.mkdir(parents=True, exist_ok=True)
@@ -143,10 +143,10 @@ def test_doctor_passes_with_prepared_sdk(tmp_path, monkeypatch) -> None:
 
 def test_discovers_versioned_sdk_under_qnn_layout(tmp_path) -> None:
     installation = tmp_path / "qnn" / "qnn"
-    sdk = installation / "qairt" / "2.48.0.260626"
+    sdk = installation / "qairt" / "2.49.0.260730"
     sdk.mkdir(parents=True)
     (sdk / "sdk.yaml").write_text(
-        "version: 2.48.0\nbuild_id: 260626120635\n", encoding="utf-8"
+        "version: 2.49.0\nbuild_id: 260730134355\n", encoding="utf-8"
     )
 
     assert discover_sdk_path(installation) == sdk.resolve()

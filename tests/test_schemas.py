@@ -160,7 +160,7 @@ def test_output_layout_rejects_paths_outside_output_root(relative: str) -> None:
 
 def _provenance() -> StageProvenance:
     return StageProvenance(
-        sdk_build="260626120635",
+        sdk_build="260730134355",
         adapter_capability="explicit_factory",
         platform_abi="ubuntu22.04-x86_64",
     )

@@ -23,8 +23,8 @@ from qairt_agent.project import init, load
 def test_checked_in_harness_has_worker_and_runtime_pins() -> None:
     constraints = DEFAULT_CONSTRAINTS
 
-    assert constraints.qairt_version == "2.48.0"
-    assert constraints.qairt_build_id == "260626120635"
+    assert constraints.qairt_version == "2.49.0"
+    assert constraints.qairt_build_id == "260730134355"
     assert constraints.ubuntu_version == "22.04"
     assert constraints.python_version_tuple == (3, 10)
     assert constraints.platform == "linux/amd64"
@@ -58,7 +58,7 @@ def test_active_harness_drives_contract_stage_key_and_provenance(
     document = json.loads(
         DEFAULT_CONSTRAINTS.source_path.read_text(encoding="utf-8")
     )
-    document["qairt"]["version"] = "2.49.0"
+    document["qairt"]["version"] = "2.50.0"
     document["qairt"]["build_id"] = "next-build"
     document["worker"]["ubuntu_version"] = "24.04"
     document["worker"]["platform"] = "linux/amd64"
@@ -67,10 +67,10 @@ def test_active_harness_drives_contract_stage_key_and_provenance(
     monkeypatch.setenv("QAIRT_AGENT_HARNESS_CONSTRAINTS", str(path))
 
     target = TargetSpec()
-    assert target.qairt_version == "2.49.0"
+    assert target.qairt_version == "2.50.0"
     assert target.qairt_build_id == "next-build"
     with pytest.raises(ValidationError, match="must match harness"):
-        TargetSpec(qairt_version="2.48.0")
+        TargetSpec(qairt_version="2.49.0")
 
     assert QairtAgent._stage_key("build", "a" * 64, {}) != baseline_key
     provenance = QairtAgentClient(

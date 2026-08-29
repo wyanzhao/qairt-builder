@@ -135,7 +135,7 @@ vision vectors.
 The Omni package is an SDK `WorkflowContainer` created with
 `WorkflowBuilder.from_builders` and an
 `AUDIO_ENCODER -> TEXT_GENERATOR` graph. Both component containers are saved,
-but the agent does not call or claim end-to-end audio execution: QAIRT 2.48's
+but the agent does not call or claim end-to-end audio execution: QAIRT 2.49's
 workflow executor does not orchestrate that audio node. Missing audio
 ONNX/encodings, per-AR text ONNX/encodings, explicit builder classes, token IDs,
 or factory methods fail closed before packaging.
@@ -405,8 +405,8 @@ logs/worker-launch.log detached-runtime startup stdout/stderr
   `qairt-agent image build --root .` refreshes and builds the project-local worker image and
   then accepts it only after an import smoke test against the read-only mounted SDK. Run
   `qairt-agent image smoke --root .` to repeat that gate without rebuilding.
-- `doctor` verifies SDK metadata, QAIRT 2.48 capability, Ubuntu/x86_64 ABI, and
-  the `SM8850/v81/soc_model 660` target. On a host without the SDK or selected
+- `doctor` verifies SDK metadata, QAIRT 2.49 capability, Ubuntu/x86_64 ABI, and
+  the `SM8750/v79/soc_model 69` target. On a host without the SDK or selected
   runtime it reports those checks as failing rather than silently passing.
 - Both runtimes use the same Ubuntu 22.04 / Python 3.10 / `linux/amd64`
   image. The SDK, models, and artifacts are mounted, never baked into the
@@ -422,7 +422,7 @@ logs/worker-launch.log detached-runtime startup stdout/stderr
   work lives at `/data/local/tmp/qairt-agent/<job-id>/<stage-key>/<attempt-id>/`,
   staged via `incoming -> verify -> ready`. Context binaries, vector manifests,
   and their raw tensors are copied there as a content-verified lifecycle/audit
-  sandbox. QAIRT 2.48 does not expose a Python option that makes
+  sandbox. QAIRT 2.49 does not expose a Python option that makes
   `CompiledModel` reuse this remote working directory: execution still receives
   an explicit `qairt.Device`, and QAIRT owns its internal runtime deployment.
   The exact audit-sandbox attempt directory is removed in a `finally` on
@@ -488,7 +488,7 @@ logs/worker-launch.log detached-runtime startup stdout/stderr
 ## What is verified here vs gated
 
 This workspace contains the pinned SDK under
-`./qnn/qnn/qairt/2.48.0.260626`. Host-runtime and device acceptance remain
+`./qnn/qnn/qairt/2.49.0.260730`. Host-runtime and device acceptance remain
 separate gates:
 
 - **Verified by tests (no SDK/container runtime/device needed):** the contracts and
@@ -504,7 +504,7 @@ separate gates:
   evidence normalization; automatic SQNR attribution, compatible fork-profile
   deltas, and fail-closed hotspot-only latency diagnosis.
 - **Gated pending environment prep:** live worker-image construction/execution
-  and SM8850 on-device build/validate/benchmark/optrace. These run
+  and SM8750 on-device build/validate/benchmark/optrace. These run
   through the same code paths once the selected runtime is ready and the image is built;
   until then `doctor` reports them as not-ready and the engine fails closed at
   preflight.

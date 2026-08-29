@@ -1,4 +1,4 @@
-"""Version-gated, Python-only QAIRT 2.48 adapters."""
+"""Version-gated, Python-only QAIRT 2.49 adapters."""
 
 from .adapter import QairtSdkAdapter
 from .errors import (

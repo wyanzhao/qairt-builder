@@ -1,0 +1,62 @@
+# QAIRT 2.49.0.260730 Python 3.10 worker dependencies.
+#
+# Derivation, not inheritance. The first block was re-read from this release's
+# own checker, bin/check-python-dependency in QAIRT 2.49.0.260730: its
+# required_packages table holds the same 33 entries at the same versions as
+# 2.48.0.260626, and its per-Python-version override table is empty, so this
+# block is identical to the previous release lock because the SDK's own
+# requirements are identical -- verified item by item, not carried over.
+# Ubuntu 22.04 still maps to Python 3.10 there; Ubuntu 24.04 would map to 3.12.
+absl-py==2.1.0
+aenum==3.1.15
+attrs==23.2.0
+dash==2.12.1
+decorator==4.4.2
+invoke==1.7.3
+joblib==1.4.0
+jsonschema==4.19.0
+lxml==5.2.1
+mako==1.2.0
+matplotlib==3.10.8
+mock==3.0.5
+numpy==1.26.4
+opencv-python==4.8.1.78
+optuna==3.3.0
+packaging==24.0
+pandas==2.3.3
+paramiko==3.5.1
+pathlib2==2.3.6
+pillow==10.2.0
+plotly==5.20.0
+psutil==6.1.1
+pydantic==2.8.2
+pytest==8.1.1
+pyyaml==6.0.3
+rich==13.9.4
+safetensors==0.4.3
+scikit-optimize==0.9.0
+scipy==1.15.3
+six==1.16.0
+tabulate==0.9.0
+typing-extensions==4.14.0
+xlsxwriter==1.2.2
+
+# Pinned QAIRT Python API / GenAI Builder additions.
+#
+# The SDK checker does not cover the GenAI Builder and ONNX optimizer import
+# closures, and 2.49 declares no version constraint for any of these in code,
+# so the pins are ours. Each was re-confirmed as still imported by
+# 2.49.0.260730: onnx_ir by 81 modules under qairt/ (the LLM splitter builds on
+# it), onnxscript, onnxruntime and transformers by 3 each, islpy by 2, tqdm by
+# 1, and tiktoken/sentencepiece by the qti.aisw.genai tokenizer. onnx stays at
+# the version this SDK's sdk.yaml records (1.16.1). The image smoke test is
+# what proves the set actually imports.
+islpy==2025.2.5
+onnx==1.16.1
+onnx-ir==0.1.12
+onnxruntime==1.17.1
+onnxscript==0.5.6
+sentencepiece==0.2.0
+tiktoken==0.7.0
+tqdm==4.65.0
+transformers==4.57.1

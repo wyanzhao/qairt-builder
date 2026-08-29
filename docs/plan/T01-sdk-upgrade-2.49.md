@@ -1,10 +1,11 @@
 # T01 — QAIRT SDK upgrade to 2.49.0.260730
 
-Status: planned — static verification done ahead of the pin change
-(2026-08-29); see "Pre-change verification". The pin itself was deliberately
-**not** moved, because the gates that must accompany it (dependency lock,
-worker image rebuild, real-device acceptance) cannot be run yet and a
-half-migrated pin is worse than none.
+Status: in-progress (2026-08-29) — pin, lock, worker image + SDK import smoke,
+target move to SM8750, green `doctor` / `device doctor`, and a real build on the
+2.49 SDK producing an SM8750 context binary. The remaining acceptance criterion
+is the on-device validate/benchmark half, blocked on a one-time privileged host
+DNS bridge the agent must not run itself; the exact command and the prepared run
+are at the end of "The pin change".
 Depends on: —
 Effort: L
 
@@ -201,12 +202,131 @@ tracked `.dockerignore` byte-identical), and the Apple container image
 remaining work is genuinely the pin plus its lock/image/device gates, not
 environment plumbing.
 
+## The pin change (2026-08-29)
+
+### Target: SM8750, and why the tuple moved at all
+
+The acceptance run needs hardware, and the hardware available is an
+`SM-S931U1` reporting `ro.soc.model=SM8750` with `soc_id=618`. With a single
+pinned target, running there means pinning SM8750, so the tuple is now
+**SM8750 / v79 / soc_model 69**, using the `Qnn_SocModel_t` value from
+[T02](T02-target-registry.md)'s evidence table. The device's own `soc_id=618`
+is direct hardware confirmation that the Android SoC ID and the QNN SoC model
+are different numbering schemes -- the confusion that made the old
+`soc_model 660` pin wrong. SM8850 is not buildable until T02 lands its
+registry.
+
+`TargetSpec` now defaults from and validates against
+`harness/constraints.json`, so that file is genuinely the one reviewed source
+for the target, as the contract has always claimed. A spec naming a different
+tuple fails at spec time instead of at compile time.
+
+### One guard had to be rebuilt, not just re-pointed
+
+The old rule was "a resolved `v79` means QAIRT fell back, so refuse it". On
+SM8750 the intended architecture *is* v79, and QAIRT's own compile default is
+`dsp_arch v79` with `soc_model 69` (`qairt/api/compiler/config.py:615`) -- the
+exact SM8750 tuple. A resolved-value check can therefore no longer distinguish
+an intended target from a silent fallback.
+
+`_validate_compiler_target` now fails closed on an **empty**
+`device_custom_configs` list, which is the SDK's "could not set soc model for
+chipset ... skipping device config creation" path and the actual mechanism by
+which a compile ends up on the SDK's defaults. The test fake previously
+returned an empty list unconditionally, so the guard had never been exercised;
+it now builds device configs from `soc_details` the way the SDK does, and a new
+test drives the skip path.
+
+### What ran, and what it proved
+
+- `qairt-agent init` regenerated the worker build context.
+- `qairt-agent image build` built
+  `qairt-agent-worker:0.2.0-ubuntu22.04-py310` (`sha256:52e9a6980a8c...`) and
+  its **SDK import smoke passed** -- the real proof that the new dependency
+  lock installs on Ubuntu 22.04 / CPython 3.10 and that QAIRT 2.49.0.260730
+  imports inside it.
+- `qairt-agent doctor` is **`ok: true`**: every critical check green, including
+  `sdk_metadata` and `target`; only the expected macOS `host_abi` warning
+  remains.
+- `qairt-agent device doctor` against the real SM8750 is **`ok: true`**: adb
+  reachable, serial present, state `device`, target triple recorded, remote
+  free space 189436004 KB, and `sdk build 260730134355 matches expected`.
+- **A real build ran on the real SDK.** `qairt-agent build --spec
+  models/acceptance/spec.json` completed inside the pinned worker with the
+  2.49 SDK: `INFO_CONVERSION_SUCCESS`, then
+  `qairt.compile: Compiled model: tiny for backend: HTP`, producing
+  `vit.dlc` (10856 bytes) and the context binary `vit.bin` (49824 bytes) for
+  **SM8750 / v79 / soc_model 69**. The published manifest is reopenable at
+  `artifacts/sm8750-acceptance-ae/manifests/d0bb8fde-.../manifest-r000001-3832222c....json`.
+  Its stage metrics also exercise T05 against real artifacts: `total_bytes`
+  49824 over `total_includes: ["context"]`, with the converted DLC reported
+  but correctly outside the headline total.
+  Caveat recorded rather than glossed: the converter logged "Following OPs
+  fallback to float" for this model, so the compiled graph is not fully
+  quantized. That is a property of the synthetic acceptance model and its
+  generated encodings, not of the SDK pin, and it does not affect what this run
+  is evidence for.
+- Full test suite green plus `compileall`.
+
+### A device-compatibility defect the real device exposed
+
+`device doctor` initially failed `remote_free_space` with "could not parse
+remote free space". `df PATH` names the filesystem by its **own mount point**,
+which on this Android 15 device is `/data/user/0`, not the queried
+`/data/local/tmp`; the parser filtered for lines containing the queried path
+and matched nothing. The test fixture had used a mount point that happened to
+equal the queried path, which is why it never caught this. The parser now finds
+the data line by position and the available column from the header (covering
+the toybox, legacy-Android, and wrapped-filesystem-name layouts), and the
+fixture carries this device's real output.
+
+### A second defect the real SDK exposed: calibrate cannot run in the worker
+
+The acceptance model was first driven through `quantization.mode =
+"calibrate"`. The converter succeeded, then the SDK's IR quantizer printed
+`Could not create output directory: ./output/` and the process died in native
+code. The cause is environmental, not model-specific: the container's working
+directory is `/workspace`, which `RuntimeMounts` mounts **read-only**
+(`docker/image.py:117`), and the quantizer writes a *relative* `./output/`.
+Any SDK tool that assumes a writable working directory fails the same way.
+
+Because the death is a native exit, no Python handler runs and the job stays
+`running` with a stale heartbeat until a `resume` marks it `ORPHANED` — that
+part is the designed recovery path (`mark_orphaned_if_stale` is called only
+under the worker lease), not a defect.
+
+Not fixed here, deliberately. The fix is to give the container a writable
+working directory, which changes container semantics for every run and belongs
+in its own reviewed change; and this program's production quantization path is
+AIMET `apply_encodings`, which is the path the successful build above used.
+Filed for a separate task rather than bundled into the SDK pin.
+
 ### What is still required before this task can be marked done
 
-Unchanged from the acceptance criteria: the pin patch, a genuinely regenerated
-`docker/requirements-qairt-2.49.0.260730.txt` (not a copy of the 2.48 lock),
-the worker image rebuild plus SDK-import smoke, an import-based probe run
-inside that image, and at least one real-device SM8850 acceptance run.
+Only the on-device half — validate and benchmark. The build half is done and
+its report is reopenable. The device half is blocked on a host setup step this
+project deliberately refuses to perform. Apple `container` cannot reach an
+ADB server bound to host loopback without a privileged localhost DNS bridge,
+and `docs/worker-runtimes.md` states plainly that "the agent never runs this
+command". The maintainer runs it once:
+
+```bash
+sudo container system dns create host.container.internal --localhost 203.0.113.113
+```
+
+After that, one command produces the acceptance evidence:
+
+```bash
+QAIRT_AGENT_ADB_SERIAL=RFCY30B296K QAIRT_AGENT_ADB_SERVER=localhost:5037 \
+  qairt-agent workflow --spec models/acceptance/spec.json --follow
+```
+
+`models/acceptance/` holds a small self-contained acceptance model (a 64x32
+MatMul + bias + ReLU graph routed through the `vit` preset, so it needs no
+MHA2SHA, KV cache, or weight sharing), calibration vectors, an ORT float
+golden, and that spec. It is deliberately not a Qwen model: this run exists to
+prove the SDK pin, the SM8750 target, and the device path, and a real LLM would
+confound that with model-specific failures.
 
 ## Acceptance criteria
 

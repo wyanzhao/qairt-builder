@@ -1338,7 +1338,7 @@ class QairtAgent:
                 "connections": [["audioEncoder", "textGenerator"]],
                 "runtime_supported": False,
                 "runtime_boundary": (
-                    "QAIRT 2.48 builds both components but does not provide "
+                    "QAIRT 2.49 builds both components but does not provide "
                     "validated end-to-end audio workflow execution"
                 ),
             }

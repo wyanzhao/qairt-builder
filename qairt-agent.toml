@@ -14,6 +14,6 @@ artifacts_dir = "artifacts"
 cache_dir = ".qairt-agent/cache"
 
 [target]
-chipset = "SM8850"
-dsp_arch = "v81"
-soc_model = 660
+chipset = "SM8750"
+dsp_arch = "v79"
+soc_model = 69

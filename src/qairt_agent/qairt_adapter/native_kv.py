@@ -66,7 +66,7 @@ def _load_config(config: str | Path | Mapping[str, Any]) -> Mapping[str, Any]:
 def build_native_kv_config(
     expectations: Sequence[NativeKvGraphExpectation],
 ) -> dict[str, list[dict[str, Any]]]:
-    """Generate QAIRT 2.48's canonical ``graphs[].tensors[]`` JSON shape."""
+    """Generate QAIRT 2.49's canonical ``graphs[].tensors[]`` JSON shape."""
 
     graphs: list[dict[str, Any]] = []
     for expectation in expectations:

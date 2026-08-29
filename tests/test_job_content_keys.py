@@ -24,7 +24,7 @@ from qairt_agent.jobs.worker import WorkflowWorker
 from qairt_agent.vectors import VectorPreparer
 
 PROVENANCE = StageProvenance(
-    sdk_build="260626120635",
+    sdk_build="260730134355",
     adapter_capability="explicit_factory",
     platform_abi="ubuntu22.04-x86_64",
     resolved_preset_sha256="a" * 64,
@@ -108,7 +108,7 @@ def _make_spec(tmp_path: Path, *, external_data: bool = False) -> tuple[dict[str
         "transforms": {"mha2sha": True},
         "quantization": {"mode": "apply_encodings"},
         "compile": {},
-        "target": {"chipset": "SM8850"},
+        "target": {"chipset": "SM8750"},
         "vectors": {
             "mode": "provided",
             "validation_manifest": str(vector_manifest),
@@ -378,7 +378,7 @@ def test_build_key_does_not_walk_output_or_sdk_directories(tmp_path: Path) -> No
     spec, _ = _make_spec(tmp_path)
     sdk_root = tmp_path / "qnn-sdk"
     sdk_root.mkdir()
-    (sdk_root / "sdk.yaml").write_text("version: 2.48\n", encoding="utf-8")
+    (sdk_root / "sdk.yaml").write_text("version: 2.49\n", encoding="utf-8")
     sdk_payload = sdk_root / "huge-library.bin"
     sdk_payload.write_bytes(b"sdk-before")
     output_dir = tmp_path / "outputs"

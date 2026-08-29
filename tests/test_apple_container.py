@@ -189,7 +189,7 @@ def test_build_image_uses_harness_build_args(
     assert "PYTHON_VERSION=3.10" in argv
     assert (
         "QAIRT_DEPENDENCIES_FILE="
-        "docker/requirements-qairt-2.48.0.260626.txt"
+        "docker/requirements-qairt-2.49.0.260730.txt"
         in argv
     )
     assert "HARNESS_CONSTRAINTS_FILE=harness/constraints.json" in argv
@@ -239,7 +239,7 @@ def test_sdk_smoke_uses_rosetta_read_only_sdk_and_no_dns(
 ) -> None:
     sdk = tmp_path / "sdk"
     sdk.mkdir()
-    (sdk / "sdk.yaml").write_text("version: 2.48.0\n", encoding="utf-8")
+    (sdk / "sdk.yaml").write_text("version: 2.49.0\n", encoding="utf-8")
     executor = FakeExecutor(
         [
             *_available_results(),

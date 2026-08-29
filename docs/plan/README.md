@@ -35,6 +35,12 @@ new decision entry here instead.
   fallback, no unregistered target) is retained.
 - **SDK**: upgrade the pin to QAIRT 2.49.0.260730 (build id 260730134355). The
   SDK may be provided under `qnn/qnn` via a symlink to the real install.
+  *(Landed 2026-08-29 by T01.)*
+- **`soc_model` correction (2026-08-29, maintainer-approved)**: `soc_model` is
+  the `Qnn_SocModel_t` enum value, not the Android SoC ID. The previous
+  `SM8850 / 660` pin conflated the two. SM8750 is `v79 / 69`, SM8850 is
+  `v81 / 87`, and the SM8750 device on hand reports `soc_id 618`, confirming
+  the two schemes are distinct.
 - **Out of scope by decision**: direct Genie API integration, power/thermal
   measurement, token-level accuracy metrics (top-1 agreement, KL), end-to-end
   Omni audio runtime, end-to-end Qwen3-VL multimodal execution.
@@ -44,8 +50,8 @@ new decision entry here instead.
 
 | ID | Task | Status | Depends on |
 | --- | --- | --- | --- |
-| [T01](T01-sdk-upgrade-2.49.md) | QAIRT SDK upgrade to 2.49.0.260730 | planned (static verification done 2026-08-29) | — |
-| [T02](T02-target-registry.md) | Target registry (SM8850, SM8750) | planned (SoC numbering verified 2026-08-29 — contradicts the current pin) | T01 |
+| [T01](T01-sdk-upgrade-2.49.md) | QAIRT SDK upgrade to 2.49.0.260730 | in-progress (2026-08-29) — real SDK build green; on-device half blocked on a privileged host DNS bridge | — |
+| [T02](T02-target-registry.md) | Target registry (SM8850, SM8750) | planned — T01 pinned SM8750 alone; SM8850 needs this registry | T01 |
 | [T03](T03-config-matrix.md) | Model x target config matrix | planned | T02 |
 | [T04](T04-ort-float-reference.md) | ORT float reference and layerwise debug | tier 1 done (2026-08-29); tier 2 planned | T01 for tier 2 and device acceptance |
 | [T05](T05-static-footprint.md) | Static footprint reporting | done (2026-08-29) | — |

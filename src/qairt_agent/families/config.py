@@ -148,7 +148,7 @@ class FamilyConfigGenerator:
             )
         if profile.factory_support.value == "generic_fallback":
             warnings.append(
-                f"QAIRT 2.48 does not have an explicit {profile.family.value} GenAI "
+                f"QAIRT 2.49 does not have an explicit {profile.family.value} GenAI "
                 "builder entry; validate generic-factory graph compatibility"
             )
 

@@ -43,10 +43,10 @@ class PreflightTests(unittest.TestCase):
         )
 
     def _sdk(self, root: Path) -> Path:
-        sdk = root / "2.48.0.260626"
+        sdk = root / "2.49.0.260730"
         (sdk / "lib" / "python").mkdir(parents=True)
         (sdk / "sdk.yaml").write_text(
-            "product: QAIRT\nversion: 2.48.0\nbuild_id: 260626120635\n",
+            "product: QAIRT\nversion: 2.49.0\nbuild_id: 260730134355\n",
             encoding="utf-8",
         )
         htp = (
@@ -61,7 +61,7 @@ class PreflightTests(unittest.TestCase):
         )
         htp.mkdir(parents=True)
         (htp / "htp_v2.json").write_text(
-            json.dumps({"soc_model_to_arch": {"SM8850": "v81"}}),
+            json.dumps({"soc_model_to_arch": {"SM8750": "v79"}}),
             encoding="utf-8",
         )
         return sdk
@@ -73,22 +73,24 @@ class PreflightTests(unittest.TestCase):
                 {
                     "sdk_root": sdk,
                     "target": {
-                        "chipset": "SM8850",
-                        "dsp_arch": "v81",
-                        "soc_model": 660,
+                        "chipset": "SM8750",
+                        "dsp_arch": "v79",
+                        "soc_model": 69,
                     },
                 }
             )
         self.assertTrue(report.ok, report.issues)
-        self.assertEqual(report.soc_model, 660)
+        self.assertEqual(report.soc_model, 69)
 
-    def test_v79_or_implicit_target_is_rejected(self) -> None:
+    def test_mismatched_arch_or_implicit_soc_model_is_rejected(self) -> None:
+        # The right chipset with the wrong architecture, and no soc_model at
+        # all, are both refused: nothing about the target may be implicit.
         with tempfile.TemporaryDirectory() as directory:
             sdk = self._sdk(Path(directory))
             report = self._checker().check(
                 {
                     "sdk_root": sdk,
-                    "target": {"chipset": "SM8850", "dsp_arch": "v79"},
+                    "target": {"chipset": "SM8750", "dsp_arch": "v81"},
                 }
             )
         codes = {issue.code for issue in report.errors}
@@ -245,12 +247,33 @@ class NativeKvTests(unittest.TestCase):
         self.assertIn(NATIVE_KV_DATA_FORMAT, " ".join(report.issues))
 
 
+def _device_configs(kwargs: dict[str, Any]) -> list[Any]:
+    """Mirror the SDK: build one device config per soc_model in soc_details."""
+
+    details = str(kwargs.get("soc_details") or "")
+    fields = dict(
+        part.split(":", 1) for part in details.split(";") if ":" in part
+    )
+    if not fields.get("soc_model") or not fields.get("dsp_arch"):
+        return []
+    return [
+        SimpleNamespace(dsp_arch=fields["dsp_arch"], soc_model=int(model))
+        for model in fields["soc_model"].split("|")
+    ]
+
+
 class FakeCompileConfig:
     created: list["FakeCompileConfig"] = []
+    # Set to simulate the SDK's "could not set soc model for chipset ...
+    # skipping device config creation" path, which leaves the compiler on its
+    # own default target.
+    skip_device_configs = False
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
-        self.device_custom_configs = []
+        self.device_custom_configs = (
+            [] if type(self).skip_device_configs else _device_configs(kwargs)
+        )
         self.mode = None
         self.mode_kwargs = None
         type(self).created.append(self)
@@ -416,7 +439,7 @@ class AdapterTests(unittest.TestCase):
             require_successful_preflight=False,
         )
 
-    def test_compile_weight_sharing_passes_explicit_sm8850_v81(self) -> None:
+    def test_compile_weight_sharing_passes_explicit_sm8750_v79(self) -> None:
         adapter = self._adapter()
         with tempfile.TemporaryDirectory() as directory:
             result = adapter.compile_context(
@@ -425,16 +448,16 @@ class AdapterTests(unittest.TestCase):
                 graph_names=("decoder_ar1", "decoder_ar128"),
                 ar_values=(1, 128),
                 source_kinds=("derived", "derived"),
-                target_soc="SM8850",
-                dsp_arch="v81",
-                soc_model=660,
+                target_soc="SM8750",
+                dsp_arch="v79",
+                soc_model=69,
                 family=FamilyId.QWEN3_DENSE,
                 slice_name="decoder_00",
             )
         config = FakeCompileConfig.created[-1]
         self.assertEqual(config.mode, "weight_sharing")
-        self.assertEqual(config.mode_kwargs["soc_model"], 660)
-        self.assertEqual(config.mode_kwargs["dsp_arch"], "v81")
+        self.assertEqual(config.mode_kwargs["soc_model"], 69)
+        self.assertEqual(config.mode_kwargs["dsp_arch"], "v79")
         self.assertEqual(
             config.mode_kwargs["graph_names"],
             ["decoder_ar1", "decoder_ar128"],
@@ -552,9 +575,9 @@ class AdapterTests(unittest.TestCase):
                     }
                 },
                 "target": {
-                    "chipset": "SM8850",
-                    "dsp_arch": "v81",
-                    "soc_model": 660,
+                    "chipset": "SM8750",
+                    "dsp_arch": "v79",
+                    "soc_model": 69,
                 },
             }
             result = adapter.build_standalone_vit(
@@ -598,9 +621,9 @@ class AdapterTests(unittest.TestCase):
                     }
                 },
                 "target": {
-                    "chipset": "SM8850",
-                    "dsp_arch": "v81",
-                    "soc_model": 660,
+                    "chipset": "SM8750",
+                    "dsp_arch": "v79",
+                    "soc_model": 69,
                 },
             }
             result = adapter.build_standalone_vit(
@@ -628,7 +651,7 @@ class AdapterTests(unittest.TestCase):
             FakeCompileConfig.created[0].kwargs,
             {
                 "backend": "HTP",
-                "soc_details": "chipset:SM8850;dsp_arch:v81;soc_model:660",
+                "soc_details": "chipset:SM8750;dsp_arch:v79;soc_model:69",
                 "data_format_config": None,
                 "profiling_level": "detailed",
             },
@@ -637,7 +660,7 @@ class AdapterTests(unittest.TestCase):
             FakeCompileConfig.created[1].kwargs,
             {
                 "backend": "HTP",
-                "soc_details": "chipset:SM8850;dsp_arch:v81;soc_model:660",
+                "soc_details": "chipset:SM8750;dsp_arch:v79;soc_model:69",
                 "data_format_config": None,
                 "profiling_level": "detailed",
                 "set_output_tensors": ["encoder.layer.0/output"],
@@ -666,9 +689,9 @@ class AdapterTests(unittest.TestCase):
                 graph_names=("ar1", "ar128"),
                 ar_values=(1, 128),
                 source_kinds=("derived", "derived"),
-                target_soc="SM8850",
-                dsp_arch="v81",
-                soc_model=660,
+                target_soc="SM8750",
+                dsp_arch="v79",
+                soc_model=69,
                 family=FamilyId.QWEN3_5,
             )
         self.assertEqual(imports, [])
@@ -683,9 +706,9 @@ class AdapterTests(unittest.TestCase):
                 graph_names=("ar1", "ar128"),
                 ar_values=(1, 128),
                 source_kinds=("derived", "derived"),
-                target_soc="SM8850",
-                dsp_arch="v81",
-                soc_model=660,
+                target_soc="SM8750",
+                dsp_arch="v79",
+                soc_model=69,
                 family=FamilyId.QWEN3_5,
                 slice_name="decoder_00",
                 context_length=4096,
@@ -798,9 +821,9 @@ class AdapterTests(unittest.TestCase):
                 graph_names=("ar1", "ar128"),
                 ar_values=(1, 128),
                 context_length=4096,
-                target_soc="SM8850",
-                dsp_arch="v81",
-                soc_model=660,
+                target_soc="SM8750",
+                dsp_arch="v79",
+                soc_model=69,
                 runtime_validator=lambda _request: Qwen35RuntimeValidationResult(
                     True,
                     True,
@@ -817,9 +840,9 @@ class AdapterTests(unittest.TestCase):
                 graph_names=("ar1", "ar128"),
                 ar_values=(1, 128),
                 source_kinds=("derived", "derived"),
-                target_soc="SM8850",
-                dsp_arch="v81",
-                soc_model=660,
+                target_soc="SM8750",
+                dsp_arch="v79",
+                soc_model=69,
                 family=FamilyId.QWEN3_5,
                 slice_name="decoder_00",
                 context_length=4096,
@@ -828,7 +851,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(len(validation.diagnostic_contexts), 3)
         self.assertTrue(validation.evidence.evidence_id)
 
-    def test_compile_rejects_mixed_slices_and_v79_before_sdk(self) -> None:
+    def test_compile_rejects_mixed_slices_and_wrong_arch_before_sdk(self) -> None:
         adapter = self._adapter()
         with self.assertRaises(QairtConfigurationError):
             adapter.compile_context(
@@ -837,10 +860,37 @@ class AdapterTests(unittest.TestCase):
                 graph_names=("ar1", "ar128"),
                 ar_values=(1, 128),
                 source_kinds=("derived", "derived"),
-                target_soc="SM8850",
-                dsp_arch="v79",
-                soc_model=660,
+                target_soc="SM8750",
+                dsp_arch="v81",
+                soc_model=69,
             )
+        self.assertEqual(self.compiles, [])
+
+    def test_compile_refuses_when_the_sdk_skips_device_config_creation(
+        self,
+    ) -> None:
+        # QAIRT prints "could not set soc model for chipset ... skipping device
+        # config creation" and leaves an empty device-config list, which means
+        # the compile runs on its own defaults -- dsp_arch v79 with soc_model
+        # 69, the exact SM8750 tuple. A value check cannot catch that, so the
+        # empty list has to fail on its own.
+        adapter = self._adapter()
+        FakeCompileConfig.skip_device_configs = True
+        try:
+            with self.assertRaises(QairtConfigurationError) as caught:
+                adapter.compile_context(
+                    [FakeModel("ar1"), FakeModel("ar128")],
+                    output_path="/tmp/unsafe.bin",
+                    graph_names=("decoder_ar1", "decoder_ar128"),
+                    ar_values=(1, 128),
+                    source_kinds=("derived", "derived"),
+                    target_soc="SM8750",
+                    dsp_arch="v79",
+                    soc_model=69,
+                )
+        finally:
+            FakeCompileConfig.skip_device_configs = False
+        self.assertIn("no device configuration", str(caught.exception))
         self.assertEqual(self.compiles, [])
 
     def test_run_and_profile_select_exactly_one_graph(self) -> None:
@@ -1226,7 +1276,7 @@ class GenAIBuilderPackagingTests(unittest.TestCase):
         self.assertIn(
             (
                 "set_targets",
-                ["chipset:SM8850;dsp_arch:v81;soc_model:660"],
+                ["chipset:SM8750;dsp_arch:v79;soc_model:69"],
             ),
             calls,
         )
@@ -1805,8 +1855,8 @@ class GenAIBuilderPackagingTests(unittest.TestCase):
         self.assertEqual(
             target_events,
             [
-                ["chipset:SM8850;dsp_arch:v81;soc_model:660"],
-                ["chipset:SM8850;dsp_arch:v81;soc_model:660"],
+                ["chipset:SM8750;dsp_arch:v79;soc_model:69"],
+                ["chipset:SM8750;dsp_arch:v79;soc_model:69"],
             ],
         )
         workflow_call = next(
@@ -1858,11 +1908,11 @@ class ComposedBuildTests(unittest.TestCase):
             return PreflightReport(
                 issues=(),
                 sdk_root=Path("/sdk"),
-                sdk_version="2.48.0",
-                sdk_build_id="260626120635",
-                target_soc="SM8850",
-                dsp_arch="v81",
-                soc_model=660,
+                sdk_version="2.49.0",
+                sdk_build_id="260730134355",
+                target_soc="SM8750",
+                dsp_arch="v79",
+                soc_model=69,
             )
 
         def ar_convert(self, model_path: str | Path, **kwargs: Any) -> ModelVariantArtifact:
@@ -1969,9 +2019,9 @@ class ComposedBuildTests(unittest.TestCase):
             },
             "quantization": {"mode": "float"},
             "target": {
-                "chipset": "SM8850",
-                "dsp_arch": "v81",
-                "soc_model": 660,
+                "chipset": "SM8750",
+                "dsp_arch": "v79",
+                "soc_model": 69,
             },
         }
 

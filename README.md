@@ -1,7 +1,7 @@
 # QAIRT Agent
 
 `qairt-agent` is a Python-only, agent-native orchestration layer for Qualcomm
-AI Runtime (QAIRT) 2.48 GenAI model preparation, compilation, execution, and
+AI Runtime (QAIRT) 2.49 GenAI model preparation, compilation, execution, and
 diagnostics. It is designed for Claude Code, Codex, and direct Python callers.
 The thin JSON-producing CLI is the primary automation interface; direct Python
 imports are for focused debugging and custom analysis, while MCP is retained as
@@ -31,8 +31,8 @@ The QAIRT worker is pinned by the editable
 
 - Ubuntu 22.04 x86_64
 - Python 3.10
-- QAIRT `2.48.0.260626` (build `260626120635`)
-- HTP target `SM8850 / v81 / soc_model 660`
+- QAIRT `2.49.0.260730` (build `260730134355`)
+- HTP target `SM8750 / v79 / soc_model 69`
 
 The Python package can be imported without QAIRT installed. Operations that
 need the SDK fail with a structured preflight error.
@@ -47,7 +47,7 @@ pip install -e '.[mcp,dev]'
 
 Initialize the repository after unpacking QAIRT beneath `qnn/qnn`. The
 installation root may itself be an SDK or contain a versioned SDK such as
-`qnn/qnn/qairt/2.48.0.260626`; discovery does not move it.
+`qnn/qnn/qairt/2.49.0.260730`; discovery does not move it.
 
 ```bash
 qairt-agent init --root .
@@ -84,7 +84,7 @@ Real-device stages fail closed unless both `QAIRT_AGENT_ADB_SERIAL` and
 `QAIRT_AGENT_ADB_SERVER` are set. Before calling the QAIRT Python API they put
 the context and raw vector artifacts in an integrity-checked, leased sandbox
 under `/data/local/tmp/qairt-agent/`, then clean that exact attempt directory.
-This sandbox is lifecycle/audit evidence; QAIRT 2.48's explicit `Device` object
+This sandbox is lifecycle/audit evidence; QAIRT 2.49's explicit `Device` object
 still performs its own internal runtime deployment because the Python API does
 not expose reuse of that remote sandbox as its execution working directory.
 Native loopback, Docker's `host.docker.internal`, and Apple container's
@@ -137,7 +137,7 @@ There are two intentionally separate build lanes:
   use `GenAIBuilderFactory`. It does not call the low-level build in the same
   invocation, so the model is not compiled twice.
 
-QAIRT 2.48's factory explicitly dispatches Qwen3 MoE. Qwen3.5 is instead
+QAIRT 2.49's factory explicitly dispatches Qwen3 MoE. Qwen3.5 is instead
 pinned to the public `Qwen3_5BuilderHTP.from_pretrained` constructor because
 the factory does not recognize every Qwen3.5/Omni Thinker architecture name.
 Qwen3 Dense uses the SDK's generic HTP builder and is marked as requiring
@@ -245,7 +245,7 @@ an optional SKU overlay; `BuildSpec` is still readable (`to_workflow_spec`). The
 `vit` uses a standalone low-level `qairt.convert -> qairt.compile` lane. The
 `qwen3_5_omni` preset packages a dedicated
 `Qwen3OmniAudioEncoderBuilderHTP` plus a pinned `Qwen3_5BuilderHTP`; it remains
-`runtime_supported=false` because QAIRT 2.48 does not provide validated
+`runtime_supported=false` because QAIRT 2.49 does not provide validated
 end-to-end audio workflow execution. It never aliases the text or audio model
 family. See
 [Native workflow](docs/native-workflow.md) for the journal, presets, worker

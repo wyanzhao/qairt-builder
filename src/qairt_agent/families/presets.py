@@ -127,7 +127,7 @@ QWEN3_VL_PRESET = FamilyPreset(
     output_layout=LOW_LEVEL_OUTPUT_LAYOUT,
     notes=(
         "Reusable ViT/projector components feed the text decoder chain.",
-        "QAIRT 2.48 cannot execute an IMAGE_ENCODER workflow; runtime_supported reflects the SDK.",
+        "QAIRT 2.49 cannot execute an IMAGE_ENCODER workflow; runtime_supported reflects the SDK.",
     ),
 )
 
@@ -195,7 +195,7 @@ QWEN3_5_OMNI_PRESET = FamilyPreset(
     notes=(
         "Packages Qwen3OmniAudioEncoderBuilderHTP and a pinned Qwen3_5BuilderHTP "
         "as AUDIO_ENCODER -> TEXT_GENERATOR components.",
-        "QAIRT 2.48 does not provide validated end-to-end audio workflow execution; "
+        "QAIRT 2.49 does not provide validated end-to-end audio workflow execution; "
         "runtime_supported remains false.",
     ),
 )
@@ -287,7 +287,7 @@ def resolve_workflow(spec: WorkflowSpec) -> ResolvedWorkflow:
 
     if preset.capability_gate is not None:
         raise UnsupportedSdkCapabilityError(
-            f"preset '{preset.preset_id}' is not dispatchable on QAIRT 2.48 "
+            f"preset '{preset.preset_id}' is not dispatchable on QAIRT 2.49 "
             f"({preset.capability_gate}); it must not alias to another family",
             stage="preset",
             details={

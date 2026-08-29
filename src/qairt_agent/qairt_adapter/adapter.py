@@ -1,4 +1,4 @@
-"""QAIRT 2.48 Python-only SDK adapter.
+"""QAIRT 2.49 Python-only SDK adapter.
 
 This module intentionally contains no subprocess integration.  Every SDK
 operation is invoked through a lazily imported Python API so Claude Code/Codex
@@ -158,7 +158,7 @@ class QairtSdkAdapter:
             return self._module_loader(name)
         except (ImportError, ModuleNotFoundError) as error:
             raise QairtSdkImportError(
-                f"cannot import required QAIRT 2.48 Python module {name!r}; "
+                f"cannot import required QAIRT 2.49 Python module {name!r}; "
                 "run preflight and expose <sdk_root>/lib/python to Python"
             ) from error
 
@@ -460,7 +460,8 @@ class QairtSdkAdapter:
             )
         if str(dsp_arch).lower() != PINNED_DSP_ARCH:
             raise QairtConfigurationError(
-                f"dsp_arch must be {PINNED_DSP_ARCH}; QAIRT's v79 fallback is forbidden"
+                f"dsp_arch must be {PINNED_DSP_ARCH} for {PINNED_TARGET_SOC}; "
+                "an implicitly resolved architecture is forbidden"
             )
         if int(soc_model) != PINNED_SOC_MODEL:
             raise QairtConfigurationError(
@@ -978,16 +979,34 @@ class QairtSdkAdapter:
 
     @staticmethod
     def _validate_compiler_target(config: Any) -> None:
+        """Refuse a compile whose resolved device target is not the pinned one.
+
+        An empty device-config list is the SDK's "could not set soc model for
+        chipset ... skipping device config creation" path, which leaves the
+        compiler on its own defaults. Those defaults are ``dsp_arch v79`` with
+        ``soc_model 69`` -- the exact SM8750 tuple -- so a resolved-value check
+        alone cannot tell an intended SM8750 target from a silent fallback.
+        The empty list must therefore fail closed in its own right.
+        """
+
         device_configs = getattr(config, "device_custom_configs", None)
         if not device_configs:
-            return
+            raise QairtConfigurationError(
+                "CompileConfig produced no device configuration for "
+                f"{PINNED_TARGET_SOC}; QAIRT skips device-config creation when "
+                "it cannot resolve the requested SoC and would compile against "
+                "its own default target"
+            )
         for device_config in device_configs:
             soc_model = getattr(device_config, "soc_model", None)
             dsp_arch = getattr(device_config, "dsp_arch", None)
             dsp_value = getattr(dsp_arch, "value", dsp_arch)
             if int(soc_model) != PINNED_SOC_MODEL or str(dsp_value).lower() != PINNED_DSP_ARCH:
                 raise QairtConfigurationError(
-                    "CompileConfig resolved a non-SM8850/V81 target; refusing SDK fallback"
+                    "CompileConfig resolved "
+                    f"{dsp_value}/soc_model {soc_model} instead of the pinned "
+                    f"{PINNED_TARGET_SOC} {PINNED_DSP_ARCH}/soc_model "
+                    f"{PINNED_SOC_MODEL}; refusing an SDK fallback"
                 )
 
     def compile_context(
@@ -1454,7 +1473,7 @@ class QairtSdkAdapter:
         return self._compiled_model(context_binary_path)
 
     def create_device(self, *, serial: str, server: str) -> Any:
-        """Construct the exact Android target expected by QAIRT 2.48.
+        """Construct the exact Android target expected by QAIRT 2.49.
 
         ``CompiledModel(..., device=None)`` means local-host execution, so the
         orchestration layer must never pass the raw environment strings or
@@ -1769,7 +1788,7 @@ class QairtSdkAdapter:
         method never enables the SDK's single-source automatic AR conversion.
 
         Qwen3-VL builds and saves a two-node ``WorkflowContainer`` but records
-        ``runtime_supported=False`` because QAIRT 2.48's
+        ``runtime_supported=False`` because QAIRT 2.49's
         ``WorkflowContainer.get_executor`` cannot execute workflows with an
         ``IMAGE_ENCODER`` node.  This method never probes or invokes that
         unsupported executor.
@@ -1986,7 +2005,7 @@ class QairtSdkAdapter:
         )
         used_factory = True
         if resolved_profile.family is FamilyId.QWEN3_5:
-            # QAIRT 2.48 only lists Qwen3_5ForConditionalGeneration in
+            # QAIRT 2.49 only lists Qwen3_5ForConditionalGeneration in
             # GenAIBuilderFactory.SupportedLLMs.  A standalone Omni Thinker
             # legitimately carries Qwen3_5OmniThinkerForConditionalGeneration,
             # so routing it through the generic factory silently selects the
@@ -2154,13 +2173,13 @@ class QairtSdkAdapter:
             compatibility_mode = "explicit_family_builder"
             compatibility_notes.append(
                 "Qwen3.5 uses the public Qwen3_5BuilderHTP.from_pretrained "
-                "constructor directly because QAIRT 2.48 GenAIBuilderFactory "
+                "constructor directly because QAIRT 2.49 GenAIBuilderFactory "
                 "does not recognize every supported Qwen3.5 architecture name."
             )
         elif factory_support == "generic_fallback":
             compatibility_mode = "generic_fallback_requires_device_validation"
             compatibility_notes.append(
-                "QAIRT 2.48 does not explicitly dispatch this architecture; "
+                "QAIRT 2.49 does not explicitly dispatch this architecture; "
                 "GenAIBuilderFactory selected its generic HTP compatibility path. "
                 "Device golden validation is required before release."
             )
@@ -2174,7 +2193,7 @@ class QairtSdkAdapter:
         runtime_supported = not is_multimodal
         if is_multimodal:
             compatibility_notes.append(
-                "QAIRT 2.48 can build and save this IMAGE_ENCODER -> "
+                "QAIRT 2.49 can build and save this IMAGE_ENCODER -> "
                 "TEXT_GENERATOR WorkflowContainer, but its get_executor() "
                 "rejects IMAGE_ENCODER workflows. Runtime is unsupported."
             )
@@ -2369,7 +2388,7 @@ class QairtSdkAdapter:
     ) -> GenAIContainerBuildResult:
         """Build a Qwen3.5-Omni AUDIO_ENCODER -> TEXT_GENERATOR package.
 
-        The checked-in QAIRT 2.48 SDK has a dedicated
+        The checked-in QAIRT 2.49 SDK has a dedicated
         ``Qwen3OmniAudioEncoderBuilderHTP`` and a Qwen3.5 text builder, but its
         ``WorkflowContainer.get_executor`` does not orchestrate audio.  This
         method therefore packages both SDK containers while explicitly
@@ -2646,7 +2665,7 @@ class QairtSdkAdapter:
         compatibility_notes = (
             "Audio uses Qwen3OmniAudioEncoderBuilderHTP and text uses the pinned "
             "Qwen3_5BuilderHTP; no family aliasing was used.",
-            "QAIRT 2.48 WorkflowContainer.get_executor does not orchestrate its "
+            "QAIRT 2.49 WorkflowContainer.get_executor does not orchestrate its "
             "AUDIO_ENCODER node; the package is buildable but end-to-end audio "
             "runtime is not claimed.",
             "All text ARs use caller-supplied ONNX models and AIMET encodings.",

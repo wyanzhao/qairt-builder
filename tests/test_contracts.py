@@ -235,7 +235,7 @@ def test_nested_source_aliases_vectors_and_full_reference_are_canonical() -> Non
     assert serialized["sources"]["text"]["onnx_path"] == "/models/model.onnx"
     assert "onnx" not in serialized["sources"]["text"]
     assert serialized["vectors"]["mode"] == "provided"
-    assert serialized["target"]["soc_model"] == 660
+    assert serialized["target"]["soc_model"] == 69
 
 
 @pytest.mark.parametrize(

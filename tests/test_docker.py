@@ -229,7 +229,7 @@ def test_build_image_uses_pinned_platform_dockerfile_and_tag(docker_on_path, tmp
         "UBUNTU_VERSION=22.04",
         "PYTHON_VERSION=3.10",
         "QAIRT_DEPENDENCIES_FILE="
-        "docker/requirements-qairt-2.48.0.260626.txt",
+        "docker/requirements-qairt-2.49.0.260730.txt",
         "HARNESS_CONSTRAINTS_FILE=harness/constraints.json",
         "TORCH_VERSION=2.4.1",
     ):
@@ -237,10 +237,10 @@ def test_build_image_uses_pinned_platform_dockerfile_and_tag(docker_on_path, tmp
 
 
 def test_sdk_smoke_argv_mounts_only_sdk_and_import_test_is_offline(tmp_path) -> None:
-    sdk = tmp_path / "qairt" / "2.48.0.260626"
+    sdk = tmp_path / "qairt" / "2.49.0.260730"
     sdk.mkdir(parents=True)
     (sdk / "sdk.yaml").write_text(
-        "version: 2.48.0\nbuild_id: 260626120635\n",
+        "version: 2.49.0\nbuild_id: 260730134355\n",
         encoding="utf-8",
     )
     runner = DockerRunner(image=DockerImageConfig(image_ref="worker:test"))
@@ -276,7 +276,7 @@ def test_sdk_smoke_executes_after_availability_and_image_checks(
 ) -> None:
     sdk = tmp_path / "sdk"
     sdk.mkdir()
-    (sdk / "sdk.yaml").write_text("version: 2.48.0\n", encoding="utf-8")
+    (sdk / "sdk.yaml").write_text("version: 2.49.0\n", encoding="utf-8")
     image_id = "sha256:" + "d" * 64
     executor = FakeExecutor(
         results=[
@@ -310,7 +310,7 @@ def test_sdk_smoke_executes_after_availability_and_image_checks(
 def test_sdk_smoke_fails_closed_on_import_failure(docker_on_path, tmp_path) -> None:
     sdk = tmp_path / "sdk"
     sdk.mkdir()
-    (sdk / "sdk.yaml").write_text("version: 2.48.0\n", encoding="utf-8")
+    (sdk / "sdk.yaml").write_text("version: 2.49.0\n", encoding="utf-8")
     executor = FakeExecutor(
         results=[
             FakeCompleted(stdout=_docker_version()),
@@ -451,14 +451,14 @@ def test_image_provenance_arm64_emulates() -> None:
     config = DockerImageConfig(image_ref="img", digest=digest)
 
     provenance = image_provenance(
-        config, host_arch="arm64", sdk_build="260626120635", adapter_capability="explicit_factory"
+        config, host_arch="arm64", sdk_build="260730134355", adapter_capability="explicit_factory"
     )
 
     assert provenance.emulation is True
     assert provenance.platform_abi == "ubuntu22.04-amd64"
     assert provenance.host_arch == "arm64"
     assert provenance.image_digest == digest
-    assert provenance.sdk_build == "260626120635"
+    assert provenance.sdk_build == "260730134355"
     assert provenance.adapter_capability == "explicit_factory"
 
 

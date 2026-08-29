@@ -188,10 +188,10 @@ def test_image_build_requires_mounted_sdk_api_smoke(tmp_path, monkeypatch) -> No
         ),
         encoding="utf-8",
     )
-    sdk = tmp_path / "qnn" / "qnn" / "qairt" / "2.48.0.260626"
+    sdk = tmp_path / "qnn" / "qnn" / "qairt" / "2.49.0.260730"
     sdk.mkdir(parents=True)
     (sdk / "sdk.yaml").write_text(
-        "version: 2.48.0\nbuild_id: 260626120635\n",
+        "version: 2.49.0\nbuild_id: 260730134355\n",
         encoding="utf-8",
     )
     calls: list[tuple[str, object]] = []
@@ -234,9 +234,9 @@ def test_image_smoke_does_not_rebuild_image(tmp_path, monkeypatch) -> None:
         ),
         encoding="utf-8",
     )
-    sdk = tmp_path / "qnn" / "qnn" / "qairt" / "2.48.0.260626"
+    sdk = tmp_path / "qnn" / "qnn" / "qairt" / "2.49.0.260730"
     sdk.mkdir(parents=True)
-    (sdk / "sdk.yaml").write_text("version: 2.48.0\n", encoding="utf-8")
+    (sdk / "sdk.yaml").write_text("version: 2.49.0\n", encoding="utf-8")
     calls: list[str] = []
 
     monkeypatch.setattr(
@@ -528,10 +528,10 @@ def test_default_spawner_uses_docker_with_sdk_and_adb_mapping(tmp_path, monkeypa
         config_text.replace('backend = "auto"', 'backend = "docker"'),
         encoding="utf-8",
     )
-    sdk = tmp_path / "qnn" / "qnn" / "qairt" / "2.48.0.260626"
+    sdk = tmp_path / "qnn" / "qnn" / "qairt" / "2.49.0.260730"
     sdk.mkdir(parents=True)
     (sdk / "sdk.yaml").write_text(
-        "version: 2.48.0\nbuild_id: 260626120635\n", encoding="utf-8"
+        "version: 2.49.0\nbuild_id: 260730134355\n", encoding="utf-8"
     )
     monkeypatch.setenv("QAIRT_AGENT_ADB_SERIAL", "SERIAL")
     monkeypatch.setenv("QAIRT_AGENT_ADB_SERVER", "localhost:5037")
@@ -603,10 +603,10 @@ def test_default_spawner_uses_apple_container_on_macos_backend(
         ),
         encoding="utf-8",
     )
-    sdk = tmp_path / "qnn" / "qnn" / "qairt" / "2.48.0.260626"
+    sdk = tmp_path / "qnn" / "qnn" / "qairt" / "2.49.0.260730"
     sdk.mkdir(parents=True)
     (sdk / "sdk.yaml").write_text(
-        "version: 2.48.0\nbuild_id: 260626120635\n",
+        "version: 2.49.0\nbuild_id: 260730134355\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("QAIRT_AGENT_ADB_SERIAL", "SERIAL")
@@ -769,10 +769,10 @@ def test_native_spawner_injects_device_provenance_without_image(
         text.replace('backend = "auto"', 'backend = "native"'),
         encoding="utf-8",
     )
-    sdk = tmp_path / "qnn" / "qnn" / "qairt" / "2.48.0.260626"
+    sdk = tmp_path / "qnn" / "qnn" / "qairt" / "2.49.0.260730"
     sdk.mkdir(parents=True)
     (sdk / "sdk.yaml").write_text(
-        "version: 2.48.0\nbuild_id: 260626120635\n",
+        "version: 2.49.0\nbuild_id: 260730134355\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("QAIRT_AGENT_ADB_SERIAL", "NATIVE-SERIAL")
@@ -795,7 +795,7 @@ def test_native_spawner_injects_device_provenance_without_image(
     assert captured["argv"][1:3] == ["-m", "qairt_agent.cli"]
     worker_env = captured["env"]
     assert worker_env["QAIRT_AGENT_WORKER_PROVENANCE"] == "1"
-    assert worker_env["QAIRT_AGENT_SDK_BUILD"] == "260626120635"
+    assert worker_env["QAIRT_AGENT_SDK_BUILD"] == "260730134355"
     assert worker_env["QAIRT_AGENT_PLATFORM_ABI"].startswith("ubuntu22.04-")
     assert (
         worker_env["QAIRT_AGENT_DEVICE_FINGERPRINT"]

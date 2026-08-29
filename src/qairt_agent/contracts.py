@@ -368,9 +368,15 @@ class TargetSpec(FrozenContract):
     """Pinned QAIRT worker and target-device contract."""
 
     backend: Literal["HTP"] = "HTP"
-    chipset: str = "SM8850"
-    dsp_arch: str = "v81"
-    soc_model: Literal[660] = 660
+    chipset: str = Field(
+        default_factory=lambda: load_harness_constraints().target_chipset
+    )
+    dsp_arch: str = Field(
+        default_factory=lambda: load_harness_constraints().target_dsp_arch
+    )
+    soc_model: int = Field(
+        default_factory=lambda: load_harness_constraints().target_soc_model
+    )
     platform: Literal["android", "x86_64_linux"] = "android"
     device_id: str | None = None
     qairt_version: str = Field(
@@ -390,6 +396,21 @@ class TargetSpec(FrozenContract):
         if self.qairt_build_id != constraints.qairt_build_id:
             raise ValueError(
                 f"qairt_build_id must match harness {constraints.qairt_build_id}"
+            )
+        # The target tuple has exactly one reviewed source. Rejecting a
+        # mismatch here rather than at compile time keeps a spec that names
+        # the wrong device from planning as if it were deployable.
+        expected = (
+            constraints.target_chipset,
+            constraints.target_dsp_arch,
+            constraints.target_soc_model,
+        )
+        actual = (self.chipset, self.dsp_arch, self.soc_model)
+        if actual != expected:
+            raise ValueError(
+                "target must match the reviewed harness tuple "
+                f"{expected[0]}/{expected[1]}/soc_model {expected[2]}, got "
+                f"{actual[0]}/{actual[1]}/soc_model {actual[2]}"
             )
         return self
 

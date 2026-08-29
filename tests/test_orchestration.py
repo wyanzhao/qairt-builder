@@ -31,7 +31,7 @@ from qairt_agent.contracts import ToolResult
 from qairt_agent.families.presets import resolve_workflow
 
 PROV = StageProvenance(
-    sdk_build="260626120635",
+    sdk_build="260730134355",
     adapter_capability="explicit_factory",
     platform_abi="ubuntu22.04-x86_64",
     resolved_preset_sha256="p" * 64,

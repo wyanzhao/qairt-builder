@@ -10,10 +10,10 @@ is limited to the QAIRT GenAI Builder and low-level Python APIs; the QAIRT CLI
 and C++ APIs are out of scope.
 
 The QAIRT adapter is pinned by `harness/constraints.json` to QAIRT
-`2.48.0.260626`, build `260626120635`. Any other version is rejected before a
+`2.49.0.260730`, build `260730134355`. Any other version is rejected before a
 transform or build. The same contract owns the worker image, Ubuntu/Python,
 dependency file, and host-runtime CLI versions.
-`SM8850 / HTP v81 / soc_model 660` must resolve explicitly through the SDK.
+`SM8750 / HTP v79 / soc_model 69` must resolve explicitly through the SDK.
 The canonical target fields are `chipset`, `dsp_arch`, and `soc_model`. There is
 no V79 or default-SoC fallback.
 
@@ -184,7 +184,7 @@ validation/benchmarking fails closed. Callers may explicitly select a
 components, and vision-only execution requires its own vectors. The framework
 does not claim an unproven end-to-end ImageT2T execution path.
 
-QAIRT 2.48's factory explicitly dispatches Qwen3 MoE. Qwen3.5 and Omni Thinker
+QAIRT 2.49's factory explicitly dispatches Qwen3 MoE. Qwen3.5 and Omni Thinker
 bind the public `Qwen3_5BuilderHTP.from_pretrained` constructor directly
 because the factory does not recognize every supported architecture name. The
 canonical Qwen3 Dense preset remains low-level and requires device golden
@@ -212,7 +212,7 @@ contexts and vectors in a leased, content-verified ADB audit sandbox, executes
 every named graph through an explicit QAIRT Android `Device`, writes reopenable
 comparison reports, hashes those reports, and then mints invocation-scoped
 evidence. The sandbox does not replace QAIRT's own internal runtime deployment;
-QAIRT 2.48 exposes no Python working-directory override for that reuse. The
+QAIRT 2.49 exposes no Python working-directory override for that reuse. The
 request cannot authorize compilation by supplying boolean evidence.
 
 The canonical Qwen3.5 and Omni Thinker GenAI build instead records the public

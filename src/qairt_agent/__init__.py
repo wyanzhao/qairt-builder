@@ -1,4 +1,4 @@
-"""Agent-native orchestration for QAIRT 2.48.
+"""Agent-native orchestration for QAIRT 2.49.
 
 Two public layers:
 

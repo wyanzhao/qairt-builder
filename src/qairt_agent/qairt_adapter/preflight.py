@@ -1,4 +1,4 @@
-"""Fail-fast QAIRT 2.48 Linux host and target validation."""
+"""Fail-fast QAIRT 2.49 Linux host and target validation."""
 
 from __future__ import annotations
 
@@ -109,7 +109,7 @@ def _target_mapping(path: Path, target_soc: str) -> str | None:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    # QAIRT 2.48 places this mapping at the top level.  Recursion keeps the
+    # QAIRT 2.49 places this mapping at the top level.  Recursion keeps the
     # check stable if a patched SDK wraps backend-aware configuration in a
     # nested object, while still requiring an actual dictionary mapping.
     pending: list[Any] = [document]

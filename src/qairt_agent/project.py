@@ -574,7 +574,7 @@ class DoctorCheck:
 
 
 def doctor(project_root: str | Path) -> dict[str, Any]:
-    """Verify SDK metadata, QAIRT 2.48 capability, host ABI, and target.
+    """Verify SDK metadata, QAIRT 2.49 capability, host ABI, and target.
 
     Honest by design: on a host without ``./qnn/qnn`` or the selected worker
     runtime the relevant checks report ``ok=False`` with guidance rather than

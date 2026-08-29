@@ -241,7 +241,7 @@ def create_server(
     server = FastMCP(
         "qairt-agent",
         instructions=(
-            "Asynchronous QAIRT 2.48 workflow jobs. Submit a job and poll/watch it by id; "
+            "Asynchronous QAIRT 2.49 workflow jobs. Submit a job and poll/watch it by id; "
             "the journal persists state, events, and verified stage receipts."
             if not legacy
             else "DEPRECATED synchronous QAIRT tools; prefer the asynchronous submit_job/get_job API."
