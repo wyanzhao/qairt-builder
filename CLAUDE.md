@@ -5,6 +5,38 @@ maintainers. Prefer the `qairt-agent` CLI for normal work. Import
 `QairtAgent` only for focused debugging or custom analysis; MCP is a
 compatibility surface, not the primary automation interface.
 
+## Program scope and plan
+
+Long-horizon work is organized as agent-executable tasks under
+[`docs/plan/`](docs/plan/README.md): pick one task, execute it against its
+acceptance criteria, update its status. This file describes **current**
+behavior only; planned changes live in the task files until they land, then
+their behavior descriptions move here in the same change.
+
+Settled program decisions (2026-08-29; details and rationale in
+`docs/plan/README.md`):
+
+- **Primary model: Qwen3.5** (hybrid/linear attention) through the GenAI
+  Builder lane, built from two independent exports — AR1 and AR128 ONNX +
+  AIMET encodings — at context length 4096, split policy per GenAI Builder
+  defaults. **Secondary: Qwen3 dense/MoE** through the low-level lane from one
+  wide export (for example AR2073/CL4096) with AR/CL conversion.
+- Golden vectors come from the AIMET-quantized model as trusted local pickle
+  and are imported into immutable per-AR manifests before use.
+- Measurement scope: tensor-level SQNR/RMSE/cosine; warmed production wall
+  latency plus optrace attribution; static artifact footprint as the only RAM
+  metric. An ONNX Runtime float-graph second reference is a **debug-only**
+  mode: slice-boundary comparison has landed (T04 tier 1), layer-level
+  drilldown has not. Neither is ever a default, and neither alters production
+  reports.
+- Hardware: SM8850 and SM8750 through a reviewed target registry (T02). Until
+  T02 lands, the single pinned target below stands. The SDK pin moves to QAIRT
+  2.49.0.260730 with T01; until then the 2.48 pin stands.
+- **Out of scope by decision** — do not build or claim: direct Genie API
+  integration, power/thermal measurement, token-level accuracy metrics,
+  end-to-end Omni audio runtime, end-to-end Qwen3-VL multimodal execution.
+- All landed documentation and code are English-only.
+
 ## Non-negotiable boundaries
 
 - Use only QAIRT Python APIs: the GenAI Builder Python API and the low-level
@@ -114,7 +146,8 @@ Canonical examples live in `examples/`. Run `qairt-agent plan` after changing a
 spec; the resolved JSON must show the expected `pipeline`, AR policy, native-KV
 policy, and output layout before starting a build. `examples/README.md` states
 which examples are normal CLI workflows and which capability-gated or legacy
-files must not be treated as production templates.
+files must not be treated as production templates. Deployable model x target
+spec cells land under `configs/` with T03.
 
 ## Input and transformation contract
 
@@ -280,6 +313,9 @@ Do not hand-edit `docker/.generated/`; rerun `init` or `image build`. Keep the
 managed `.dockerignore` block last so `qnn/`, models, artifacts, and model
 payloads cannot be re-included by earlier user rules.
 
+The SDK installation root `qnn/qnn` may be a symlink to a real install
+elsewhere; discovery and container mounts must resolve it (T01 verifies this).
+
 For an upgrade:
 
 1. Change `harness/constraints.json` in one reviewable patch.
@@ -292,7 +328,8 @@ For an upgrade:
 6. Update examples and capability claims only after those gates pass.
 
 Do not relax a version mismatch into a warning. Until a new SDK is proven,
-preflight must fail closed.
+preflight must fail closed. The next planned upgrade is
+[T01](docs/plan/T01-sdk-upgrade-2.49.md) to QAIRT 2.49.0.260730.
 
 ## Development checks
 
@@ -306,4 +343,6 @@ Use small targeted tests while editing, then run:
 Preserve unrelated workspace changes. Use `apply_patch` for hand edits. Avoid
 committing generated contexts, SDK contents under `qnn/`, device dumps, caches,
 or secrets. When behavior changes, update the typed contract, CLI plan output,
-canonical example, tests, and documentation together.
+canonical example, tests, and documentation together — including the
+`docs/plan/` status board when the change completes a task. `AGENTS.md` is a
+symlink to this file; edit only `CLAUDE.md`.
