@@ -12,12 +12,42 @@ from .types import NativeKvAuditReport, NativeKvGraphExpectation
 
 NATIVE_KV_DATA_FORMAT = "QNN_TENSOR_DATA_FORMAT_HMX_WEIGHT_LAYOUT"
 
+# QAIRT emits KV outputs in the native HMX layout only for graphs whose AR is a
+# positive multiple of 32; every other graph carries inputs alone.  Source:
+# QAIRT 2.49.0.260730 ``qairt/gen_ai_api/builders/gen_ai_utils.py``
+# ``gen_kv_format_config``: ``is_multiple_of_32 = ar is not None and ar > 0 and
+# ar % 32 == 0``.
+_HMX_OUTPUT_AR_MULTIPLE = 32
+
+# The SDK selects cache tensors with a bare ``"key" in name or "value" in name``
+# substring test.  We keep that inclusion rule so the generated config stays
+# compatible with the compiler, but subtract names whose role vocabulary proves
+# they are not caches: marking a padding mask or a position index as an HMX
+# weight layout would silently corrupt it, and linear-attention recurrent/conv
+# state is not a KV cache at all.
+_KV_NAME_TOKENS = ("key", "value")
+_NON_CACHE_ROLE_TOKENS = (
+    "recurrent_state",
+    "conv_state",
+    "mask",
+    "padding",
+    "position",
+    "index",
+    "length",
+    "scale",
+    "offset",
+)
+
+
+def _has_hmx_kv_outputs(ar: int) -> bool:
+    return ar > 0 and ar % _HMX_OUTPUT_AR_MULTIPLE == 0
+
 
 def _is_kv_name(name: str) -> bool:
     normalized = name.lower()
-    return ("key" in normalized or "value" in normalized) and not (
-        "recurrent_state" in normalized or "conv_state" in normalized
-    )
+    if not any(token in normalized for token in _KV_NAME_TOKENS):
+        return False
+    return not any(token in normalized for token in _NON_CACHE_ROLE_TOKENS)
 
 
 def _load_config(config: str | Path | Mapping[str, Any]) -> Mapping[str, Any]:
@@ -42,7 +72,11 @@ def build_native_kv_config(
     for expectation in expectations:
         input_names = tuple(name for name in expectation.input_names if _is_kv_name(name))
         output_names = tuple(name for name in expectation.output_names if _is_kv_name(name))
-        selected = input_names + output_names if expectation.ar % 32 == 0 else input_names
+        selected = (
+            input_names + output_names
+            if _has_hmx_kv_outputs(expectation.ar)
+            else input_names
+        )
         if selected:
             graphs.append(
                 {
@@ -128,7 +162,7 @@ def audit_native_kv_config(
         expected_outputs = tuple(name for name in expectation.output_names if _is_kv_name(name))
         expected_tensors = (
             expected_inputs + expected_outputs
-            if expectation.ar % 32 == 0
+            if _has_hmx_kv_outputs(expectation.ar)
             else expected_inputs
         )
         actual = graph_tensors.get(expectation.graph_name, ())

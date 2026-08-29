@@ -2163,6 +2163,34 @@ def test_genai_builder_saved_container_auto_benchmarks_with_public_executor(
     )
 
 
+def test_genai_benchmark_rejects_low_level_chain_keys(
+    tmp_path: Path,
+) -> None:
+    factory = FakeAdapterFactory()
+    agent = _fake_agent(factory)
+    plan = agent.plan(_make_spec(tmp_path), offline=True)
+    assert plan.manifest is not None
+
+    conflicted = agent.benchmark(
+        plan.manifest.path,
+        plan.manifest.sha256,
+        config={
+            "container_path": tmp_path / "container",
+            "prompt": [{"role": "user", "content": "hello"}],
+            "steps": [{"slice": "decoder", "inputs": {}}],
+            "warmup_runs": 0,
+            "measured_runs": 1,
+            "aa_calibration": False,
+        },
+    )
+
+    assert not conflicted.ok
+    assert conflicted.error is not None
+    assert conflicted.error.code is ErrorCode.INVALID_SPEC
+    assert "low-level slice-chain configuration" in conflicted.error.message
+    assert conflicted.error.details["conflicting_keys"] == ["steps"]
+
+
 def test_standalone_vit_uses_only_low_level_convert_compile_lane(
     tmp_path: Path,
 ) -> None:
@@ -2628,6 +2656,48 @@ def test_validate_accepts_run_graph_output_manifest_without_section_override(
     assert validated.data is not None
     assert validated.data["first_chain_error"] is None
     assert validated.data["observations"][0]["device_chain"]["status"] == "exact"
+
+
+def test_validate_records_device_evidence_only_for_a_device_stage(
+    tmp_path: Path,
+) -> None:
+    vector = _vector_case(tmp_path)
+    factory = FakeAdapterFactory()
+    agent = _fake_agent(factory)
+    plan = agent.plan(_make_spec(tmp_path), offline=True)
+    assert plan.manifest is not None
+
+    offline = agent.validate(
+        plan.manifest.path,
+        plan.manifest.sha256,
+        config={
+            "references": {
+                "decoder": {"tap": np.array([1.0, 2.0], dtype=np.float32)}
+            },
+            "device_chain_outputs": {
+                "decoder": {"tap": np.array([1.0, 2.0], dtype=np.float32)}
+            },
+        },
+    )
+    assert offline.ok and offline.manifest is not None
+    offline_metrics = _load_run(offline.manifest).stages[-1].metrics
+    assert "device_identifier" not in offline_metrics
+    assert "remote_cleanup" not in offline_metrics
+
+    on_device = agent.validate(
+        offline.manifest.path,
+        offline.manifest.sha256,
+        config={
+            "context_path": tmp_path / "main.bin",
+            "graph_name": "main_ar1",
+            "vector_manifest": vector,
+        },
+    )
+    assert on_device.ok, on_device.error
+    assert on_device.manifest is not None
+    device_metrics = _load_run(on_device.manifest).stages[-1].metrics
+    assert device_metrics["device_identifier"] == "TEST@localhost:5037"
+    assert device_metrics["remote_cleanup"] == "confirmed"
 
 
 def test_validate_benchmark_and_diagnoses_publish_report_only_artifacts(

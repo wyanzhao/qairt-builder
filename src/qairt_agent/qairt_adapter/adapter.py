@@ -420,12 +420,25 @@ class QairtSdkAdapter:
         input_list: str | Path | None = None,
         **options: Any,
     ) -> QuantizedModelArtifact:
-        """Run the standalone QAIRT DLC quantizer Python module."""
+        """Run the standalone QAIRT DLC quantizer Python module.
+
+        DEPRECATED. Production input for this program is always AIMET
+        encodings applied through ``apply_encodings``; the standalone
+        quantizer is reachable only from the deprecated expert MCP surface and
+        is retained for debugging a calibration-based comparison.
+
+        ``dump_encoding_json`` defaults to ``True`` here because the SDK leaves
+        ``QuantizerOutputConfig.encoding_json`` unset otherwise (QAIRT 2.49
+        ``qti/aisw/tools/core/modules/converter/quantizer_module.py``), which
+        would make ``QuantizedModelArtifact.encodings_path`` permanently
+        ``None``. Pass it explicitly to override.
+        """
 
         self._ensure_ready()
         quantizer_module = self._load_module(
             "qti.aisw.tools.core.modules.converter.quantizer_module"
         )
+        options.setdefault("dump_encoding_json", True)
         config = quantizer_module.QuantizerInputConfig(
             input_dlc=str(input_dlc),
             output_dlc=str(output_dlc),

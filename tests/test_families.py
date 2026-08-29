@@ -79,18 +79,66 @@ class SplitPlanTests(unittest.TestCase):
             split_lm_head=True,
         )
         self.assertEqual(plan.num_splits, 5)
+        # split_llm folds layer 6 into the lm_head split, so only 6 layers are
+        # distributed across the three decoder slices.
         self.assertEqual(
             [(item.layer_start, item.layer_end) for item in plan.decoder_slices],
-            [(0, 3), (3, 5), (5, 7)],
+            [(0, 2), (2, 4), (4, 6)],
         )
+        self.assertEqual(plan.folded_lm_head_layer, 6)
         self.assertEqual(
             plan.to_qairt_kwargs(),
             {"num_splits": 5, "split_embedding": True, "split_lm_head": True},
         )
 
+    def test_lm_head_split_folds_the_final_decoder_layer(self) -> None:
+        # QAIRT 2.49 llm_splitter pops the last post-FFN residual add before it
+        # distributes boundaries: 28 layers over 4 decoder splits becomes
+        # 7/7/7/6 with layer 27 folded into the lm_head split.
+        plan = build_split_plan(
+            28,
+            decoder_slices=4,
+            split_embedding=True,
+            split_lm_head=True,
+        )
+        self.assertEqual(
+            [item.layer_count for item in plan.decoder_slices],
+            [7, 7, 7, 6],
+        )
+        self.assertEqual(
+            [(item.layer_start, item.layer_end) for item in plan.decoder_slices],
+            [(0, 7), (7, 14), (14, 21), (21, 27)],
+        )
+        self.assertEqual(plan.distributed_decoder_layers, 27)
+        self.assertEqual(plan.folded_lm_head_layer, 27)
+        self.assertEqual(plan.num_splits, 6)
+
+    def test_without_lm_head_split_every_layer_stays_in_a_decoder_slice(
+        self,
+    ) -> None:
+        plan = build_split_plan(
+            28,
+            decoder_slices=4,
+            split_embedding=True,
+            split_lm_head=False,
+        )
+        self.assertEqual(
+            [item.layer_count for item in plan.decoder_slices],
+            [7, 7, 7, 7],
+        )
+        self.assertEqual(plan.distributed_decoder_layers, 28)
+        self.assertIsNone(plan.folded_lm_head_layer)
+
     def test_reject_more_decoder_slices_than_layers(self) -> None:
         with self.assertRaises(ValueError):
             build_split_plan(2, decoder_slices=3)
+
+    def test_reject_decoder_slices_beyond_the_distributed_layers(self) -> None:
+        # 4 layers with a folded lm_head leaves only 3 distributable layers.
+        build_split_plan(4, decoder_slices=3, split_lm_head=True)
+        with self.assertRaises(ValueError) as caught:
+            build_split_plan(4, decoder_slices=4, split_lm_head=True)
+        self.assertIn("split_llm distributes", str(caught.exception))
 
 
 class FamilyConfigTests(unittest.TestCase):

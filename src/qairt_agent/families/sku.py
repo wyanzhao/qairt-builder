@@ -64,6 +64,8 @@ def merge_sku(preset: FamilyPreset, sku: SkuOverlay | None) -> dict[str, object]
 
 
 def _boundaries_from_split_plan(split_plan: SplitPlan) -> tuple[SliceBoundary, ...]:
+    # Every slice that owns decoder layers is captured, including the lm_head
+    # split when ``split_llm`` folds the final layer into it.
     return tuple(
         SliceBoundary(
             slice_id=slice_spec.name,
@@ -71,7 +73,7 @@ def _boundaries_from_split_plan(split_plan: SplitPlan) -> tuple[SliceBoundary, .
             layer_end=slice_spec.layer_end,
         )
         for slice_spec in split_plan.slices
-        if slice_spec.kind.value == "decoder"
+        if slice_spec.layer_start is not None and slice_spec.layer_end is not None
     )
 
 

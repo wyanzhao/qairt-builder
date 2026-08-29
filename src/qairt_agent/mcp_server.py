@@ -209,10 +209,23 @@ def _register_legacy_tools(server: Any) -> None:
         expert.__name__ = stage_method
         return expert
 
+    # Stages that are deprecated beyond the legacy surface itself: production
+    # quantization is always AIMET ``apply_encodings``, so the standalone
+    # quantizer survives only as a debugging comparison.
+    extra_deprecation_notes = {
+        "qairt_quantize": (
+            " Standalone calibration quantization is not a production path; "
+            "supply AIMET encodings through apply_encodings instead."
+        ),
+    }
+
     for tool_name, method_name in expert_tools:
         server.tool(
             name=tool_name,
-            description=f"DEPRECATED expert synchronous QAIRT stage: {method_name}.",
+            description=(
+                f"DEPRECATED expert synchronous QAIRT stage: {method_name}."
+                + extra_deprecation_notes.get(tool_name, "")
+            ),
         )(make_expert(method_name))
 
 

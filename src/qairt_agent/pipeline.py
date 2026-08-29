@@ -97,6 +97,16 @@ _OUTPUT_ONLY_CONFIG_FIELDS = {
 }
 _EXECUTION_ATTEMPT_METADATA = "_qairt_agent_execution_attempt"
 
+# Low-level slice-chain keys. The GenAI lane drives its container through the
+# public executor and exposes raw slices only under ``tensor_runtime``, so these
+# top-level keys are never executable there.
+_LOW_LEVEL_CHAIN_CONFIG_FIELDS = (
+    "routes",
+    "contexts",
+    "steps",
+    "initial_native_state",
+)
+
 
 def _jsonable(value: Any) -> Any:
     """Convert public values to JSON without traversing live SDK objects."""
@@ -1527,6 +1537,45 @@ class QairtAgent:
         effective["component"] = component
         effective["coverage"] = expected_coverage
         return effective
+
+    @staticmethod
+    def _reject_genai_chain_keys(
+        effective: Mapping[str, Any],
+        *,
+        stage: str,
+    ) -> None:
+        """Fail closed when a GenAI run carries low-level chain keys.
+
+        The GenAI branch executes the saved container and reads raw slices from
+        ``tensor_runtime``; a top-level ``routes``/``steps`` pair would be
+        silently ignored or crash the optrace path instead of measuring what the
+        caller asked for.
+        """
+
+        if not (
+            effective.get("lane") == "genai_builder"
+            or effective.get("container_path") is not None
+        ):
+            return
+        conflicting = [
+            key
+            for key in _LOW_LEVEL_CHAIN_CONFIG_FIELDS
+            if effective.get(key) is not None
+        ]
+        if not conflicting:
+            return
+        raise InvalidSpecError(
+            "GenAI container execution cannot be combined with low-level "
+            "slice-chain configuration; drop these keys or select the "
+            "low-level lane explicitly",
+            stage=stage,
+            details={
+                "conflicting_keys": conflicting,
+                "container_path": effective.get("container_path"),
+                "lane": effective.get("lane"),
+                "raw_slice_profiling": "stage_configs.benchmark.tensor_runtime",
+            },
+        )
 
     @staticmethod
     def _initial_native_state_from_routes(
@@ -4598,6 +4647,8 @@ class QairtAgent:
             full_reference_actual: dict[str, dict[str, np.ndarray]] | None = None
             slice_reference_refs: tuple[ArtifactRef, ...] = ()
             slice_reference_audit: list[dict[str, Any]] = []
+            device_identifier: Any | None = None
+            remote_attempt_dir: Any | None = None
 
             teacher = (
                 self._slice_tensor_tree(
@@ -4976,7 +5027,7 @@ class QairtAgent:
                 "executed_modes": list(mode_reports),
                 "divergence_observed": divergence_observed,
             }
-            if "device_identifier" in locals():
+            if device_identifier is not None:
                 metrics.update(
                     {
                         "device_identifier": device_identifier,
@@ -5227,6 +5278,7 @@ class QairtAgent:
                 effective,
                 stage="benchmark",
             )
+            self._reject_genai_chain_keys(effective, stage="benchmark")
 
             spec = manifest.build_spec
             optrace_enabled = bool(

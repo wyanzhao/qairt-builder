@@ -163,6 +163,74 @@ class NativeKvTests(unittest.TestCase):
             ["past_value_0_in", "past_value_0_out"],
         )
 
+    def test_unknown_ar_keeps_outputs_out_of_the_hmx_layout(self) -> None:
+        # A slice artifact without an AR reaches the expectation as ar=0.  The
+        # SDK guards its multiple-of-32 test with ``ar > 0``; without that guard
+        # 0 % 32 == 0 would wrongly mark output tensors.
+        expectations = (
+            NativeKvGraphExpectation(
+                "decoder_unknown_ar",
+                0,
+                ("past_key_0_in",),
+                ("past_key_0_out",),
+            ),
+        )
+        config = build_native_kv_config(expectations)
+        self.assertEqual(
+            [
+                tensor["tensor_name"]
+                for tensor in config["graphs"][0]["tensors"]
+            ],
+            ["past_key_0_in"],
+        )
+        self.assertTrue(
+            audit_native_kv_config(config, expectations=expectations).ok
+        )
+
+    def test_non_cache_role_names_are_never_marked(self) -> None:
+        expectations = (
+            NativeKvGraphExpectation(
+                "decoder_ar128",
+                128,
+                (
+                    "past_key_0_in",
+                    "key_padding_mask",
+                    "value_position_index",
+                    "recurrent_state_0_in",
+                ),
+                ("past_key_0_out",),
+            ),
+        )
+        config = build_native_kv_config(expectations)
+        self.assertEqual(
+            [
+                tensor["tensor_name"]
+                for tensor in config["graphs"][0]["tensors"]
+            ],
+            ["past_key_0_in", "past_key_0_out"],
+        )
+        swept_in = {
+            "graphs": [
+                {
+                    "graph_name": "decoder_ar128",
+                    "tensors": [
+                        {
+                            "tensor_name": name,
+                            "dataFormat": NATIVE_KV_DATA_FORMAT,
+                        }
+                        for name in (
+                            "past_key_0_in",
+                            "key_padding_mask",
+                            "past_key_0_out",
+                        )
+                    ],
+                }
+            ]
+        }
+        report = audit_native_kv_config(swept_in, expectations=expectations)
+        self.assertFalse(report.ok)
+        self.assertIn("key_padding_mask", " ".join(report.issues))
+
     def test_wrong_layout_is_rejected(self) -> None:
         config = {
             "graphs": [
@@ -945,6 +1013,77 @@ class AdapterTests(unittest.TestCase):
         )
         self.assertEqual(graph.connections, (("imageEncoder", "textGenerator"),))
         self.assertEqual(graph.nodes[0].role, "image")
+
+    def _quantizer_module(self, captured: list[Any]) -> Any:
+        class QuantizerInputConfig:
+            def __init__(self, **kwargs: Any) -> None:
+                self.__dict__.update(kwargs)
+                captured.append(kwargs)
+
+        class QAIRTQuantizer:
+            @staticmethod
+            def quantize(config: Any) -> Any:
+                # Mirrors the SDK: encoding_json is populated only when the
+                # caller asked for the dump.
+                encoding_json = (
+                    Path(config.output_dlc).with_name(
+                        Path(config.output_dlc).stem + "_encoding.json"
+                    )
+                    if getattr(config, "dump_encoding_json", False)
+                    else None
+                )
+                return SimpleNamespace(
+                    dlc_output=config.output_dlc,
+                    encoding_json=encoding_json,
+                )
+
+        return SimpleNamespace(
+            QuantizerInputConfig=QuantizerInputConfig,
+            QAIRTQuantizer=QAIRTQuantizer,
+        )
+
+    def test_standalone_quantizer_dumps_encodings_by_default(self) -> None:
+        captured: list[Any] = []
+        adapter = self._adapter(
+            {
+                "qti.aisw.tools.core.modules.converter.quantizer_module": (
+                    self._quantizer_module(captured)
+                )
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = adapter.quantize(
+                root / "in.dlc",
+                output_dlc=root / "out.dlc",
+                input_list=root / "inputs.txt",
+            )
+
+        self.assertTrue(captured[0]["dump_encoding_json"])
+        self.assertIsNotNone(artifact.encodings_path)
+        assert artifact.encodings_path is not None
+        self.assertEqual(artifact.encodings_path.name, "out_encoding.json")
+
+    def test_standalone_quantizer_honours_an_explicit_dump_override(self) -> None:
+        captured: list[Any] = []
+        adapter = self._adapter(
+            {
+                "qti.aisw.tools.core.modules.converter.quantizer_module": (
+                    self._quantizer_module(captured)
+                )
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = adapter.quantize(
+                root / "in.dlc",
+                output_dlc=root / "out.dlc",
+                input_list=root / "inputs.txt",
+                dump_encoding_json=False,
+            )
+
+        self.assertFalse(captured[0]["dump_encoding_json"])
+        self.assertIsNone(artifact.encodings_path)
 
 
 class GenAIBuilderPackagingTests(unittest.TestCase):

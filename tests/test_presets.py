@@ -355,7 +355,16 @@ def test_capture_sku_binds_sha_and_boundaries(tmp_path) -> None:
     assert sku.architecture == "Qwen3ForCausalLM"
     assert sku.tensor_abi["byte_order"] == "little"
     assert sku.tensor_abi["layout"] == "C"
-    assert len(sku.slice_boundaries) == 2
+    # Two decoder splits over 7 distributed layers, plus the lm_head split that
+    # split_llm folds the final layer into.
+    assert [
+        (item.slice_id, item.layer_start, item.layer_end)
+        for item in sku.slice_boundaries
+    ] == [
+        ("decoder_00", 0, 4),
+        ("decoder_01", 4, 7),
+        ("lm_head", 7, 8),
+    ]
     assert sku.captured_at is not None
 
 

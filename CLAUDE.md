@@ -131,13 +131,21 @@ The canonical inputs are:
 For a low-level LLM build the explicit stage order is model inspection,
 test-vector preparation, AR/CL conversion, semantic model split, MHA2SHA,
 converter, optional standalone quantizer, and context-binary generation.
+The standalone quantizer is deprecated for this program — production input is
+always AIMET `apply_encodings` — and survives only as a debugging comparison.
 Weight sharing packages the exact AR set `{1, 128}` per semantic slice.
 For a wider source such as AR2073/CL4096, the build exports independent
 AR1/AR128 ONNX and AIMET-encoding artifacts and target-ABI vector manifests;
 supplied compatible goldens win, otherwise ORT capture is recorded.
-Embedding, decoder slices, and LM head retain explicit boundaries. Native KV
-must preserve exact tensor names, graph routing, shape/layout, and CL
-alignment.
+Embedding, decoder slices, and LM head retain explicit boundaries. The planned
+boundaries reproduce `split_llm` exactly: with `split_lm_head` the final decoder
+layer is folded into the lm_head split, so `N-1` layers are distributed across
+the decoder slices with the remainder front-loaded, and captured slice
+boundaries record the folded layer instead of losing it. Native KV must
+preserve exact tensor names, graph routing, shape/layout, and CL alignment; it
+marks key/value cache tensors only, never mask/position-style tensors that
+merely share a substring, and marks output tensors only for a graph whose AR is
+a positive multiple of 32.
 
 GenAI Builder owns its internal transform/convert/quantize/compile sequence;
 do not invoke the low-level build behind it. Qwen3.5 production specs supply
