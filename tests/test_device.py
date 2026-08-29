@@ -25,6 +25,7 @@ from qairt_agent.device import (
     remote_attempt_dir,
     require_healthy,
 )
+from qairt_agent.device.doctor import _free_space_kb
 from qairt_agent.errors import (
     ArtifactIntegrityError,
     DeviceUnavailableError,
@@ -1208,9 +1209,11 @@ def test_device_runtime_releases_empty_lease_when_record_fails(tmp_path) -> None
 # device_doctor
 # --------------------------------------------------------------------------- #
 
+# Real output from an SM8750 device (Android 15): df names the filesystem by
+# its own mount point, /data/user/0, not the path that was queried.
 DF_OK = (
-    "Filesystem 1K-blocks Used Available Use% Mounted on\n"
-    "/dev/block/x 100G 10G 90G 10% /data/local/tmp\n"
+    "Filesystem       1K-blocks     Used Available Use% Mounted on\n"
+    "/dev/block/dm-72 231436288 41870032 189435184  19% /data/user/0\n"
 )
 
 
@@ -1225,6 +1228,33 @@ def _doctor_handler(devices_stdout, *, state="device", state_rc=0, df_stdout=DF_
         return FakeCompleted()
 
     return handler
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        # SM8750 / Android 15 toybox: the mount point is not the queried path.
+        (DF_OK, 189435184),
+        # Legacy Android layout: Free is still the fourth column.
+        (
+            "Filesystem               Size     Used     Free   Blksize\n"
+            "/data                  200.0G    10.0G   190.0G   4096\n",
+            190 * 1024 * 1024,
+        ),
+        # A long filesystem name wraps onto its own line.
+        (
+            "Filesystem     1K-blocks     Used Available Use% Mounted on\n"
+            "/dev/block/mapper/an-extremely-long-dm-name\n"
+            "               231436288 41870032 189435184  19% /data/user/0\n",
+            189435184,
+        ),
+        ("", None),
+    ],
+)
+def test_free_space_parses_real_df_layouts(stdout, expected) -> None:
+    executor = FakeExecutor(handler=_doctor_handler("", df_stdout=stdout))
+
+    assert _free_space_kb(AdbClient(CONFIG, command_executor=executor)) == expected
 
 
 def test_device_doctor_healthy_and_require_healthy_passes() -> None:

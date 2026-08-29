@@ -86,23 +86,47 @@ def _parse_size_kb(token: str) -> int | None:
         return None
 
 
+_FREE_SPACE_COLUMNS = ("available", "avail", "free")
+
+
 def _free_space_kb(client: AdbClient) -> int | None:
     """Best-effort parse of ``df /data/local/tmp`` available space (KB).
 
-    Handles both the Android (``Filesystem Size Used Free Blksize``) and toybox
-    (``Filesystem 1K-blocks Used Available Use% Mounted``) layouts, where the
-    available/free value is the 4th whitespace-separated field of the data line.
+    ``df PATH`` reports the filesystem *containing* the path, and names it by
+    its own mount point -- on Android 15 that is ``/data/user/0``, not the
+    queried path -- so the data line is found by position, never by matching
+    the path back. The available column is located from the header to cover
+    both the Android (``Filesystem Size Used Free Blksize``) and toybox
+    (``Filesystem 1K-blocks Used Available Use% Mounted on``) layouts, and a
+    ``df`` that wraps a long filesystem name onto its own line.
     """
 
     result = client.shell("df /data/local/tmp")
-    for raw_line in (getattr(result, "stdout", "") or "").splitlines():
-        if "/data/local/tmp" not in raw_line:
+    lines = [
+        line for line in (getattr(result, "stdout", "") or "").splitlines() if line.strip()
+    ]
+    column = 3
+    data_lines = lines
+    for index, line in enumerate(lines):
+        tokens = [token.lower() for token in line.split()]
+        if not tokens or tokens[0] != "filesystem":
             continue
-        fields = raw_line.split()
-        if len(fields) >= 4:
-            parsed = _parse_size_kb(fields[3])
-            if parsed is not None:
-                return parsed
+        for position, token in enumerate(tokens):
+            if token in _FREE_SPACE_COLUMNS:
+                column = position
+                break
+        data_lines = lines[index + 1:]
+        break
+
+    for line in data_lines:
+        fields = line.split()
+        # A wrapped filesystem name leaves the numbers on the next line, one
+        # field short of the header's alignment.
+        for candidate in (column, column - 1):
+            if 0 <= candidate < len(fields):
+                parsed = _parse_size_kb(fields[candidate])
+                if parsed is not None:
+                    return parsed
     return None
 
 
