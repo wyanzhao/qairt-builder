@@ -13,9 +13,11 @@ import json
 import os
 import re
 import sys
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 
@@ -188,6 +190,66 @@ class VectorManifest:
                 else None
             ),
         )
+
+
+def _external_data_paths(model: Any, model_path: Path) -> tuple[Path, ...]:
+    """Return the external initializer files a loaded model proto references."""
+
+    resolved: set[Path] = set()
+    for tensor in model.graph.initializer:
+        metadata = {
+            str(item.key): str(item.value)
+            for item in getattr(tensor, "external_data", ())
+        }
+        location = metadata.get("location")
+        if not location:
+            continue
+        external = Path(location)
+        if not external.is_absolute():
+            external = model_path.parent / external
+        resolved.add(external.resolve())
+    return tuple(sorted(resolved))
+
+
+@contextmanager
+def _instrumented_model_source(
+    model: Any,
+    model_path: Path,
+    external_data: Sequence[str],
+) -> Iterator[Any]:
+    """Yield something ``InferenceSession`` accepts for an instrumented model.
+
+    A self-contained model is handed over as bytes.  A model with external data
+    must be materialized *beside the original* so its relative initializer
+    locations still resolve; that temporary file is always removed. If the
+    model's directory is not writable the mode fails closed rather than
+    silently running a graph with missing weights.
+    """
+
+    payload = model.SerializeToString()
+    if not external_data:
+        yield payload
+        return
+
+    try:
+        handle, temporary_name = tempfile.mkstemp(
+            prefix=f".{model_path.stem}.float-reference.",
+            suffix=".onnx",
+            dir=model_path.parent,
+        )
+    except OSError as error:
+        raise PermissionError(
+            "the float reference model uses external data, so an instrumented "
+            "copy must be written next to it, but "
+            f"{model_path.parent} is not writable: {error}"
+        ) from error
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+        yield os.fspath(temporary_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 class VectorPreparer:
@@ -528,6 +590,103 @@ class VectorPreparer:
                 "reference_output_names": list(selected),
             },
         )
+
+    @staticmethod
+    def onnx_producible_tensor_names(
+        model_path: str | os.PathLike[str],
+    ) -> frozenset[str]:
+        """Return every tensor name a graph can expose as an output."""
+
+        import onnx
+
+        model = onnx.load(os.fspath(Path(model_path).expanduser().resolve()), load_external_data=False)
+        graph = model.graph
+        names = {
+            *(item.name for item in graph.input),
+            *(item.name for item in graph.output),
+            *(item.name for item in graph.initializer),
+        }
+        for node in graph.node:
+            names.update(str(name) for name in node.output if name)
+        return frozenset(names)
+
+    @staticmethod
+    def capture_onnx_float_activations(
+        model_path: str | os.PathLike[str],
+        inputs: Mapping[str, np.ndarray],
+        tensor_names: Sequence[str],
+        *,
+        providers: Sequence[str] = ("CPUExecutionProvider",),
+    ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+        """Run a float ONNX graph and capture named internal activations.
+
+        The requested names are promoted to graph outputs in an in-memory copy
+        of the model; the file on disk is never modified.  A name that no node
+        in the graph produces is an error, not a silent omission: the caller is
+        expected to have resolved the name mapping already and to report
+        anything it could not map.
+
+        Returns the captured values and the provenance an auditable report
+        needs (model hash, ORT version, providers, promoted names).
+        """
+
+        import onnx
+        import onnxruntime as ort
+
+        resolved_model = Path(model_path).expanduser().resolve()
+        requested = tuple(dict.fromkeys(str(name) for name in tensor_names))
+        if not requested:
+            raise ValueError("float activation capture requires at least one tensor name")
+
+        model = onnx.load(os.fspath(resolved_model), load_external_data=False)
+        graph = model.graph
+        existing_outputs = {item.name for item in graph.output}
+        producible = {
+            *(item.name for item in graph.input),
+            *(item.name for item in graph.initializer),
+        }
+        for node in graph.node:
+            producible.update(str(name) for name in node.output if name)
+        unknown = [name for name in requested if name not in producible | existing_outputs]
+        if unknown:
+            raise KeyError(
+                "float reference tensors are not present in the graph: " f"{sorted(unknown)}"
+            )
+
+        promoted = [name for name in requested if name not in existing_outputs]
+        for name in promoted:
+            graph.output.append(onnx.helper.make_empty_tensor_value_info(name))
+
+        external_data = [
+            os.fspath(item)
+            for item in _external_data_paths(model, resolved_model)
+        ]
+        with _instrumented_model_source(model, resolved_model, external_data) as source:
+            session = ort.InferenceSession(source, providers=list(providers))
+            session_inputs = {item.name for item in session.get_inputs()}
+            missing_inputs = sorted(session_inputs - set(inputs))
+            if missing_inputs:
+                raise KeyError(
+                    "float reference run is missing graph inputs: " f"{missing_inputs}"
+                )
+            feeds = {
+                name: np.asarray(value)
+                for name, value in inputs.items()
+                if name in session_inputs
+            }
+            values = session.run(list(requested), feeds)
+
+        provenance = {
+            "reference_source": "onnxruntime_float",
+            "reference_model_path": os.fspath(resolved_model),
+            "reference_model_sha256": sha256_file(resolved_model),
+            "reference_model_external_data": external_data,
+            "onnxruntime_version": str(getattr(ort, "__version__", "unknown")),
+            "onnxruntime_providers": list(providers),
+            "captured_tensors": list(requested),
+            "promoted_tensors": promoted,
+        }
+        return dict(zip(requested, values)), provenance
 
     @classmethod
     def write_input_list(

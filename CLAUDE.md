@@ -182,6 +182,20 @@ with ONNX Runtime and records that fallback, model hash, ORT version, and
 providers in the immutable report. A manifest with neither usable goldens nor
 inputs fails closed; ORT never replaces supplied goldens.
 
+A second ONNX Runtime reference is available as an explicit **debug-only** mode:
+`stage_configs.validation.float_reference` runs the float source graph and
+compares it against the device slice boundaries. It is off unless that config
+is present, requires an explicit single `ar`, requires a device chain run, and
+publishes a separate `float_reference_report` artifact plus a `float_reference`
+block — the supplied-golden comparison is untouched and remains the production
+reference. Internal activations are promoted to outputs in an in-memory copy of
+the graph; the model on disk is never rewritten. A device tensor binds to a
+float tensor only by an exact name match or an explicit
+`float_reference.tensor_map` entry; everything else is listed in
+`unmapped_tensors` rather than guessed, and a run that can bind nothing fails
+closed. Only `granularity="slice_boundary"` is implemented; layer-level
+drilldown needs executed diagnostic contexts and is not available yet.
+
 When no custom graph/routes/outputs or explicit `stage_configs.*.ar` override
 is present, low-level validation and benchmarking execute every AR requested by
 the spec. Each AR is bound to its exact graph and

@@ -233,6 +233,52 @@ normalized, content-addressed `optrace_evidence` artifact. Thread-cycle records
 use the maximum overlapping thread value rather than a sum, and all per-op
 claims remain reported work attribution rather than additive wall latency.
 
+### Float-graph reference (debug only)
+
+`stage_configs.validation.float_reference` adds a second reference beside the
+supplied AIMET goldens: the float source graph, run under ONNX Runtime, compared
+against the device slice boundaries. It exists for attributing a divergence to
+quantization versus backend, and it is **never** on by default.
+
+```json
+"stage_configs": {
+  "validation": {
+    "ar": 1,
+    "float_reference": {
+      "granularity": "slice_boundary",
+      "ar": 1,
+      "model_path": "/models/qwen3/ar1-cl4096/model.onnx",
+      "tensor_map": {"decoder_00": {"decoder_00_output_0": "/model/layers.6/Add_1_output_0"}}
+    }
+  }
+}
+```
+
+Rules the mode enforces:
+
+- Absent config, validation behaves exactly as before — no extra artifact, and
+  the stage metric `float_reference_debug` reads `false`.
+- It is single-AR: `float_reference.ar` is required and must agree with the AR
+  the run is bound to.
+- It needs device chain outputs; there is nothing to compare without them.
+- Boundary names bind by exact match or by an explicit `tensor_map` entry.
+  Anything else is reported in `unmapped_tensors`, never approximated, and a run
+  that binds nothing fails closed rather than reporting a partial picture.
+- Internal activations are promoted to graph outputs in an in-memory copy. The
+  ONNX file on disk is never modified. A model with external data needs its
+  directory to be writable, because the instrumented copy must sit beside the
+  side-car files for their relative locations to resolve; the copy is always
+  removed afterwards.
+- The result is published as its own `float_reference_report` artifact and a
+  `float_reference` block in the validation payload, carrying model SHA, ORT
+  version, providers, promoted tensor names, and
+  `claim_scope: "first_observed_divergence_not_root_cause"`. The
+  supplied-golden report is unchanged.
+
+Only `granularity: "slice_boundary"` is implemented. Layer-level drilldown
+requires executing the diagnostic contexts the build already produces, which is
+not wired up yet; requesting it fails closed.
+
 ### Benchmark sampling and token accounting
 
 Sampling policy is lane-aware. The low-level lane measures 10 warmup and 50

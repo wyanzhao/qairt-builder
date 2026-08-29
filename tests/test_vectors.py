@@ -105,3 +105,77 @@ def test_manifest_loader_accepts_artifact_like_object(tmp_path: Path) -> None:
     )
 
     assert preparer.load_manifest(artifact).case_id == "artifact-ref"
+
+
+def _external_data_model(directory: Path) -> Path:
+    """A float graph whose initializers live in a side-car data file."""
+
+    import onnx
+    from onnx import TensorProto, helper
+
+    directory.mkdir(parents=True, exist_ok=True)
+    weights = np.full((64,), 2.0, dtype=np.float32)
+    graph = helper.make_graph(
+        [
+            helper.make_node("Add", ["x", "bias"], ["h0"], name="layer0"),
+            helper.make_node("Identity", ["h0"], ["y"], name="head"),
+        ],
+        "external-data",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [64])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [64])],
+        initializer=[
+            # raw=True: only raw_data tensors are eligible for external storage.
+            helper.make_tensor(
+                "bias", TensorProto.FLOAT, [64], weights.tobytes(), raw=True
+            )
+        ],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_operatorsetid("", 18)],
+    )
+    model.ir_version = 9
+    path = directory / "model.onnx"
+    onnx.save_model(
+        model,
+        path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location="external-data.bin",
+        size_threshold=0,
+    )
+    return path
+
+
+def test_float_capture_resolves_external_data_and_restores_the_directory(
+    tmp_path: Path,
+) -> None:
+    model = _external_data_model(tmp_path / "model")
+    before = sorted(item.name for item in model.parent.iterdir())
+    assert "external-data.bin" in before
+
+    values, provenance = VectorPreparer.capture_onnx_float_activations(
+        model,
+        {"x": np.ones((64,), dtype=np.float32)},
+        ["h0"],
+    )
+
+    np.testing.assert_allclose(values["h0"], np.full((64,), 3.0, dtype=np.float32))
+    assert provenance["reference_source"] == "onnxruntime_float"
+    assert provenance["promoted_tensors"] == ["h0"]
+    assert [Path(item).name for item in provenance["reference_model_external_data"]] == [
+        "external-data.bin"
+    ]
+    # The instrumented copy written beside the model is always cleaned up.
+    assert sorted(item.name for item in model.parent.iterdir()) == before
+
+
+def test_producible_tensor_names_include_internal_activations(
+    tmp_path: Path,
+) -> None:
+    model = _external_data_model(tmp_path / "model")
+
+    names = VectorPreparer.onnx_producible_tensor_names(model)
+
+    assert {"x", "bias", "h0", "y"} <= names
+    assert "not_a_tensor" not in names

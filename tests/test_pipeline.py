@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 import numpy as np
 import onnx
+import pytest
 from onnx import TensorProto, helper
 
 from qairt_agent.artifacts import ManifestStore, verify_artifact
@@ -2162,6 +2163,231 @@ def test_genai_builder_saved_container_auto_benchmarks_with_public_executor(
         name == "profile" and details["graph_name"] == "decoder_ar128"
         for _, name, details in factory.log.calls
     )
+
+
+def _float_reference_onnx(path: Path) -> Path:
+    """A two-layer float graph whose internal activations are not outputs."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    graph = helper.make_graph(
+        [
+            helper.make_node("Add", ["x", "one"], ["h0"], name="layer0"),
+            helper.make_node("Mul", ["h0", "two"], ["h1"], name="layer1"),
+            helper.make_node("Identity", ["h1"], ["y"], name="head"),
+        ],
+        "float-reference",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2])],
+        initializer=[
+            helper.make_tensor("one", TensorProto.FLOAT, [2], [1.0, 1.0]),
+            helper.make_tensor("two", TensorProto.FLOAT, [2], [2.0, 2.0]),
+        ],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_operatorsetid("", 18)],
+    )
+    model.ir_version = 9
+    onnx.save_model(model, path)
+    return path
+
+
+def _float_reference_validate(
+    tmp_path: Path,
+    *,
+    device_chain_outputs: Mapping[str, Mapping[str, Any]],
+    float_reference: Mapping[str, Any] | None,
+) -> Any:
+    vector = _vector_case(
+        tmp_path,
+        inputs={"x": np.array([3.0, 4.0], dtype=np.float32)},
+        goldens={"y": np.array([8.0, 10.0], dtype=np.float32)},
+        case_id="float-reference",
+    )
+    agent = _fake_agent(FakeAdapterFactory())
+    plan = agent.plan(_make_spec(tmp_path), offline=True)
+    assert plan.manifest is not None
+    config: dict[str, Any] = {
+        # The production golden comparison always covers exactly the device
+        # tensors under test, so a float-reference assertion is never masked by
+        # an unrelated SQNR shape error.
+        "references": {
+            name: {tensor: np.asarray(value) for tensor, value in tensors.items()}
+            for name, tensors in device_chain_outputs.items()
+        },
+        "device_chain_outputs": {
+            name: dict(tensors) for name, tensors in device_chain_outputs.items()
+        },
+        "vector_manifest": vector,
+    }
+    if float_reference is not None:
+        config["float_reference"] = dict(float_reference)
+    return agent.validate(plan.manifest.path, plan.manifest.sha256, config=config)
+
+
+def test_validation_without_the_debug_config_publishes_no_float_reference(
+    tmp_path: Path,
+) -> None:
+    validated = _float_reference_validate(
+        tmp_path,
+        device_chain_outputs={
+            "decoder": {"h1": np.array([8.0, 10.0], dtype=np.float32)}
+        },
+        float_reference=None,
+    )
+
+    assert validated.ok, validated.error
+    assert validated.data is not None and validated.manifest is not None
+    assert "float_reference" not in validated.data
+    manifest = _load_run(validated.manifest)
+    assert manifest.stages[-1].metrics["float_reference_debug"] is False
+    assert not [
+        ref
+        for ref in manifest.artifacts
+        if (ref.logical_name or "").startswith("float_reference")
+    ]
+
+
+def test_float_reference_compares_device_boundaries_with_the_float_graph(
+    tmp_path: Path,
+) -> None:
+    model = _float_reference_onnx(tmp_path / "float" / "two_layer.onnx")
+
+    validated = _float_reference_validate(
+        tmp_path,
+        device_chain_outputs={
+            # h1 on the float graph is (3+1)*2, (4+1)*2 = 8, 10.
+            "decoder": {"h1": np.array([8.0, 10.25], dtype=np.float32)}
+        },
+        float_reference={"ar": 1, "model_path": model},
+    )
+
+    assert validated.ok, validated.error
+    assert validated.data is not None and validated.manifest is not None
+    report = validated.data["float_reference"]
+    assert report["mode"] == "debug_only"
+    assert report["policy"] == "report_only"
+    assert report["reference_source"] == "onnxruntime_float"
+    assert report["granularity"] == "slice_boundary"
+    assert report["ar"] == 1
+    assert report["unmapped_tensors"] == []
+    # h1 is an internal activation, so it had to be promoted to an output.
+    assert report["promoted_tensors"] == ["h1"]
+    assert report["reference_model_path"] == str(model)
+    assert report["onnxruntime_providers"] == ["CPUExecutionProvider"]
+
+    observation = report["observations"][0]
+    assert (observation["slice"], observation["tensor"]) == ("decoder", "h1")
+    assert observation["float_tensor"] == "h1"
+    assert observation["quality"]["status"] == "measured"
+    assert observation["quality"]["max_abs_error"] == pytest.approx(0.25)
+
+    # The production golden comparison is untouched and still first-class.
+    assert validated.data["reference_source"] == "provided"
+    manifest = _load_run(validated.manifest)
+    assert manifest.stages[-1].metrics["float_reference_debug"] is True
+    published = json.loads(
+        next(
+            ref.path
+            for ref in manifest.artifacts
+            if ref.logical_name == "float_reference_report"
+        ).read_text(encoding="utf-8")
+    )
+    assert published == report
+
+    # The model on disk is never rewritten by the promotion.
+    assert [item.name for item in onnx.load(str(model)).graph.output] == ["y"]
+
+
+def test_float_reference_lists_unmapped_boundaries_instead_of_guessing(
+    tmp_path: Path,
+) -> None:
+    model = _float_reference_onnx(tmp_path / "float" / "two_layer.onnx")
+
+    validated = _float_reference_validate(
+        tmp_path,
+        device_chain_outputs={
+            "decoder": {
+                "h1": np.array([8.0, 10.0], dtype=np.float32),
+                "decoder_00_out_0": np.array([1.0, 1.0], dtype=np.float32),
+            }
+        },
+        float_reference={"ar": 1, "model_path": model},
+    )
+
+    assert validated.ok, validated.error
+    assert validated.data is not None
+    report = validated.data["float_reference"]
+    assert [item["tensor"] for item in report["observations"]] == ["h1"]
+    assert report["unmapped_tensors"] == [
+        {
+            "slice": "decoder",
+            "tensor": "decoder_00_out_0",
+            "attempted_float_tensor": "decoder_00_out_0",
+            "reason": (
+                "no exact name match in the float graph and no tensor_map entry"
+            ),
+        }
+    ]
+
+
+def test_float_reference_uses_an_explicit_tensor_map(tmp_path: Path) -> None:
+    model = _float_reference_onnx(tmp_path / "float" / "two_layer.onnx")
+
+    validated = _float_reference_validate(
+        tmp_path,
+        device_chain_outputs={
+            "decoder": {"decoder_00_out_0": np.array([4.0, 5.0], dtype=np.float32)}
+        },
+        float_reference={
+            "ar": 1,
+            "model_path": model,
+            "tensor_map": {"decoder": {"decoder_00_out_0": "h0"}},
+        },
+    )
+
+    assert validated.ok, validated.error
+    assert validated.data is not None
+    report = validated.data["float_reference"]
+    observation = report["observations"][0]
+    assert observation["float_tensor"] == "h0"
+    # h0 is exactly 3+1, 4+1 on the float graph.
+    assert observation["quality"]["status"] == "exact"
+    assert report["unmapped_tensors"] == []
+
+
+def test_float_reference_fails_closed_on_debug_misuse(tmp_path: Path) -> None:
+    model = _float_reference_onnx(tmp_path / "float" / "two_layer.onnx")
+    outputs = {"decoder": {"h1": np.array([8.0, 10.0], dtype=np.float32)}}
+
+    missing_ar = _float_reference_validate(
+        tmp_path / "a",
+        device_chain_outputs=outputs,
+        float_reference={"model_path": model},
+    )
+    assert not missing_ar.ok and missing_ar.error is not None
+    assert missing_ar.error.code is ErrorCode.INVALID_SPEC
+    assert "single-AR debug mode" in missing_ar.error.message
+
+    layerwise = _float_reference_validate(
+        tmp_path / "b",
+        device_chain_outputs=outputs,
+        float_reference={"ar": 1, "model_path": model, "granularity": "layer"},
+    )
+    assert not layerwise.ok and layerwise.error is not None
+    assert layerwise.error.code is ErrorCode.INVALID_SPEC
+    assert "slice_boundary" in layerwise.error.message
+
+    nothing_mappable = _float_reference_validate(
+        tmp_path / "c",
+        device_chain_outputs={
+            "decoder": {"unknown_tensor": np.array([1.0, 1.0], dtype=np.float32)}
+        },
+        float_reference={"ar": 1, "model_path": model},
+    )
+    assert not nothing_mappable.ok and nothing_mappable.error is not None
+    assert nothing_mappable.error.code is ErrorCode.INVALID_SPEC
+    assert "never guessed" in nothing_mappable.error.message
 
 
 def _genai_spec(tmp_path: Path, **overrides: Any) -> BuildSpec:

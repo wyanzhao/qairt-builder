@@ -45,7 +45,7 @@ from qairt_agent.contracts import (
     utc_now,
 )
 from qairt_agent.diagnostics.latency import LatencyDiagnoser
-from qairt_agent.diagnostics.sqnr import QualityDiagnoser
+from qairt_agent.diagnostics.sqnr import QualityDiagnoser, compute_tensor_quality
 from qairt_agent.device import DeviceRuntime
 from qairt_agent.errors import ErrorCode, InvalidSpecError, ToolErrorData
 from qairt_agent.errors import ManifestConflictError
@@ -1737,6 +1737,192 @@ class QairtAgent:
         effective["component"] = component
         effective["coverage"] = expected_coverage
         return effective
+
+    def _float_reference_report(
+        self,
+        manifest: RunManifest,
+        effective: Mapping[str, Any],
+        *,
+        device_outputs: Mapping[str, Mapping[str, Any]] | None,
+        output_dir: Path,
+        report_suffix: str,
+    ) -> tuple[dict[str, Any], tuple[ArtifactRef, ...]]:
+        """Compare device slice boundaries against an ONNX Runtime float run.
+
+        Debug-only. Nothing here runs unless
+        ``stage_configs.validation.float_reference`` is present, and the result
+        is published beside the production report rather than replacing any
+        part of it: the AIMET golden comparison remains the production
+        reference.
+        """
+
+        config = effective.get("float_reference")
+        if config is None:
+            return {}, ()
+        if not isinstance(config, Mapping):
+            raise InvalidSpecError(
+                "stage_configs.validation.float_reference must be an object",
+                stage="validate",
+            )
+
+        granularity = str(config.get("granularity", "slice_boundary"))
+        if granularity != "slice_boundary":
+            raise InvalidSpecError(
+                "only the slice_boundary float reference granularity is "
+                "implemented; layer-level drilldown needs executed diagnostic "
+                "contexts",
+                stage="validate",
+                details={"requested_granularity": granularity},
+            )
+        if config.get("ar") is None:
+            raise InvalidSpecError(
+                "the float reference is a single-AR debug mode: set an "
+                "explicit float_reference.ar",
+                stage="validate",
+            )
+        requested_ar = int(config["ar"])
+        bound_ar = effective.get("ar")
+        if bound_ar is not None and int(bound_ar) != requested_ar:
+            raise InvalidSpecError(
+                "float_reference.ar must match the AR the validation run is "
+                "bound to",
+                stage="validate",
+                details={
+                    "float_reference_ar": requested_ar,
+                    "runtime_binding_ar": int(bound_ar),
+                },
+            )
+        if not device_outputs:
+            raise InvalidSpecError(
+                "the float reference compares device slice boundaries, so it "
+                "requires a device chain run; supply routes/contexts or "
+                "device_chain_outputs",
+                stage="validate",
+            )
+        if effective.get("vector_manifest") is None:
+            raise InvalidSpecError(
+                "the float reference must be fed the same inputs as the "
+                "device run; no vector manifest is bound",
+                stage="validate",
+            )
+
+        model_path = (
+            config.get("model_path")
+            or effective.get("reference_model_path")
+            or manifest.build_spec.sources.text.onnx_path
+        )
+        resolved_model = Path(str(model_path)).expanduser().resolve()
+        if not resolved_model.is_file():
+            raise InvalidSpecError(
+                "the float reference model does not exist",
+                stage="validate",
+                details={"model_path": os.fspath(resolved_model)},
+            )
+
+        supplied_map = config.get("tensor_map") or {}
+        if not isinstance(supplied_map, Mapping):
+            raise InvalidSpecError(
+                "float_reference.tensor_map must be an object",
+                stage="validate",
+            )
+
+        def mapped_name(slice_name: str, tensor_name: str) -> str | None:
+            nested = supplied_map.get(slice_name)
+            if isinstance(nested, Mapping) and tensor_name in nested:
+                return str(nested[tensor_name])
+            direct = supplied_map.get(tensor_name)
+            if isinstance(direct, str):
+                return direct
+            return None
+
+        producible = VectorPreparer.onnx_producible_tensor_names(resolved_model)
+        pairs: list[tuple[str, str, str]] = []
+        unmapped: list[dict[str, Any]] = []
+        for slice_name, tensors in device_outputs.items():
+            for tensor_name in tensors:
+                explicit = mapped_name(str(slice_name), str(tensor_name))
+                candidate = explicit if explicit is not None else str(tensor_name)
+                if candidate in producible:
+                    pairs.append((str(slice_name), str(tensor_name), candidate))
+                    continue
+                unmapped.append(
+                    {
+                        "slice": str(slice_name),
+                        "tensor": str(tensor_name),
+                        "attempted_float_tensor": candidate,
+                        "reason": (
+                            "explicit tensor_map entry is not produced by the "
+                            "float graph"
+                            if explicit is not None
+                            else "no exact name match in the float graph and no "
+                            "tensor_map entry"
+                        ),
+                    }
+                )
+        if not pairs:
+            raise InvalidSpecError(
+                "no device boundary tensor could be bound to the float graph; "
+                "supply float_reference.tensor_map — boundary names are never "
+                "guessed",
+                stage="validate",
+                details={"unmapped_tensors": unmapped},
+            )
+
+        inputs = self._manifest_inputs(
+            effective["vector_manifest"],
+            section=str(effective.get("input_section", "inputs")),
+            sha256=effective.get("vector_manifest_sha256"),
+        )
+        providers = tuple(
+            str(item) for item in config.get("providers", ("CPUExecutionProvider",))
+        )
+        captured, provenance = VectorPreparer.capture_onnx_float_activations(
+            resolved_model,
+            inputs,
+            [float_name for _, _, float_name in pairs],
+            providers=providers,
+        )
+
+        floor = float(effective.get("reference_energy_floor", 0.0))
+        observations: list[dict[str, Any]] = []
+        for slice_name, tensor_name, float_name in pairs:
+            quality = compute_tensor_quality(
+                captured[float_name],
+                device_outputs[slice_name][tensor_name],
+                reference_energy_floor=floor,
+            )
+            observations.append(
+                {
+                    "slice": slice_name,
+                    "tensor": tensor_name,
+                    "float_tensor": float_name,
+                    "quality": quality.to_dict(),
+                }
+            )
+
+        payload = {
+            "schema": "qairt-agent.float-reference-report/1",
+            "mode": "debug_only",
+            "policy": "report_only",
+            "granularity": granularity,
+            "ar": requested_ar,
+            "claim_scope": "first_observed_divergence_not_root_cause",
+            "comparison": "device_chain_vs_onnxruntime_float_graph",
+            "tensor_map": {
+                slice_name: {tensor_name: float_name}
+                for slice_name, tensor_name, float_name in pairs
+            },
+            "unmapped_tensors": unmapped,
+            "observations": observations,
+            **provenance,
+        }
+        report_ref = atomic_publish_json(
+            output_dir / f"float_reference_report{report_suffix}.json",
+            payload,
+            kind=ArtifactKind.REPORT,
+            logical_name=f"float_reference_report{report_suffix}",
+        )
+        return payload, (report_ref,)
 
     @staticmethod
     def _build_static_footprint(manifest: RunManifest) -> dict[str, Any] | None:
@@ -5166,6 +5352,15 @@ class QairtAgent:
             ]
             payload["executed_modes"] = list(mode_reports)
             payload["mode_reports"] = mode_reports
+            float_reference, float_reference_refs = self._float_reference_report(
+                manifest,
+                effective,
+                device_outputs=chain,
+                output_dir=output_dir,
+                report_suffix=report_suffix,
+            )
+            if float_reference:
+                payload["float_reference"] = float_reference
             if slice_reference_audit:
                 payload["slice_reference_evidence"] = slice_reference_audit
             divergence_observed = any(
@@ -5255,6 +5450,7 @@ class QairtAgent:
                 ],
                 "executed_modes": list(mode_reports),
                 "divergence_observed": divergence_observed,
+                "float_reference_debug": bool(float_reference),
             }
             if device_identifier is not None:
                 metrics.update(
@@ -5266,7 +5462,10 @@ class QairtAgent:
                 )
             return (
                 payload,
-                tuple(reference_refs) + slice_reference_refs + (report_ref,),
+                tuple(reference_refs)
+                + slice_reference_refs
+                + float_reference_refs
+                + (report_ref,),
                 metrics,
             )
 

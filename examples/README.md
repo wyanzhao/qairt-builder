@@ -20,6 +20,7 @@ them point at mounted files in your project.
 | `qwen3_5.json` | GenAI Builder | independent AR1/AR128 ONNX+encodings and validation manifest per AR | `/artifacts/qwen3.5` |
 | `qwen3_5_omni_thinker.json` | GenAI Builder text lane | independent Thinker AR1/AR128 ONNX+encodings and validation manifest per AR | `/artifacts/qwen3.5-omni-thinker` |
 | `qwen3_5_omni.json` | GenAI Builder packaging | Thinker AR1/AR128 plus audio ONNX+encodings; validation manifest per text AR | `/artifacts/qwen3.5-omni` |
+| `qwen3_dense_float_reference_debug.json` | low-level Python API (**debug only**) | same as `qwen3_dense.json` plus the AR-matching float ONNX | `/artifacts/qwen3-float-reference-debug` |
 
 `qwen3_5_omni.json` is build/package-only on the pinned SDK because its preset
 sets `runtime_supported=false`; do not run the default validate/benchmark
@@ -39,6 +40,18 @@ and AIMET-encoding artifacts, then writes target-ABI raw vector manifests under
 the run's vector directory. Supplied target-compatible goldens win; when
 retargeting makes them incompatible, ONNX Runtime captures new per-AR goldens
 and records why.
+
+`qwen3_dense_float_reference_debug.json` is a **debug-only** variant of
+`qwen3_dense.json`, not a production template. It adds
+`stage_configs.validation.float_reference`, which runs the float source ONNX
+under ONNX Runtime and compares the device slice boundaries against it. The
+mode is single-AR by construction, never enabled by default, and its report is
+published beside — never instead of — the AIMET golden comparison. Copy the
+block into your own spec only while investigating a divergence, and remove it
+before a production run: `tensor_map` names must come from the transform
+lineage of your exact export, because a boundary name is never guessed. Any
+device tensor it cannot bind by an exact name match is listed under
+`unmapped_tensors` rather than silently dropped.
 
 `legacy/qwen3_5_low_level_experimental.json` preserves an old direct low-level
 experiment for single-source Qwen3.5 AR rewriting. Files under `legacy/` are
