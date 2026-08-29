@@ -2163,6 +2163,185 @@ def test_genai_builder_saved_container_auto_benchmarks_with_public_executor(
     )
 
 
+def _footprint_bytes_on_disk(footprint: Mapping[str, Any]) -> int:
+    return sum(Path(item["path"]).stat().st_size for item in footprint["artifacts"])
+
+
+def test_build_publishes_a_static_footprint_measured_from_disk(
+    tmp_path: Path,
+) -> None:
+    factory = FakeAdapterFactory()
+    agent = _fake_agent(factory)
+
+    built = agent.build(_make_spec(tmp_path))
+
+    assert built.ok, built.error
+    assert built.data is not None and built.manifest is not None
+    footprint = built.data["static_footprint"]
+    assert footprint["policy"] == "report_only"
+    assert footprint["unit"] == "bytes"
+
+    for item in footprint["artifacts"]:
+        assert item["bytes"] == Path(item["path"]).stat().st_size
+    assert _footprint_bytes_on_disk(footprint) == sum(
+        item["bytes"] for item in footprint["artifacts"]
+    )
+
+    contexts = [
+        item for item in footprint["artifacts"] if item["role"] == "context"
+    ]
+    assert contexts and all(item["slice_name"] == "decoder_00" for item in contexts)
+    assert footprint["contexts_total_bytes"] == sum(
+        item["bytes"] for item in contexts
+    )
+    # Converted DLCs are reported but are build intermediates, so the headline
+    # total covers only what the device has to hold.
+    assert footprint["converted_models_total_bytes"] > 0
+    assert footprint["total_includes"] == ["context"]
+    assert footprint["total_bytes"] == footprint["contexts_total_bytes"]
+
+    # Absent measurements are absent fields, never zeros.
+    assert "genai_container_total_bytes" not in footprint
+    assert "diagnostic" not in footprint
+
+    stage_metrics = _load_run(built.manifest).stages[-1].metrics
+    assert stage_metrics["static_footprint"] == footprint
+
+
+def test_static_footprint_keeps_diagnostic_contexts_out_of_the_totals(
+    tmp_path: Path,
+) -> None:
+    vectors = _vector_case(
+        tmp_path,
+        inputs={"x": np.array([2.0], dtype=np.float32)},
+        goldens={"y": np.array([2.0], dtype=np.float32)},
+        case_id="footprint-diagnostics",
+    )
+    spec = _make_spec(
+        tmp_path,
+        vectors={"mode": "provided", "validation_manifest": vectors},
+        sequence={
+            "ars": [1],
+            "context_lengths": [4096],
+            "weight_sharing": False,
+            "native_kv": False,
+        },
+        quality={
+            "sqnr_modes": ["full_reference"],
+            "dump_intermediates_on_failure": True,
+        },
+    )
+    agent = _fake_agent(FakeQualityModesAdapterFactory())
+
+    built = agent.build(spec)
+
+    assert built.ok, built.error
+    assert built.data is not None
+    footprint = built.data["static_footprint"]
+    diagnostic = footprint["diagnostic"]
+    assert diagnostic["counted_in_totals"] is False
+    assert len(diagnostic["artifacts"]) == 2
+    assert diagnostic["total_bytes"] == sum(
+        Path(item["path"]).stat().st_size for item in diagnostic["artifacts"]
+    )
+    assert diagnostic["total_bytes"] > 0
+
+    production_paths = {item["path"] for item in footprint["artifacts"]}
+    assert not production_paths & {
+        item["path"] for item in diagnostic["artifacts"]
+    }
+    assert footprint["total_bytes"] == footprint["contexts_total_bytes"]
+
+
+def test_genai_static_footprint_measures_the_saved_container(
+    tmp_path: Path,
+) -> None:
+    model = _write_onnx(tmp_path / "qwen3" / "model.onnx")
+    encodings = _write(tmp_path / "qwen3" / "model.encodings", b"{}")
+    spec = BuildSpec(
+        name="genai-footprint",
+        family="qwen3_moe",
+        sources={"text": {"onnx_path": model, "encodings_path": encodings}},
+        output_root=tmp_path / "artifacts",
+        sequence={"ars": [1, 128], "context_lengths": [4096]},
+        metadata={
+            "model_config": {
+                "architectures": ["Qwen3MoeForCausalLM"],
+                "model_type": "qwen3_moe",
+                "hidden_size": 16,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 4096,
+                "vocab_size": 32,
+            }
+        },
+    )
+    agent = _fake_agent(FakeAdapterFactory())
+
+    built = agent.build_genai_container(spec)
+
+    assert built.ok, built.error
+    assert built.data is not None
+    footprint = built.data["static_footprint"]
+    container_root = Path(built.data["genai_container"]["container_path"])
+    expected = sum(
+        path.stat().st_size for path in container_root.rglob("*") if path.is_file()
+    )
+    assert footprint["genai_container_total_bytes"] == expected
+    assert footprint["total_includes"] == ["genai_container"]
+    assert footprint["total_bytes"] == expected
+    # A GenAI build has no low-level contexts at all: the field is absent, not 0.
+    assert "contexts_total_bytes" not in footprint
+    # The raw slice lives inside the container and must not be counted twice.
+    assert sum(item["bytes"] for item in footprint["artifacts"]) == expected
+
+
+def test_benchmark_report_carries_the_build_footprint_verbatim(
+    tmp_path: Path,
+) -> None:
+    vectors = _vector_case(tmp_path)
+    spec = _make_spec(
+        tmp_path,
+        vectors={"mode": "provided", "validation_manifest": vectors},
+        sequence={"ars": [1], "context_lengths": [4096], "weight_sharing": False},
+    )
+    agent = _fake_agent(FakeAdapterFactory())
+
+    built = agent.build(spec)
+    assert built.ok and built.manifest is not None and built.data is not None
+    validated = agent.validate(built.manifest.path, built.manifest.sha256)
+    assert validated.ok, validated.error
+    assert validated.manifest is not None
+
+    benchmarked = agent.benchmark(
+        validated.manifest.path,
+        validated.manifest.sha256,
+        config={"warmup_runs": 0, "measured_runs": 1, "aa_calibration": False},
+    )
+
+    assert benchmarked.ok, benchmarked.error
+    assert benchmarked.data is not None and benchmarked.manifest is not None
+    reported = benchmarked.data["static_footprint"]
+    assert reported["source"] == "build_receipt"
+    assert reported["measured_by_stage"] == "build"
+    build_footprint = built.data["static_footprint"]
+    assert {
+        key: value
+        for key, value in reported.items()
+        if key not in {"source", "measured_by_stage", "measured_by_attempt"}
+    } == build_footprint
+
+    published = json.loads(
+        next(
+            ref.path
+            for ref in _load_run(benchmarked.manifest).artifacts
+            if ref.logical_name == "latency_report"
+        ).read_text(encoding="utf-8")
+    )
+    assert published["static_footprint"] == reported
+
+
 def test_genai_benchmark_rejects_low_level_chain_keys(
     tmp_path: Path,
 ) -> None:
@@ -2354,6 +2533,16 @@ def test_qwen35_omni_packages_audio_and_text_but_runtime_is_unsupported(
         "text-ar128.onnx",
         "text-ar128.encodings",
     } <= {artifact.path.name for artifact in manifest.artifacts}
+
+    # Omni nests the audio/text component directories inside the container
+    # directory; each file must be counted exactly once.
+    footprint = result.data["static_footprint"]
+    container_root = Path(packaged["container_path"])
+    counted = [item["path"] for item in footprint["artifacts"]]
+    assert len(counted) == len(set(counted))
+    assert footprint["genai_container_total_bytes"] == sum(
+        path.stat().st_size for path in container_root.rglob("*") if path.is_file()
+    )
 
 
 def test_calibration_build_preflights_before_creating_calibration_config(

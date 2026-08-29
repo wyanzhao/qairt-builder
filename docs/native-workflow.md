@@ -233,6 +233,27 @@ normalized, content-addressed `optrace_evidence` artifact. Thread-cycle records
 use the maximum overlapping thread value rather than a sum, and all per-op
 claims remain reported work attribution rather than additive wall latency.
 
+### Static footprint
+
+Every build publishes a `static_footprint` block in its stage data and metrics:
+one entry per published output with its exact byte size and SHA, per-role
+totals (`contexts_total_bytes`, `converted_models_total_bytes`,
+`genai_container_total_bytes`), and a headline `total_bytes` that sums only the
+roles named in `total_includes` — the context binaries and the saved GenAI
+container, that is, what the device has to hold. Converted DLCs are reported as
+build intermediates but never summed into that total, and diagnostic contexts
+live in their own `diagnostic` section with `counted_in_totals: false`, the same
+separation the latency reports keep.
+
+Sizes come from the published content-addressed references, so nothing is
+estimated: a role with no outputs has no total field rather than a zero. The
+policy is `report_only`; there are no thresholds. Benchmark reports embed the
+block copied verbatim from the hash-verified build receipt (with `source:
+"build_receipt"` and the measuring stage recorded), so a latency report answers
+"how big is what I just measured" without re-measuring. This static footprint
+is the program's only RAM metric; on-device RSS/PSS and VTCM/DDR accounting are
+out of scope.
+
 ### Output layout
 
 `output_root` is model-specific and is the only artifact root. `plan` renders

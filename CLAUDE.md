@@ -213,6 +213,15 @@ evidence only when those contexts are present and hash-verified. Otherwise the
 report explicitly degrades to verified slice/tensor evidence and sets
 `op_level_dump_available=false`.
 
+Every build publishes a report-only `static_footprint` block — per-artifact
+bytes read from the published content-addressed references, per-role totals, and
+a `total_bytes` that sums only the roles named in `total_includes` (context
+binaries and the saved GenAI container). Converted DLCs are reported but never
+summed into it, diagnostic contexts sit in a separate `diagnostic` section with
+`counted_in_totals=false`, and a role with no outputs has no total field rather
+than a zero. Benchmark reports embed the block copied verbatim from the verified
+build receipt rather than re-measuring. This is the only RAM metric.
+
 Benchmark warmed production contexts only; context loading, ADB staging, and
 setup are outside the latency sample. For a quality regression, generate a
 diagnostic context and bisect component, slice, layer, tensor, then operator.

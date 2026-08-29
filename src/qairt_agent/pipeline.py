@@ -283,6 +283,158 @@ def _path_artifacts(value: Any, *, logical_prefix: str = "") -> tuple[ArtifactRe
     return tuple(collected)
 
 
+_STATIC_FOOTPRINT_SCHEMA = "qairt-agent.static-footprint/1"
+
+# Roles summed into the headline total: what a device actually has to hold.
+# Converted DLCs are build intermediates and are reported but never summed in.
+_DEPLOYABLE_FOOTPRINT_ROLES = ("context", "genai_container")
+
+
+def _static_footprint(
+    result: Any,
+    artifacts: Sequence[ArtifactRef],
+) -> dict[str, Any]:
+    """Summarize the on-disk size of one build's outputs.
+
+    Sizes are read from the published content-addressed references, so nothing
+    here is estimated: an output that was not published is absent from the
+    report rather than reported as zero.  Diagnostic contexts are kept in their
+    own section and never counted in the production totals, mirroring the rule
+    that diagnostic-context latency is not production latency.
+    """
+
+    by_path: dict[Path, ArtifactRef] = {}
+    for ref in artifacts:
+        by_path.setdefault(ref.path.expanduser().resolve(), ref)
+
+    def entry(
+        path: Any,
+        role: str,
+        **details: Any,
+    ) -> dict[str, Any] | None:
+        if path is None:
+            return None
+        ref = by_path.get(Path(path).expanduser().resolve())
+        if ref is None:
+            return None
+        record = {
+            "role": role,
+            "logical_name": ref.logical_name,
+            "path": os.fspath(ref.path),
+            "sha256": ref.sha256,
+            "bytes": ref.size_bytes,
+        }
+        record.update({key: value for key, value in details.items() if value is not None})
+        return record
+
+    counted: set[Path] = set()
+
+    def directory_entries(directory: Any, role: str) -> list[dict[str, Any]]:
+        # Omni packaging nests the audio/text component directories inside the
+        # container directory, so a file must be counted for the first (widest)
+        # root that claims it and never again.
+        if directory is None:
+            return []
+        root = Path(directory).expanduser().resolve()
+        found: list[dict[str, Any]] = []
+        for path in sorted(by_path):
+            if path in counted or not (path == root or path.is_relative_to(root)):
+                continue
+            record = entry(path, role, container=os.fspath(root))
+            if record is not None:
+                counted.add(path)
+                found.append(record)
+        return found
+
+    production: list[dict[str, Any]] = []
+    diagnostic: list[dict[str, Any]] = []
+
+    for context in getattr(result, "contexts", ()) or ():
+        record = entry(
+            getattr(context, "context_binary_path", None),
+            "context",
+            slice_name=getattr(context, "slice_name", None),
+            context_length=getattr(context, "context_length", None),
+            ar_values=list(getattr(context, "ar_values", ()) or ()) or None,
+            weight_sharing=getattr(context, "weight_sharing", None),
+        )
+        if record is not None:
+            production.append(record)
+
+    for context in getattr(result, "diagnostic_contexts", ()) or ():
+        record = entry(
+            getattr(context, "context_binary_path", None),
+            "diagnostic_context",
+            slice_name=getattr(context, "slice_name", None),
+            context_length=getattr(context, "context_length", None),
+        )
+        if record is not None:
+            diagnostic.append(record)
+
+    for converted in getattr(result, "converted_models", ()) or ():
+        record = entry(
+            getattr(converted, "model_path", None),
+            "converted_model",
+            slice_name=getattr(converted, "slice_name", None),
+            ar=getattr(converted, "ar", None),
+            context_length=getattr(converted, "context_length", None),
+        )
+        if record is not None:
+            production.append(record)
+
+    for attribute in ("container_path", "text_container_path", "audio_container_path"):
+        production.extend(
+            directory_entries(getattr(result, attribute, None), "genai_container")
+        )
+
+    for raw_slice in getattr(result, "raw_slices", ()) or ():
+        # A raw slice normally lives inside the container directory and is
+        # already counted there.
+        slice_path = getattr(raw_slice, "context_binary_path", None)
+        if slice_path is None:
+            continue
+        resolved_slice = Path(slice_path).expanduser().resolve()
+        if resolved_slice in counted:
+            continue
+        record = entry(
+            slice_path,
+            "genai_raw_slice",
+            slice_name=getattr(raw_slice, "slice_id", None),
+        )
+        if record is not None:
+            counted.add(resolved_slice)
+            production.append(record)
+
+    footprint: dict[str, Any] = {
+        "schema": _STATIC_FOOTPRINT_SCHEMA,
+        "policy": "report_only",
+        "unit": "bytes",
+        "artifacts": production,
+    }
+    role_totals: dict[str, int] = {}
+    for record in production:
+        role_totals[record["role"]] = role_totals.get(record["role"], 0) + record["bytes"]
+    for role, key in (
+        ("context", "contexts_total_bytes"),
+        ("converted_model", "converted_models_total_bytes"),
+        ("genai_container", "genai_container_total_bytes"),
+        ("genai_raw_slice", "genai_raw_slices_total_bytes"),
+    ):
+        if role in role_totals:
+            footprint[key] = role_totals[role]
+    summed_roles = [role for role in _DEPLOYABLE_FOOTPRINT_ROLES if role in role_totals]
+    if summed_roles:
+        footprint["total_bytes"] = sum(role_totals[role] for role in summed_roles)
+        footprint["total_includes"] = summed_roles
+    if diagnostic:
+        footprint["diagnostic"] = {
+            "artifacts": diagnostic,
+            "total_bytes": sum(record["bytes"] for record in diagnostic),
+            "counted_in_totals": False,
+        }
+    return footprint
+
+
 def _config_input_artifacts(value: Any) -> tuple[ArtifactRef, ...]:
     """Collect existing file paths supplied directly in a stage config."""
 
@@ -1537,6 +1689,26 @@ class QairtAgent:
         effective["component"] = component
         effective["coverage"] = expected_coverage
         return effective
+
+    @staticmethod
+    def _build_static_footprint(manifest: RunManifest) -> dict[str, Any] | None:
+        """Return the footprint the build stage measured for this run.
+
+        The block is copied from the hash-verified manifest, never re-measured,
+        so a latency report answers "how big is what I just measured" with the
+        same numbers the build published.
+        """
+
+        for stage in reversed(manifest.stages):
+            footprint = stage.metrics.get("static_footprint")
+            if isinstance(footprint, Mapping):
+                return {
+                    **dict(footprint),
+                    "source": "build_receipt",
+                    "measured_by_stage": stage.name,
+                    "measured_by_attempt": stage.attempt,
+                }
+        return None
 
     @staticmethod
     def _reject_genai_chain_keys(
@@ -2860,6 +3032,7 @@ class QairtAgent:
                     + result_refs
                     + route_refs
                 )
+                footprint = _static_footprint(result, artifacts)
                 return {
                     "lane": "standalone_vit_low_level",
                     "build": _jsonable(result),
@@ -2867,6 +3040,7 @@ class QairtAgent:
                     "slice_routes": route_summaries,
                     "validation_vector_bindings": vector_audit,
                     "runtime_index": _jsonable(runtime_index_ref),
+                    "static_footprint": footprint,
                     "artifact_count": len(artifacts),
                 }, artifacts, {
                     "variant_count": 0,
@@ -2876,6 +3050,7 @@ class QairtAgent:
                     "diagnostic_context_count": len(
                         result.diagnostic_contexts
                     ),
+                    "static_footprint": footprint,
                 }
             generated, config_path = self._generate_family_config(parsed)
             effective = self._effective_payload(parsed, generated)
@@ -3006,12 +3181,14 @@ class QairtAgent:
                 + result_refs
                 + route_refs
             )
+            footprint = _static_footprint(result, artifacts)
             data = {
                 "build": _jsonable(result),
                 "effective_config": effective,
                 "slice_routes": route_summaries,
                 "validation_vector_bindings": vector_audit,
                 "runtime_index": _jsonable(runtime_index_ref),
+                "static_footprint": footprint,
                 "artifact_count": len(artifacts),
             }
             metrics = {
@@ -3022,6 +3199,7 @@ class QairtAgent:
                 "diagnostic_context_count": len(
                     getattr(result, "diagnostic_contexts", ())
                 ),
+                "static_footprint": footprint,
             }
             return data, artifacts, metrics
 
@@ -3222,12 +3400,14 @@ class QairtAgent:
                 + extra_config_refs
                 + result_refs
             )
+            footprint = _static_footprint(result, artifacts)
             data = {
                 "lane": lane,
                 "genai_container": _jsonable(result),
                 "effective_config": effective,
                 "validation_vector_bindings": vector_audit,
                 "runtime_index": _jsonable(runtime_index_ref),
+                "static_footprint": footprint,
                 "artifact_count": len(artifacts),
             }
             metrics = {
@@ -3235,6 +3415,7 @@ class QairtAgent:
                 "compatibility_mode": result.compatibility_mode,
                 "runtime_supported": result.runtime_supported,
                 "container_file_count": len(result_refs),
+                "static_footprint": footprint,
             }
             return data, artifacts, metrics
 
@@ -5957,6 +6138,9 @@ class QairtAgent:
                 payload["aa_calibration"] = aa_measurement.to_dict()
             if optrace_ref is not None:
                 payload["optrace_evidence"] = _jsonable(optrace_ref)
+            footprint = self._build_static_footprint(manifest)
+            if footprint is not None:
+                payload["static_footprint"] = footprint
             report_ref = atomic_publish_json(
                 output_dir / f"latency_report{report_suffix}.json",
                 payload,
