@@ -44,6 +44,7 @@ from qairt_agent.contracts import (
     preset_id_for_family,
     utc_now,
 )
+from qairt_agent.diagnostics.device_metrics import DEVICE_EXECUTION_SCHEMA
 from qairt_agent.diagnostics.latency import LatencyDiagnoser
 from qairt_agent.diagnostics.sqnr import QualityDiagnoser, compute_tensor_quality
 from qairt_agent.device import DeviceRuntime
@@ -854,6 +855,62 @@ class QairtAgent:
                 "QAIRT_AGENT_ADB_SERIAL/QAIRT_AGENT_ADB_SERVER"
             )
         return options
+
+    @staticmethod
+    def _device_execution_block(
+        adapter: Any,
+        compiled: Any,
+        inputs: Mapping[str, np.ndarray],
+        *,
+        graph_name: str,
+        device: Any,
+        native_io: bool,
+        execution_options: Mapping[str, Any],
+        working_dir: Path,
+    ) -> dict[str, Any] | None:
+        """Device-side execute evidence, or ``None`` when unavailable.
+
+        This is report-only enrichment of a latency report: an adapter that
+        cannot profile still produces a valid benchmark, so a missing capture
+        degrades the report rather than failing the stage.  What it must never
+        do is publish a device claim it did not measure.
+        """
+
+        capture = getattr(adapter, "capture_device_execution", None)
+        if not callable(capture):
+            return None
+        try:
+            return capture(
+                compiled,
+                inputs,
+                graph_name=graph_name,
+                device=device,
+                native_io=native_io,
+                working_dir=working_dir,
+                **dict(execution_options),
+            )
+        except Exception as error:  # report-only: never fail the benchmark
+            return {
+                "schema": DEVICE_EXECUTION_SCHEMA,
+                "policy": "report_only",
+                "available": False,
+                "reason": f"{type(error).__name__}: {error}",
+            }
+
+    @staticmethod
+    def _initialize_execution(
+        adapter: Any,
+        compiled: Any,
+        *,
+        device: Any,
+    ) -> Any:
+        """Establish QAIRT's persistent execution context, when supported."""
+
+        initialize = getattr(adapter, "initialize_execution", None)
+        release = getattr(adapter, "release_execution", None)
+        if not callable(initialize) or not callable(release):
+            return None
+        return initialize(compiled, device=device)
 
     @staticmethod
     def _profile_report_payload(
@@ -5741,6 +5798,8 @@ class QairtAgent:
             profile_inputs: dict[str, np.ndarray] | None = None
             profile_ar: int | None = None
             profile_initial_native_state: dict[str, np.ndarray] = {}
+            device_execution: dict[str, Any] | None = None
+            execution_owner: Any = None
             profile_claim_scope = (
                 "production_runtime_optrace"
             )
@@ -6036,24 +6095,53 @@ class QairtAgent:
                     profile_ar = int(
                         effective.get("ar", spec.sequence.ars[0])
                     )
+                    # Ask the device what it actually spent, before the model
+                    # is initialized: an initialized model carries an execution
+                    # context created with profiling disabled, and QAIRT would
+                    # then report no profiling data at all.
+                    device_execution = self._device_execution_block(
+                        adapter,
+                        compiled,
+                        inputs,
+                        graph_name=str(effective["graph_name"]),
+                        device=device_stage.device,
+                        native_io=native_io,
+                        execution_options=execution_options,
+                        working_dir=output_dir / "device_profiling",
+                    )
+                    # Without initialize(), QAIRT rebuilds the backend and the
+                    # inferencer on every call.  This is its documented way to
+                    # execute repeatedly against one model/backend/device.
+                    execution_owner = self._initialize_execution(
+                        adapter,
+                        compiled,
+                        device=device_stage.device,
+                    )
 
                 if scope != "genai_generation":
-                    # Context loading, Device construction, ADB staging, and
-                    # graph-runner setup are all complete before the timer.
-                    measurement = diagnoser.measure(
-                        invoke,
-                        warmup=warmup,
-                        repeats=repeats,
-                    )
-                    aa_measurement = (
-                        diagnoser.calibrate_aa(
+                    # Our own setup -- context loading, Device construction, ADB
+                    # staging, graph-runner setup -- is complete before the
+                    # timer.  What QAIRT does inside one call is not: on the
+                    # low-level lane it relaunches qnn-net-run per call.
+                    try:
+                        measurement = diagnoser.measure(
                             invoke,
                             warmup=warmup,
                             repeats=repeats,
                         )
-                        if bool(effective.get("aa_calibration", True))
-                        else None
-                    )
+                        aa_measurement = (
+                            diagnoser.calibrate_aa(
+                                invoke,
+                                warmup=warmup,
+                                repeats=repeats,
+                            )
+                            if bool(effective.get("aa_calibration", True))
+                            else None
+                        )
+                    finally:
+                        if execution_owner is not None:
+                            adapter.release_execution(execution_owner)
+                            execution_owner = None
                 if optrace_enabled:
                     if not hasattr(adapter, "profile"):
                         raise InvalidSpecError(
@@ -6303,7 +6391,17 @@ class QairtAgent:
             payload: dict[str, Any] = {
                 "measurement": measurement.to_dict(),
                 "policy": "report_only",
-                "setup_excluded": True,
+                # Our own setup is outside the timer; what the SDK does inside
+                # one call is not, and on the low-level lane that includes a
+                # fresh qnn-net-run process per call.  Reporting a single
+                # "setup_excluded" flag conflated the two.
+                "harness_setup_excluded": True,
+                "sdk_per_call_setup_included": (
+                    "unverified"
+                    if scope == "genai_generation"
+                    else True
+                ),
+                "metric_name": "host_orchestrated_call_latency",
                 "scope": scope,
                 "measurement_scope": {
                     "clock": "host_perf_counter_ns",
@@ -6312,8 +6410,26 @@ class QairtAgent:
                     "note": (
                         "the QAIRT Python API exposes no device-side "
                         "synchronization barrier, so each sample is the warmed "
-                        "host wall time around one call; per-op attribution "
-                        "comes from optrace, not from these samples"
+                        "host wall time around one call, including whatever "
+                        "per-call setup the SDK performs inside it; this is not "
+                        "device execution time -- see 'device_execution'"
+                    ),
+                    "excluded_from_timer": [
+                        "context_loading",
+                        "device_construction",
+                        "adb_staging",
+                        "graph_runner_setup",
+                    ],
+                    "included_in_sample": (
+                        []
+                        if scope == "genai_generation"
+                        else [
+                            "qnn_net_run_process_launch",
+                            "per_call_context_load",
+                            "hvx_hmx_power_on_and_acquire",
+                            "per_call_deinit",
+                            "adb_input_push_and_output_pull",
+                        ]
                     ),
                     "sample_unit": (
                         "generate_call"
@@ -6383,6 +6499,8 @@ class QairtAgent:
                     "executed_ars": "caller_defined",
                     "complete": None,
                 }
+            if device_execution is not None:
+                payload["device_execution"] = device_execution
             if generation_metrics is not None:
                 payload["generation_metrics"] = generation_metrics
             if generated_text_sha256 is not None:
@@ -6744,7 +6862,8 @@ class QairtAgent:
             aggregate_payload: dict[str, Any] = {
                 "schema": "qairt-agent.multi-ar-latency-report.v1",
                 "policy": "report_only",
-                "setup_excluded": True,
+                "harness_setup_excluded": True,
+                "metric_name": "host_orchestrated_call_latency",
                 "coverage": coverage,
                 "results_by_ar": results_by_ar,
             }

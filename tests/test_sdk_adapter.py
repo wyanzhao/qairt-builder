@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import replace
@@ -437,9 +438,50 @@ class FakeModel:
         self.saved.append(path)
         return path
 
+    def initialize(self, device: Any = None, **kwargs: Any) -> None:
+        # QAIRT sets this attribute when it caches an execution context; the
+        # adapter keys its profiling guard off exactly this.
+        self._inference_handle = ("handle", device)
+        self.calls.append(("initialize", {"device": device, **kwargs}))
+
+    def destroy(self) -> None:
+        self.__dict__.pop("_inference_handle", None)
+        self.calls.append(("destroy", {}))
+
     def __call__(self, inputs: Any, **kwargs: Any) -> dict[str, Any]:
         self.calls.append((inputs, kwargs))
         return {"outputs": inputs, "kwargs": kwargs}
+
+
+# The shape QAIRT's detailed profiling log parses into.
+FAKE_DEVICE_REPORT: dict[str, Any] = {
+    "metadata": {"appName": "qnn-net-run"},
+    "messages": [
+        {
+            "method": "BACKEND_EXECUTE",
+            "profilingEvents": [
+                {
+                    "identifier": "Accelerator (execute excluding wait) time",
+                    "unit": "MICROSEC",
+                    "value": 77,
+                },
+                {
+                    "identifier": "Accelerator (execute) time",
+                    "unit": "MICROSEC",
+                    "value": 1734,
+                },
+            ],
+        }
+    ],
+}
+
+
+class FakeProfilingReport(dict):
+    """Dict-like, as the optrace tests expect, plus QAIRT's ``.data``."""
+
+    def __init__(self, payload: dict[str, Any], data: dict[str, Any]) -> None:
+        super().__init__(payload)
+        self.data = data
 
 
 class FakeProfiler:
@@ -453,7 +495,8 @@ class FakeProfiler:
         return None
 
     def generate_reports(self):
-        return [{"kind": "optrace", **self.context}]
+        payload = {"kind": self.context.get("option", "detailed"), **self.context}
+        return [FakeProfilingReport(payload, FAKE_DEVICE_REPORT)]
 
 
 class FakeLLMContainer:
@@ -1057,6 +1100,93 @@ class AdapterTests(unittest.TestCase):
         )
         self.assertEqual(profiled.graph_name, "decoder_ar1")
         self.assertEqual(profiled.reports[0]["kind"], "optrace")
+
+    def test_capture_device_execution_reads_qairt_own_device_numbers(self) -> None:
+        # The wall-clock benchmark sample is host time around one SDK call.
+        # This is what the device reported for the same work.
+        adapter = self._adapter()
+        model = FakeModel("decoder_ar1")
+
+        block = adapter.capture_device_execution(
+            model,
+            {"input": [1]},
+            graph_name="decoder_ar1",
+        )
+
+        self.assertEqual(block["accelerator_compute_us"], 77.0)
+        self.assertEqual(block["accelerator_execute_us"], 1734.0)
+        self.assertEqual(block["source"], "qairt_profiler_detailed_log")
+        # No optrace option: that path additionally needs a schematic binary
+        # our compile does not emit.
+        self.assertIsNone(block["profiler_option"])
+
+    def test_capture_device_execution_restores_the_working_directory(self) -> None:
+        # QAIRT writes its profiling log to a relative output/ directory, so the
+        # capture runs somewhere writable -- the worker mounts the project root
+        # read-only, which otherwise fails the execute outright.  The process
+        # cwd must come back, including when the execute raises.
+        adapter = self._adapter()
+        before = os.getcwd()
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "device_profiling"
+            adapter.capture_device_execution(
+                FakeModel("decoder_ar1"),
+                {"input": [1]},
+                graph_name="decoder_ar1",
+                working_dir=target,
+            )
+            self.assertEqual(os.getcwd(), before)
+            self.assertTrue(target.is_dir())
+
+            class ExplodingModel(FakeModel):
+                def __call__(self, inputs: Any, **kwargs: Any) -> dict[str, Any]:
+                    raise RuntimeError("Failed to execute model")
+
+            exploding = ExplodingModel("decoder_ar1")
+            with self.assertRaises(RuntimeError):
+                adapter.capture_device_execution(
+                    exploding,
+                    {"input": [1]},
+                    graph_name="decoder_ar1",
+                    working_dir=target,
+                )
+            self.assertEqual(os.getcwd(), before)
+
+    def test_capture_device_execution_refuses_an_initialized_model(self) -> None:
+        # initialize() caches an execution context created with profiling
+        # disabled.  Profiling afterwards silently yields no data at all, and
+        # QAIRT then fails deep inside report parsing.  Fail closed here, where
+        # the message can say why.
+        adapter = self._adapter()
+        model = FakeModel("decoder_ar1")
+        adapter.initialize_execution(model, device=None)
+
+        with self.assertRaises(QairtConfigurationError) as caught:
+            adapter.capture_device_execution(
+                model,
+                {"input": [1]},
+                graph_name="decoder_ar1",
+            )
+        self.assertIn("before initialize_execution", str(caught.exception))
+
+    def test_initialize_execution_establishes_and_releases_the_context(self) -> None:
+        # Without initialize(), QAIRT rebuilds the backend and inferencer on
+        # every call; measured on SM8750 that was 3990 ms versus 2492 ms.
+        adapter = self._adapter()
+        model = FakeModel("decoder_ar1")
+
+        owner = adapter.initialize_execution(model, device="android")
+        self.assertIs(owner, model)
+        self.assertTrue(hasattr(model, "_inference_handle"))
+
+        adapter.release_execution(owner)
+        self.assertFalse(hasattr(model, "_inference_handle"))
+
+    def test_initialize_execution_fails_closed_without_the_sdk_method(self) -> None:
+        adapter = self._adapter()
+
+        with self.assertRaises(QairtConfigurationError):
+            adapter.initialize_execution(SimpleNamespace(), device=None)
 
     def test_create_device_uses_qairt_248_remote_android_identifier(self) -> None:
         class RemoteDeviceIdentifier:

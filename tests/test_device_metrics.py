@@ -1,0 +1,184 @@
+from __future__ import annotations
+
+import unittest
+
+from qairt_agent.diagnostics.device_metrics import (
+    DEVICE_EXECUTION_SCHEMA,
+    DeviceMetricsError,
+    parse_device_execution,
+)
+
+
+# Captured verbatim from QAIRT 2.49.0.260730 on the SM8750 handset (serial
+# RFCY30B296K) running the tiny acceptance graph, via
+# qairt.Profiler(context={"level": "detailed"}).  The wall-clock sample around
+# the same call measured ~4900 ms.
+REAL_REPORT: dict[str, object] = {
+    "header": {"artifact_type": "QNN_PROFILE"},
+    "metadata": {
+        "appName": "qnn-net-run",
+        "appVersion": "v2.49.0.260730134355",
+        "backendVersion": "v2.49.0.260730134355",
+        "qnnProfileViewerVersion": "v2.49.0.260730134355",
+    },
+    "messages": [
+        {
+            "method": "BACKEND_CREATE_FROM_BINARY",
+            "profilingEvents": [
+                {"identifier": "RPC (load binary) time", "unit": "MICROSEC", "type": "", "value": 3104},
+                {"identifier": "QNN accelerator (load binary) time", "unit": "MICROSEC", "type": "", "value": 2701},
+                {"identifier": "Accelerator (load binary) time", "unit": "MICROSEC", "type": "", "value": 2258},
+                {"identifier": "QNN (load binary) time", "unit": "MICROSEC", "type": "INIT", "value": 9009},
+            ],
+        },
+        {
+            "method": "BACKEND_EXECUTE",
+            "profilingEvents": [
+                {"identifier": "Number of HVX threads used", "unit": "COUNT", "type": "", "value": 6},
+                {"identifier": "RPC (execute) time", "unit": "MICROSEC", "type": "", "value": 2886},
+                {"identifier": "QNN accelerator (execute) time", "unit": "MICROSEC", "type": "", "value": 2381},
+                {"identifier": "Num times yield occured", "unit": "COUNT", "type": "", "value": 0},
+                {"identifier": "Time for initial VTCM acquire", "unit": "MICROSEC", "type": "", "value": 804},
+                {
+                    "identifier": "Time for HVX + HMX power on and acquire",
+                    "unit": "MICROSEC",
+                    "type": "",
+                    "value": 29218,
+                },
+                {
+                    "identifier": "Accelerator (execute) time (cycles)",
+                    "unit": "CYCLES",
+                    "type": "",
+                    "value": 29239,
+                    "sub-events": [
+                        {"identifier": "Input OpId_2 (cycles)", "unit": "CYCLES", "type": "NODE", "value": 8405},
+                        {"identifier": "fc:OpId_17 (cycles)", "unit": "CYCLES", "type": "NODE", "value": 6137},
+                        {"identifier": "bias_add:OpId_21 (cycles)", "unit": "CYCLES", "type": "NODE", "value": 0},
+                        {"identifier": "act:OpId_23 (cycles)", "unit": "CYCLES", "type": "NODE", "value": 8567},
+                        {"identifier": "Output OpId_3 (cycles)", "unit": "CYCLES", "type": "NODE", "value": 6130},
+                    ],
+                },
+                {"identifier": "Accelerator (execute) time", "unit": "MICROSEC", "type": "", "value": 1734},
+                {
+                    "identifier": "Accelerator (execute excluding wait) time",
+                    "unit": "MICROSEC",
+                    "type": "",
+                    "value": 77,
+                },
+                {"identifier": "QNN (execute) time", "unit": "MICROSEC", "type": "EXECUTE", "value": 3001},
+            ],
+        },
+        {
+            "method": "APP_EXECUTE_IPS",
+            "profilingEvents": [
+                {"identifier": "numInferences", "unit": "COUNT", "type": "EXECUTE", "value": 1},
+                {"identifier": "duration", "unit": "MICROSEC", "type": "EXECUTE", "value": 3309},
+            ],
+        },
+        {
+            "method": "BACKEND_DEINIT",
+            "profilingEvents": [
+                {"identifier": "RPC (deinit) time", "unit": "MICROSEC", "type": "", "value": 1794},
+                {"identifier": "QNN (deinit) time", "unit": "MICROSEC", "type": "DEINIT", "value": 19359},
+            ],
+        },
+    ],
+}
+
+
+class DeviceExecutionParsingTests(unittest.TestCase):
+    def test_real_report_yields_the_device_side_numbers(self) -> None:
+        block = parse_device_execution(REAL_REPORT)
+
+        self.assertEqual(block["schema"], DEVICE_EXECUTION_SCHEMA)
+        self.assertEqual(block["policy"], "report_only")
+        # The number the NPU actually spent, and the two wider device figures.
+        self.assertEqual(block["accelerator_compute_us"], 77.0)
+        self.assertEqual(block["accelerator_execute_us"], 1734.0)
+        self.assertEqual(block["qnn_execute_us"], 3001.0)
+        self.assertEqual(block["accelerator_execute_cycles"], 29239.0)
+        self.assertEqual(block["producer"]["app_name"], "qnn-net-run")
+
+    def test_per_op_cycles_are_carried_through_including_zero(self) -> None:
+        block = parse_device_execution(REAL_REPORT)
+        cycles = {item["identifier"]: item["cycles"] for item in block["per_op_cycles"]}
+
+        self.assertEqual(
+            cycles,
+            {
+                "Input OpId_2 (cycles)": 8405.0,
+                "fc:OpId_17 (cycles)": 6137.0,
+                "bias_add:OpId_21 (cycles)": 0.0,
+                "act:OpId_23 (cycles)": 8567.0,
+                "Output OpId_3 (cycles)": 6130.0,
+            },
+        )
+        # A zero-cycle operator is a real measurement, not a missing one.
+        self.assertIn("bias_add:OpId_21 (cycles)", cycles)
+
+    def test_per_process_overhead_is_reported_separately_from_execute(self) -> None:
+        # Load-binary and deinit are per-qnn-net-run-process costs.  They are
+        # inside every wall-clock sample but are not execute time, so they must
+        # not be folded into the execute numbers.
+        block = parse_device_execution(REAL_REPORT)
+        overhead = block["per_process_overhead_us"]
+
+        self.assertEqual(overhead["QNN (load binary) time"], 9009.0)
+        self.assertEqual(overhead["QNN (deinit) time"], 19359.0)
+        self.assertNotIn("QNN (load binary) time", block["execute_events_us"])
+        # Power-on is charged to the execute message by QAIRT itself.
+        self.assertEqual(
+            block["execute_events_us"]["Time for HVX + HMX power on and acquire"],
+            29218.0,
+        )
+
+    def test_the_block_states_it_is_not_the_timed_samples(self) -> None:
+        block = parse_device_execution(REAL_REPORT)
+        self.assertEqual(
+            block["claim_scope"], "one_profiled_execute_not_the_timed_samples"
+        )
+        self.assertEqual(block["sample_unit"], "one_profiled_graph_execute")
+        self.assertIsNone(block["profiler_option"])
+
+    def test_non_microsecond_events_are_not_treated_as_times(self) -> None:
+        block = parse_device_execution(REAL_REPORT)
+        # COUNT events would otherwise land in the time map as bare numbers.
+        self.assertNotIn("Number of HVX threads used", block["execute_events_us"])
+        self.assertNotIn("Num times yield occured", block["execute_events_us"])
+
+
+class DeviceExecutionFailClosedTests(unittest.TestCase):
+    def test_report_without_an_execute_message_fails_closed(self) -> None:
+        report = {"messages": [message for message in REAL_REPORT["messages"]  # type: ignore[index]
+                               if message["method"] != "BACKEND_EXECUTE"]}
+        with self.assertRaises(DeviceMetricsError) as caught:
+            parse_device_execution(report)
+        self.assertIn("BACKEND_EXECUTE", str(caught.exception))
+
+    def test_execute_message_without_accelerator_time_fails_closed(self) -> None:
+        report = {
+            "messages": [
+                {
+                    "method": "BACKEND_EXECUTE",
+                    "profilingEvents": [
+                        {
+                            "identifier": "Number of HVX threads used",
+                            "unit": "COUNT",
+                            "value": 6,
+                        }
+                    ],
+                }
+            ]
+        }
+        with self.assertRaises(DeviceMetricsError):
+            parse_device_execution(report)
+
+    def test_a_report_that_is_not_a_profiling_report_fails_closed(self) -> None:
+        with self.assertRaises(DeviceMetricsError):
+            parse_device_execution({"header": {}})
+        with self.assertRaises(DeviceMetricsError):
+            parse_device_execution(None)  # type: ignore[arg-type]
+
+
+if __name__ == "__main__":
+    unittest.main()

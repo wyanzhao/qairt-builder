@@ -23,8 +23,9 @@ Settled program decisions (2026-08-29; details and rationale in
   wide export (for example AR2073/CL4096) with AR/CL conversion.
 - Golden vectors come from the AIMET-quantized model as trusted local pickle
   and are imported into immutable per-AR manifests before use.
-- Measurement scope: tensor-level SQNR/RMSE/cosine; warmed production wall
-  latency plus optrace attribution; static artifact footprint as the only RAM
+- Measurement scope: tensor-level SQNR/RMSE/cosine; device-side execute time
+  and per-op cycles from QAIRT's profiling log, beside a host-orchestrated wall
+  latency that is not device time; static artifact footprint as the only RAM
   metric. An ONNX Runtime float-graph second reference is a **debug-only**
   mode: slice-boundary comparison has landed (T04 tier 1), layer-level
   drilldown has not. Neither is ever a default, and neither alters production
@@ -295,11 +296,37 @@ summed into it, diagnostic contexts sit in a separate `diagnostic` section with
 than a zero. Benchmark reports embed the block copied verbatim from the verified
 build receipt rather than re-measuring. This is the only RAM metric.
 
-Benchmark warmed production contexts only; context loading, ADB staging, and
-setup are outside the latency sample. For a quality regression, generate a
-diagnostic context and bisect component, slice, layer, tensor, then operator.
-For a latency regression, use production wall time first and per-op profiling
-for attribution. Diagnostic-context latency is not production latency.
+Benchmark warmed production contexts only. *Our* setup — context loading, ADB
+staging, device construction, graph-runner setup — is outside the latency
+sample, and the report says so as `harness_setup_excluded`. What the SDK does
+inside one call is **not** outside it: on the low-level lane QAIRT implements a
+remote call by relaunching `qnn-net-run` on the device, so per-call context
+load, HVX/HMX power-on, deinit and the ADB round trip are all inside the
+sample. The wall metric is therefore named `host_orchestrated_call_latency`,
+and a report never claims setup was excluded when it was not.
+
+Device-side latency comes from QAIRT's own profiling log, published as the
+`device_execution` block: accelerator execute time, QNN execute time, per-op
+cycles, and per-process overhead reported separately. It is read at
+`level="detailed"` with **no** profiling option — `option="optrace"`
+additionally requires a schematic binary that this program's compile does not
+emit, and fails with "No op trace raw data found." without one. Per-op cycles
+need no optrace. The gap between the two metrics is large and expected: on
+SM8750 the tiny acceptance graph measures ~4900 ms of wall time around 77 µs of
+accelerator compute.
+
+`initialize_execution` establishes QAIRT's persistent execution context before
+the timer and `release_execution` frees it afterwards; without it the SDK
+rebuilds the backend and inferencer on every call. Device capture must run
+**before** initialization — an initialized model carries an execution context
+created with profiling disabled, so profiling it silently yields nothing — and
+the adapter fails closed rather than letting that happen.
+
+For a quality regression, generate a diagnostic context and bisect component,
+slice, layer, tensor, then operator. For a latency regression, compare the
+`device_execution` block first; wall time moves with host and transport
+conditions that have nothing to do with the model.
+Diagnostic-context latency is not production latency.
 For a multi-AR GenAI container, raw-tensor SQNR still covers each exact AR.
 Production generation latency is one public-executor prefill/decode workload,
 so its report states that internal graph-AR selection is executor-managed.
@@ -314,8 +341,9 @@ under `effective_config.benchmark`, and any value the spec sets explicitly
 wins. A/A calibration doubles whichever numbers apply. Every latency report
 carries a `measurement_scope` block stating that samples are warmed host
 wall-clock around one call including the host-to-SDK-to-device round trip —
-the QAIRT Python API exposes no device-side synchronization barrier — and that
-per-op attribution comes from optrace. `p50_ms_per_token` is published only
+the QAIRT Python API exposes no device-side synchronization barrier — and
+listing explicitly what is `excluded_from_timer` and what is
+`included_in_sample`. `p50_ms_per_token` is published only
 with an explicit `ms_per_token_source`: `caller` for a supplied `token_count`,
 `sdk_metrics` only if the SDK reports a generated-token count. QAIRT 2.49 does
 not (its `GenerationMetrics` carries a rate and a duration but no count), and a

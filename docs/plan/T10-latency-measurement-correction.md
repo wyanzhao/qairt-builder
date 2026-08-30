@@ -1,6 +1,6 @@
 # T10 — Latency measurement is host-harness time, not device time
 
-Status: planned (opened 2026-08-30)
+Status: done (2026-08-30)
 Depends on: —
 Effort: M
 
@@ -118,3 +118,80 @@ from the detailed log without optrace.
 - The optrace claim in root `CLAUDE.md` is corrected or the schematic-binary
   requirement is documented.
 - One real-device run on a registered target publishes both metrics.
+
+## Result (2026-08-30)
+
+Landed across `diagnostics/device_metrics.py` (new), `qairt_adapter/adapter.py`
+(`initialize_execution`, `release_execution`, `capture_device_execution`) and
+the benchmark stage in `pipeline.py`.
+
+**The report no longer lies about scope.** `setup_excluded` is gone. In its
+place `harness_setup_excluded` states what we do control, and
+`sdk_per_call_setup_included` states what we do not; `measurement_scope` lists
+`excluded_from_timer` and `included_in_sample` by name, and the wall metric is
+labelled `host_orchestrated_call_latency`.
+
+**The device metric is published.** Every low-level benchmark now carries a
+`device_execution` block read from QAIRT's detailed profiling log — accelerator
+compute, accelerator execute, QNN execute, per-op cycles, and per-process
+overhead kept separate from execute time. It is report-only enrichment: an
+adapter that cannot profile still produces a valid benchmark, and the block
+records `available: false` with a reason rather than inventing a number.
+
+**Acceptance run** on SM8750 (serial RFCY30B296K), job
+`20260830T113624Z-d356efb4`, output root
+`artifacts/sm8750-t10-device-latency-v3`:
+
+| metric | value |
+| --- | --- |
+| wall p50 (`host_orchestrated_call_latency`) | 2411 ms |
+| accelerator compute | 79 us |
+| accelerator execute | 1746 us |
+| QNN execute | 2965 us |
+| accelerator execute cycles | 30208 |
+
+Per-op cycles: `Input OpId_2` 8262, `fc:OpId_17` 6227, `bias_add:OpId_21` 0,
+`act:OpId_23` 9271, `Output OpId_3` 6448. Per-process overhead is reported
+separately, including `QNN (load binary) time` 10341 us and `QNN (deinit) time`
+19719 us. Producer: `qnn-net-run v2.49.0.260730134355`.
+
+Wall time is 813x the QNN execute time and 30525x the accelerator compute. That
+ratio is the point of the change: it is now visible in the report instead of
+being hidden behind a false `setup_excluded`.
+
+**`initialize()` landed too**, and the effect is reproducible on hardware: the
+same spec measured 4974 ms p50 before this change and 2411 ms after, matching
+the 3990 -> 2492 ms seen in the isolated probe.
+
+**One implementation trap beyond the profiler one.** QAIRT writes the profiling
+log to a *relative* `output/` directory, and the worker mounts the project root
+read-only at the process cwd, so the profiled execute failed outright with
+`ExecutionError: Failed to execute model` until the capture was given a
+writable `working_dir` (the stage's own attempt directory). This is the same
+read-only-cwd failure class already known from the standalone quantizer's
+calibrate path. The cwd is restored in a `finally`, and a test covers the
+raising case.
+
+Tests: `tests/test_device_metrics.py` (8, against a report captured verbatim
+from the device), plus `test_capture_device_execution_reads_qairt_own_device_numbers`,
+`test_capture_device_execution_refuses_an_initialized_model`,
+`test_capture_device_execution_restores_the_working_directory`,
+`test_initialize_execution_establishes_and_releases_the_context`,
+`test_initialize_execution_fails_closed_without_the_sdk_method`,
+`test_latency_report_publishes_device_side_execution_beside_wall_time`,
+`test_latency_report_no_longer_claims_per_call_setup_is_excluded`,
+`test_benchmark_captures_device_metrics_before_initializing_and_releases_after`,
+and `test_benchmark_survives_an_adapter_that_cannot_profile`.
+
+## Still open
+
+- **The GenAI lane is unmeasured.** `sdk_per_call_setup_included` is
+  `"unverified"` there rather than a guess: the executor's per-call behaviour
+  has not been probed, and `generate()` is a different path from `run_graph`.
+  It needs the same treatment before a GenAI latency number is trusted.
+- **Chain-scope runs** get the honest scope block but no `device_execution`;
+  capture is wired for the single-graph path only.
+- **What "production latency" should mean** for this program is still open. A
+  per-call `qnn-net-run` launch is not a deployment path, so neither number
+  describes a shipped application; the device block is the one that describes
+  the model.

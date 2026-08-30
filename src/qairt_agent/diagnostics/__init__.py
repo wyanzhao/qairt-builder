@@ -1,5 +1,10 @@
 """Report-only quality and latency diagnostics."""
 
+from qairt_agent.diagnostics.device_metrics import (
+    DEVICE_EXECUTION_SCHEMA,
+    DeviceMetricsError,
+    parse_device_execution,
+)
 from qairt_agent.diagnostics.latency import (
     AACalibration,
     LatencyDiagnoser,
@@ -24,6 +29,8 @@ from qairt_agent.diagnostics.sqnr import (
 
 __all__ = [
     "AACalibration",
+    "DEVICE_EXECUTION_SCHEMA",
+    "DeviceMetricsError",
     "LatencyDiagnoser",
     "LatencyMeasurement",
     "LatencySummary",
@@ -39,5 +46,6 @@ __all__ = [
     "compare_aa",
     "compute_sqnr",
     "compute_tensor_quality",
+    "parse_device_execution",
     "summarize_latency",
 ]

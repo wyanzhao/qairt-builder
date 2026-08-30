@@ -8,12 +8,17 @@ can reason about stage inputs and retain structured provenance.
 from __future__ import annotations
 
 import importlib
+import os
 import hashlib
 import json
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from qairt_agent.diagnostics.device_metrics import (
+    DeviceMetricsError,
+    parse_device_execution,
+)
 from qairt_agent.families import (
     FamilyId,
     FamilyProfile,
@@ -1717,6 +1722,117 @@ class QairtSdkAdapter:
             **execution_options,
         )
 
+    def initialize_execution(
+        self,
+        compiled_model_or_path: CompiledContextArtifact | str | Path | Any,
+        *,
+        device: Any = None,
+        **execution_options: Any,
+    ) -> Any:
+        """Establish one persistent execution context for repeated calls.
+
+        Without this, ``CompiledModel._execute`` re-enters
+        ``_create_execution_context`` on every call and QAIRT's ``NetRunner``
+        creates a backend and inferencer per call, unloading at the end.  QAIRT
+        documents ``initialize()`` as the way to call execute repeatedly
+        against the same model/backend/device; measured on SM8750 it takes the
+        tiny acceptance graph from 3990 ms to 2492 ms per call with
+        bit-identical outputs.
+
+        This does not make a sample device time -- QAIRT still relaunches
+        ``qnn-net-run`` per call, so per-call context load, HVX/HMX power-on
+        and deinit remain inside it.  Device-side latency comes from
+        :meth:`capture_device_execution`.
+        """
+
+        self._ensure_ready()
+        model = self._compiled_model(compiled_model_or_path)
+        initialize = getattr(model, "initialize", None)
+        if not callable(initialize):
+            raise QairtConfigurationError(
+                "the compiled model does not expose initialize(); a benchmark "
+                "cannot establish a persistent execution context"
+            )
+        initialize(device=device, **execution_options)
+        return model
+
+    @staticmethod
+    def release_execution(compiled_model: Any) -> None:
+        """Release backend artifacts claimed by :meth:`initialize_execution`."""
+
+        destroy = getattr(compiled_model, "destroy", None)
+        if callable(destroy):
+            destroy()
+
+    def capture_device_execution(
+        self,
+        compiled_model_or_path: CompiledContextArtifact | str | Path | Any,
+        inputs: Any,
+        *,
+        graph_name: str,
+        device: Any = None,
+        native_io: bool = False,
+        level: str = "detailed",
+        working_dir: str | Path | None = None,
+        **execution_options: Any,
+    ) -> dict[str, Any]:
+        """Report what the device spent on one execute, from QAIRT's own log.
+
+        ``level="detailed"`` with no profiling option parses straight from the
+        profiling log and needs no schematic binary, unlike ``optrace``.
+
+        QAIRT writes that log to a relative ``output/`` directory, so the
+        process working directory must be writable.  In the worker the project
+        root is mounted read-only, which fails the execute outright; callers
+        pass ``working_dir`` to run the capture somewhere writable.
+        """
+
+        self._ensure_ready()
+        qairt = self._load_module("qairt")
+        model = self._compiled_model(compiled_model_or_path)
+        if hasattr(model, "_inference_handle"):
+            # initialize() caches an execution context built with profiling
+            # disabled; the profiler then collects an event whose data is None
+            # and generate_reports() dies with "Profiling data: None is not
+            # valid".  Capture before initializing, never after.
+            raise QairtConfigurationError(
+                "capture_device_execution must run before initialize_execution: "
+                "an initialized model carries an execution context created with "
+                "profiling disabled, so QAIRT would report no profiling data"
+            )
+        previous_dir: str | None = None
+        if working_dir is not None:
+            Path(working_dir).mkdir(parents=True, exist_ok=True)
+            previous_dir = os.getcwd()
+        try:
+            if previous_dir is not None:
+                os.chdir(str(working_dir))
+            with qairt.Profiler(context={"level": level}) as profiler:
+                self.run_graph(
+                    model,
+                    inputs,
+                    graph_name=graph_name,
+                    device=device,
+                    native_io=native_io,
+                    **execution_options,
+                )
+            reports = tuple(profiler.generate_reports())
+        finally:
+            if previous_dir is not None:
+                os.chdir(previous_dir)
+        if not reports:
+            raise QairtConfigurationError(
+                "QAIRT returned no profiling report; device-side execute time "
+                "cannot be claimed"
+            )
+        data = getattr(reports[0], "data", None)
+        try:
+            return parse_device_execution(data)
+        except DeviceMetricsError as error:
+            raise QairtConfigurationError(
+                f"QAIRT profiling report is not usable device evidence: {error}"
+            ) from error
+
     def profile(
         self,
         compiled_model_or_path: CompiledContextArtifact | str | Path | Any,
@@ -1729,7 +1845,14 @@ class QairtSdkAdapter:
         option: str = "optrace",
         **execution_options: Any,
     ) -> ProfileResult:
-        """Execute one graph under QAIRT's detailed/optrace profiler."""
+        """Execute one graph under QAIRT's detailed/optrace profiler.
+
+        ``option="optrace"`` additionally requires a schematic binary in the
+        profiling data's ``backend_profiling_artifacts``; without one QAIRT
+        raises "No op trace raw data found." while parsing.  Per-operator cycle
+        counts do not need it -- they are already in the detailed log, which is
+        what :meth:`capture_device_execution` reads.
+        """
 
         self._ensure_ready()
         qairt = self._load_module("qairt")

@@ -35,7 +35,11 @@ from qairt_agent.qairt_adapter import (
     TransformedSliceArtifact,
     Qwen35ValidationEvidence,
 )
-from qairt_agent.qairt_adapter.errors import QairtPreflightError
+from qairt_agent.diagnostics.device_metrics import parse_device_execution
+from qairt_agent.qairt_adapter.errors import (
+    QairtConfigurationError,
+    QairtPreflightError,
+)
 from qairt_agent.vectors import VectorPreparer
 
 
@@ -202,6 +206,80 @@ def _make_vl_spec(tmp_path: Path) -> BuildSpec:
     )
 
 
+# Shape and values captured from QAIRT 2.49 on SM8750 running the tiny
+# acceptance graph; see tests/test_device_metrics.py for the full report.
+SAMPLE_PROFILING_REPORT: dict[str, Any] = {
+    "metadata": {"appName": "qnn-net-run", "appVersion": "v2.49.0.260730134355"},
+    "messages": [
+        {
+            "method": "BACKEND_CREATE_FROM_BINARY",
+            "profilingEvents": [
+                {
+                    "identifier": "QNN (load binary) time",
+                    "unit": "MICROSEC",
+                    "type": "INIT",
+                    "value": 9009,
+                }
+            ],
+        },
+        {
+            "method": "BACKEND_EXECUTE",
+            "profilingEvents": [
+                {
+                    "identifier": "Accelerator (execute excluding wait) time",
+                    "unit": "MICROSEC",
+                    "type": "",
+                    "value": 77,
+                },
+                {
+                    "identifier": "Accelerator (execute) time",
+                    "unit": "MICROSEC",
+                    "type": "",
+                    "value": 1734,
+                },
+                {
+                    "identifier": "QNN (execute) time",
+                    "unit": "MICROSEC",
+                    "type": "EXECUTE",
+                    "value": 3001,
+                },
+                {
+                    "identifier": "Accelerator (execute) time (cycles)",
+                    "unit": "CYCLES",
+                    "type": "",
+                    "value": 29239,
+                    "sub-events": [
+                        {
+                            "identifier": "fc:OpId_17",
+                            "unit": "CYCLES",
+                            "type": "NODE",
+                            "value": 6137,
+                        },
+                        {
+                            "identifier": "act:OpId_23",
+                            "unit": "CYCLES",
+                            "type": "NODE",
+                            "value": 8567,
+                        },
+                    ],
+                },
+            ],
+        },
+        {
+            "method": "BACKEND_DEINIT",
+            "profilingEvents": [
+                {
+                    "identifier": "QNN (deinit) time",
+                    "unit": "MICROSEC",
+                    "type": "DEINIT",
+                    "value": 19359,
+                }
+            ],
+        },
+    ],
+}
+
+
 @dataclass
 class AdapterLog:
     calls: list[tuple[int, str, dict[str, Any]]] = field(default_factory=list)
@@ -240,6 +318,7 @@ class FakeAdapter:
         self.result_style = result_style
         self.profile_cycles = float(profile_cycles)
         self.ready = False
+        self.initialized_contexts: set[str] = set()
 
     def preflight(self, spec: BuildSpec) -> PreflightReport:
         self.ready = True
@@ -405,6 +484,54 @@ class FakeAdapter:
     def load_compiled(self, path: str | Path) -> str:
         self.log.record(self.adapter_id, "load_compiled", path=str(path))
         return f"loaded:{path}"
+
+    def initialize_execution(
+        self,
+        context: Any,
+        *,
+        device: Any = None,
+        **options: Any,
+    ) -> Any:
+        self.log.record(
+            self.adapter_id,
+            "initialize_execution",
+            context=str(context),
+            device=device,
+        )
+        self.initialized_contexts.add(str(context))
+        return context
+
+    def release_execution(self, context: Any) -> None:
+        self.log.record(self.adapter_id, "release_execution", context=str(context))
+        self.initialized_contexts.discard(str(context))
+
+    def capture_device_execution(
+        self,
+        context: Any,
+        inputs: Mapping[str, np.ndarray],
+        *,
+        graph_name: str,
+        device: Any = None,
+        native_io: bool = False,
+        level: str = "detailed",
+        working_dir: Any = None,
+        **options: Any,
+    ) -> dict[str, Any]:
+        if str(context) in self.initialized_contexts:
+            # Mirrors the real adapter: an initialized model carries an
+            # execution context built with profiling disabled, so QAIRT would
+            # report nothing.
+            raise QairtConfigurationError(
+                "capture_device_execution must run before initialize_execution"
+            )
+        self.log.record(
+            self.adapter_id,
+            "capture_device_execution",
+            context=str(context),
+            graph_name=graph_name,
+            level=level,
+        )
+        return parse_device_execution(SAMPLE_PROFILING_REPORT)
 
     def create_genai_executor(
         self,
@@ -710,13 +837,16 @@ class FakeAdapterFactory:
         self.log = AdapterLog()
         self.result_style = result_style
         self.profile_cycles = float(profile_cycles)
+        self.adapters: list[FakeAdapter] = []
 
     def __call__(self) -> FakeAdapter:
-        return FakeAdapter(
+        adapter = FakeAdapter(
             self.log,
             result_style=self.result_style,
             profile_cycles=self.profile_cycles,
         )
+        self.adapters.append(adapter)
+        return adapter
 
 
 class MultiArFakeAdapter(FakeAdapter):
@@ -2526,6 +2656,109 @@ def test_latency_report_labels_the_token_metric_source_and_wall_scope(
     assert scope["clock"] == "host_perf_counter_ns"
     assert scope["device_side_sync_barrier"] is False
     assert scope["sample_unit"] == "graph_invocation"
+
+
+def _benchmark_once(tmp_path: Path, factory: FakeAdapterFactory) -> Any:
+    vector = _vector_case(tmp_path)
+    agent = _fake_agent(factory)
+    plan = agent.plan(_make_spec(tmp_path), offline=True)
+    assert plan.manifest is not None
+    return agent.benchmark(
+        plan.manifest.path,
+        plan.manifest.sha256,
+        config={
+            "context_path": tmp_path / "main.bin",
+            "graph_name": "main_ar1",
+            "vector_manifest": vector,
+            "warmup_runs": 0,
+            "measured_runs": 1,
+            "aa_calibration": False,
+        },
+    )
+
+
+def test_latency_report_publishes_device_side_execution_beside_wall_time(
+    tmp_path: Path,
+) -> None:
+    # The wall sample is host time around one SDK call; on the low-level lane
+    # QAIRT relaunches qnn-net-run per call, so it is thousands of times the
+    # device's own execute time.  The report must carry both.
+    benchmarked = _benchmark_once(tmp_path, FakeAdapterFactory())
+
+    assert benchmarked.ok, benchmarked.error
+    assert benchmarked.data is not None
+    device = benchmarked.data["device_execution"]
+
+    assert device["accelerator_compute_us"] == 77.0
+    assert device["qnn_execute_us"] == 3001.0
+    assert device["source"] == "qairt_profiler_detailed_log"
+    assert device["claim_scope"] == "one_profiled_execute_not_the_timed_samples"
+    assert {item["identifier"] for item in device["per_op_cycles"]} == {
+        "fc:OpId_17",
+        "act:OpId_23",
+    }
+    # Per-process cost is reported, never folded into execute time.
+    assert device["per_process_overhead_us"]["QNN (load binary) time"] == 9009.0
+
+
+def test_latency_report_no_longer_claims_per_call_setup_is_excluded(
+    tmp_path: Path,
+) -> None:
+    # The old report published setup_excluded=true, which was false: per-call
+    # context load, HVX/HMX power-on and deinit happen inside the timed call.
+    benchmarked = _benchmark_once(tmp_path, FakeAdapterFactory())
+
+    assert benchmarked.data is not None
+    assert "setup_excluded" not in benchmarked.data
+    assert benchmarked.data["harness_setup_excluded"] is True
+    assert benchmarked.data["sdk_per_call_setup_included"] is True
+    assert benchmarked.data["metric_name"] == "host_orchestrated_call_latency"
+
+    scope = benchmarked.data["measurement_scope"]
+    assert "adb_staging" in scope["excluded_from_timer"]
+    assert "qnn_net_run_process_launch" in scope["included_in_sample"]
+    assert "hvx_hmx_power_on_and_acquire" in scope["included_in_sample"]
+
+
+def test_benchmark_captures_device_metrics_before_initializing_and_releases_after(
+    tmp_path: Path,
+) -> None:
+    # Ordering is load-bearing twice over: profiling must happen before
+    # initialize() (an initialized model carries a profiling-disabled context),
+    # and the persistent context must be released even though the timed loop
+    # sits between them.
+    factory = FakeAdapterFactory()
+    benchmarked = _benchmark_once(tmp_path, factory)
+    assert benchmarked.ok, benchmarked.error
+
+    names = factory.log.names()
+    capture = names.index("capture_device_execution")
+    initialize = names.index("initialize_execution")
+    release = names.index("release_execution")
+    first_run = names.index("run_graph")
+
+    assert capture < initialize < first_run < release
+    # Nothing is left holding backend artifacts on the device.
+    assert all(not adapter.initialized_contexts for adapter in factory.adapters)
+
+
+def test_benchmark_survives_an_adapter_that_cannot_profile(tmp_path: Path) -> None:
+    # Device evidence is report-only enrichment: an adapter without it still
+    # produces a valid benchmark, and the report says why rather than claiming
+    # a device number it never measured.
+    class NoProfilingFactory(FakeAdapterFactory):
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            adapter = super().__call__(*args, **kwargs)
+            adapter.capture_device_execution = None  # type: ignore[assignment]
+            return adapter
+
+    benchmarked = _benchmark_once(tmp_path, NoProfilingFactory())
+
+    assert benchmarked.ok, benchmarked.error
+    assert benchmarked.data is not None
+    assert "device_execution" not in benchmarked.data
+    # The honest scope statement does not depend on the capture succeeding.
+    assert benchmarked.data["sdk_per_call_setup_included"] is True
 
 
 def test_sdk_generated_token_count_never_derives_from_a_rate() -> None:
