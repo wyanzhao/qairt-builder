@@ -1,11 +1,8 @@
 # T01 — QAIRT SDK upgrade to 2.49.0.260730
 
-Status: in-progress (2026-08-29) — pin, lock, worker image + SDK import smoke,
-target move to SM8750, green `doctor` / `device doctor`, and a real build on the
-2.49 SDK producing an SM8750 context binary. The remaining acceptance criterion
-is the on-device validate/benchmark half, blocked on a one-time privileged host
-DNS bridge the agent must not run itself; the exact command and the prepared run
-are at the end of "The pin change".
+Status: done (2026-08-30) — every acceptance criterion met, including a real
+build/validate/benchmark run on the SM8750 handset with reopenable reports
+(SQNR 41.63 dB against the supplied golden).
 Depends on: —
 Effort: L
 
@@ -319,13 +316,49 @@ and the run failed with the server's own
 `error: device 'RFCY30B296K' not found` -- i.e. the DNS half is proven working
 and only the physically disconnected handset remains.
 
-### What is still required before this task can be marked done
+### The device acceptance run (2026-08-30)
 
-Only the on-device half -- validate and benchmark -- and only because the
-handset is unplugged. The privileged DNS bridge is configured and verified, and
-the build half is done with a reopenable report. Reconnect the SM8750 over USB
-(`adb devices` should list `RFCY30B296K`), then one command produces the
-acceptance evidence:
+With the maintainer's DNS bridge in place, the alias check fixed, and the
+handset reconnected, `qairt-agent workflow --spec models/acceptance/spec.json`
+completed **build -> validate -> benchmark** on the real SM8750:
+
+- Manifest revision 3 under
+  `artifacts/sm8750-acceptance-ae/manifests/0f6048aa-.../manifest-r000003-85fffd8c....json`,
+  with `validate` and `benchmark` both recording
+  `device_identifier: RFCY30B296K@host.container.internal:5037`.
+- **SQNR 41.63 dB**, RMSE 0.00511, cosine 0.999966, status `measured`, against
+  the supplied golden (`reference_source: "provided"`, so no ORT fallback was
+  used); `coverage.complete` true for AR1; `policy: report_only`.
+- Latency p50 4833.99 ms, p90 5016.49 ms, min 4721.34 ms, robust CV 3.45% over
+  the low-level lane's 2 warmup + 5 measured invocations. Read that number for
+  what the report itself says it is: a 64x32 MatMul cannot take 4.8 s of
+  compute, and `measurement_scope` states that each sample is warmed **host**
+  wall time around one call including the host-to-container-to-ADB-to-device
+  round trip. This run proves the path and the reporting, not the model's
+  on-NPU time; per-op attribution needs optrace.
+- The benchmark report carries `static_footprint` with
+  `source: "build_receipt"` and `total_bytes` 49824, i.e. T05 copying the
+  verified build receipt rather than re-measuring, confirmed on real artifacts.
+- Remote cleanup behaved to contract: both attempt directories were removed and
+  the leases released, while the `<run>/<stage>/` parents were left in place --
+  cleanup is never broadened to a parent.
+
+Two device-lifecycle behaviours were exercised for real along the way. When the
+handset was unplugged mid-run, the worker left a retained lease, and the next
+run correctly refused with "device is already leased" rather than racing it;
+`qairt-agent device gc` then released the stale lease (`heartbeat_stale`) and
+removed the orphaned remote attempt directory, exactly as designed.
+
+### Signature probes, now import-based
+
+`tools/sdk_signature_probe.py` runs the probe **inside the worker container**,
+where the SDK genuinely imports, and reports real `inspect.signature` output:
+**29/29 present** on 2.49.0.260730, covering the private `_transform` binding,
+the Qwen3.5 builder entry points, `CompileConfig.set_mode`, the workflow
+config classes, and the standalone quantizer. The static host-side parse above
+is what motivated each probe; this is what proves it.
+
+### Reproducing the acceptance run
 
 ```bash
 QAIRT_AGENT_ADB_SERIAL=RFCY30B296K QAIRT_AGENT_ADB_SERVER=localhost:5037 \

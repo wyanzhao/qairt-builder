@@ -69,9 +69,13 @@ following. File:line references are as of commit `8b42269`.
    (and `SM8750 = 69`), and `include/QNN/HTP/QnnHtpDevice.h:60` documents the
    device field as a `Qnn_SocModel_t` enum value. 660 is SM8850's **Android
    SoC ID** (`android_device_constants.py`), a different scheme. Not changed
-   in place: a wrong `soc_model` produces a context binary compiled for the
-   wrong SoC that can still load, so this must be settled by a device run
-   inside T02, which now carries the full evidence table.
+   in place at the time: a wrong `soc_model` produces a context binary compiled
+   for the wrong SoC that can still load. **Settled for SM8750 (T01,
+   2026-08-30)**: the maintainer approved the reading, the pin moved to
+   SM8750 / v79 / soc_model 69, and a real build/validate/benchmark run on the
+   handset succeeded with it — the device itself reports `soc_id 618`, the
+   other scheme. SM8850's `soc_model 87` is still unproven on hardware and
+   returns with T02's registry.
 6. **Linear-attention knowledge is low-level-lane only**: MHA2SHA start points
    (`src/qairt_agent/families/profiles.py:138-152`), recurrent/conv state
    contracts (`adapter.py:553-724`), and native-KV state exclusion
@@ -112,11 +116,12 @@ T01 verification item.
   `device_identifier: null` and `remote_cleanup: "confirmed"` to non-device
   validation metrics.
 - `adapter.py:265`: binds the private module `qairt.api.transforms._transform`;
-  brittle across SDK versions (verify at T01). **Still open.** Probed against
-  2.49.0.260730: the module and its `transform(...)` signature are unchanged,
-  but there is **no public `qairt.api.transforms.transform` re-export** to
-  rebind to, so the private binding has to stay. 23/23 bound SDK surfaces are
-  present in 2.49; details in [T01](T01-sdk-upgrade-2.49.md).
+  brittle across SDK versions (verify at T01). **Still open, and now watched.**
+  Confirmed on 2.49.0.260730 by an import-based probe inside the worker: the
+  module and its `transform(...)` signature are unchanged, but there is **no
+  public `qairt.api.transforms.transform` re-export** to rebind to, so the
+  private binding has to stay. `tools/sdk_signature_probe.py` covers it (29/29
+  present) so the next upgrade fails loudly rather than silently.
 
 ## Environment facts (as reviewed)
 

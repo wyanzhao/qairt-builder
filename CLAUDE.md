@@ -326,6 +326,9 @@ For an upgrade:
    `worker.dependencies_file`; do not reuse an old release lock silently.
 3. Update Docker/Apple-container image inputs only through the harness values.
 4. Update SDK signature probes and family capability tests for the new build.
+   `tools/sdk_signature_probe.py` is that probe; run it **inside the worker
+   container**, where the SDK imports, and it fails naming any bound surface
+   the new build dropped.
 5. Run the complete test suite, compile check, project doctor, worker SDK
    import smoke, and at least one real-device golden/latency acceptance run.
 6. Update examples and capability claims only after those gates pass.
