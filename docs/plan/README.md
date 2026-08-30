@@ -28,8 +28,9 @@ new decision entry here instead.
   on-target outputs. Layer-by-layer comparison is a **debug-only mode**: the
   capability must exist but is never enabled by default.
 - **RAM**: static artifact footprint only (context/container byte sizes).
-- **Latency**: keep the host wall-clock + optrace methodology; add GenAI-lane
-  measurement defaults and explicit token-count support.
+- **Latency**: *superseded 2026-08-30 — see the amendment below.* Originally:
+  keep the host wall-clock + optrace methodology; add GenAI-lane measurement
+  defaults and explicit token-count support.
 - **Hardware**: SM8850 and SM8750, selected through a reviewed target registry.
   The single hard-pinned target is removed; fail-closed discipline (no
   fallback, no unregistered target) is retained.
@@ -113,6 +114,22 @@ must settle the SM8850 `soc_model` discrepancy T02 now documents.
   observed. Drift is made loud, never followed silently: a reviewed fingerprint
   guards the start points, and the signature probe covers every newly bound
   surface.
+- **Latency means device time (supersedes the 2026-08-29 latency decision).**
+  The host wall-clock number was never device time: QAIRT relaunches
+  `qnn-net-run` per call, so per-call context load, HVX/HMX power-on and deinit
+  sit inside the sample. On SM8750 a 49 KB graph measured ~4900 ms against 79 us
+  of accelerator compute. T10 corrected the reported scope and published
+  device-side execute time and per-op cycles from QAIRT's own profiling log;
+  T11 makes device the only metric and demotes wall to harness diagnostics.
+  The two lanes have **different meters** and must never be conflated: the
+  low-level lane reports accelerator/QNN execute time, while the GenAI lane can
+  only report Genie's dialog-level device timings and token rates, because
+  `generate()` reaches Genie rather than `CompiledModel.__call__` and
+  `qairt.Profiler` cannot observe it. Per-op attribution on the GenAI lane
+  requires an explicit single-`ar` raw `CompiledModel` profiling run.
+- **optrace is not the source of per-op cycles.** `option="optrace"` needs a
+  schematic binary this program's compile does not emit and fails without one;
+  per-op cycles come from `level="detailed"` alone.
 
 ## Progress log
 
