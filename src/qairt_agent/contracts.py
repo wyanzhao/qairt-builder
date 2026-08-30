@@ -27,7 +27,12 @@ from pydantic import (
 )
 
 from qairt_agent.errors import ErrorCode, ToolError, ToolErrorData
-from qairt_agent.harness import load_harness_constraints
+from qairt_agent.harness import (
+    HarnessConstraintsError,
+    load_harness_constraints,
+    resolve_target,
+    resolve_target_tuple,
+)
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -368,15 +373,12 @@ class TargetSpec(FrozenContract):
     """Pinned QAIRT worker and target-device contract."""
 
     backend: Literal["HTP"] = "HTP"
-    chipset: str = Field(
-        default_factory=lambda: load_harness_constraints().target_chipset
+    name: str = Field(
+        default_factory=lambda: load_harness_constraints().target_name
     )
-    dsp_arch: str = Field(
-        default_factory=lambda: load_harness_constraints().target_dsp_arch
-    )
-    soc_model: int = Field(
-        default_factory=lambda: load_harness_constraints().target_soc_model
-    )
+    chipset: str = ""
+    dsp_arch: str = ""
+    soc_model: int = 0
     platform: Literal["android", "x86_64_linux"] = "android"
     device_id: str | None = None
     qairt_version: str = Field(
@@ -397,22 +399,59 @@ class TargetSpec(FrozenContract):
             raise ValueError(
                 f"qairt_build_id must match harness {constraints.qairt_build_id}"
             )
-        # The target tuple has exactly one reviewed source. Rejecting a
-        # mismatch here rather than at compile time keeps a spec that names
-        # the wrong device from planning as if it were deployable.
-        expected = (
-            constraints.target_chipset,
-            constraints.target_dsp_arch,
-            constraints.target_soc_model,
-        )
-        actual = (self.chipset, self.dsp_arch, self.soc_model)
-        if actual != expected:
-            raise ValueError(
-                "target must match the reviewed harness tuple "
-                f"{expected[0]}/{expected[1]}/soc_model {expected[2]}, got "
-                f"{actual[0]}/{actual[1]}/soc_model {actual[2]}"
-            )
         return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_registered_target(cls, value: Any) -> Any:
+        """Resolve a target by name, or accept a tuple that matches one.
+
+        A target is legal because it is registered under ``harness/targets/``,
+        not because it matches a constant. A caller may name one, or supply the
+        full ``chipset``/``dsp_arch``/``soc_model`` tuple as long as it matches
+        a registered entry exactly -- anything else fails here, at spec time,
+        rather than at compile time.
+        """
+
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        supplied = {
+            key: data.get(key)
+            for key in ("chipset", "dsp_arch", "soc_model")
+            if data.get(key) not in (None, "", 0)
+        }
+        # Registry errors surface as ordinary validation errors so a bad target
+        # reads like any other bad field rather than escaping the model.
+        try:
+            if len(supplied) == 3:
+                entry = resolve_target_tuple(
+                    str(supplied["chipset"]),
+                    str(supplied["dsp_arch"]),
+                    int(supplied["soc_model"]),
+                )
+            elif supplied:
+                raise ValueError(
+                    "target must name a registered target or supply the "
+                    "complete chipset/dsp_arch/soc_model tuple; a partial "
+                    "tuple is never completed implicitly "
+                    f"(got {sorted(supplied)})"
+                )
+            else:
+                entry = resolve_target(data.get("name"))
+        except HarnessConstraintsError as error:
+            raise ValueError(str(error)) from error
+        if len(supplied) == 3:
+            if data.get("name") and str(data["name"]).lower() != entry.name:
+                raise ValueError(
+                    f"target name {data['name']!r} does not match the supplied "
+                    f"tuple, which is the registered target {entry.name!r}"
+                )
+        data["name"] = entry.name
+        data["chipset"] = entry.chipset
+        data["dsp_arch"] = entry.dsp_arch
+        data["soc_model"] = entry.soc_model
+        return data
 
 
 class SqnrMode(str, Enum):

@@ -32,18 +32,23 @@ from qairt_agent.errors import DeviceUnavailableError
 from qairt_agent.harness import (
     DEFAULT_CONSTRAINTS,
     HarnessConstraints,
+    TargetEntry,
     load_harness_constraints,
+    resolve_target,
 )
 
 __all__ = ["device_doctor", "require_healthy", "device_gc"]
 
+
+def _target_text(entry: TargetEntry) -> str:
+    """Render one registered target as the compact triple reports carry."""
+
+    return f"{entry.chipset}/{entry.dsp_arch}/{entry.soc_model}"
+
+
 #: The QAIRT build id this agent is pinned to (see contracts.TargetSpec).
 EXPECTED_SDK_BUILD = DEFAULT_CONSTRAINTS.qairt_build_id
-DEFAULT_TARGET = (
-    f"{DEFAULT_CONSTRAINTS.target_chipset}/"
-    f"{DEFAULT_CONSTRAINTS.target_dsp_arch}/"
-    f"{DEFAULT_CONSTRAINTS.target_soc_model}"
-)
+DEFAULT_TARGET = _target_text(resolve_target(constraints=DEFAULT_CONSTRAINTS))
 
 
 def _check(ok: bool, message: str, **extra: Any) -> dict[str, Any]:
@@ -152,11 +157,7 @@ def device_doctor(
         expected_sdk_build if sdk_build is None else sdk_build
     )
     resolved_target = (
-        (
-            f"{active.target_chipset}/"
-            f"{active.target_dsp_arch}/"
-            f"{active.target_soc_model}"
-        )
+        _target_text(resolve_target(constraints=active))
         if target is None
         else target
     )

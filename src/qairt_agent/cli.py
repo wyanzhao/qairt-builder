@@ -51,7 +51,11 @@ from qairt_agent.families.presets import (
     resolve_workflow,
     to_build_spec,
 )
-from qairt_agent.harness import DEFAULT_CONSTRAINTS, load_harness_constraints
+from qairt_agent.harness import (
+    DEFAULT_CONSTRAINTS,
+    load_harness_constraints,
+    resolve_target,
+)
 from qairt_agent.jobs.journal import JobJournal
 from qairt_agent.jobs.worker import DEFAULT_WORKFLOW_STAGES
 
@@ -565,7 +569,11 @@ def _spawn_worker_impl(job_id: str, jobs_root: Path) -> int:
                 f"/workspace/{config.harness_constraints}"
             ),
         }
-        for name in ("QAIRT_AGENT_ADB_SERIAL", "QAIRT_AGENT_ADB_SERVER"):
+        for name in (
+            "QAIRT_AGENT_ADB_SERIAL",
+            "QAIRT_AGENT_ADB_SERVER",
+            "QAIRT_AGENT_TARGET_ACCEPTANCE",
+        ):
             if value := env.get(name):
                 container_env[name] = value
         server = container_env.get("QAIRT_AGENT_ADB_SERVER")
@@ -836,6 +844,21 @@ def _cmd_image(args: argparse.Namespace, client: QairtAgentClient, out: TextIO, 
     return 0
 
 
+def _effective_target(build_spec: Any) -> dict[str, Any]:
+    """Render the resolved target, including whether hardware has proven it."""
+
+    entry = resolve_target(build_spec.target.name)
+    return {
+        "name": entry.name,
+        "chipset": entry.chipset,
+        "dsp_arch": entry.dsp_arch,
+        "soc_model": entry.soc_model,
+        "soc_id": list(entry.soc_id),
+        "verified": entry.verified,
+        "registry_entry": str(entry.source_path),
+    }
+
+
 def _cmd_plan(args: argparse.Namespace, client: QairtAgentClient, out: TextIO, spawner: Any) -> int:
     workflow_spec = client._normalize_spec(args.spec)  # noqa: SLF001 - CLI uses the normalizer
     resolved = resolve_workflow(workflow_spec)
@@ -851,6 +874,7 @@ def _cmd_plan(args: argparse.Namespace, client: QairtAgentClient, out: TextIO, s
             "quality": workflow_spec.quality.model_dump(mode="json"),
             "effective_compile": effective_build.compile.model_dump(mode="json"),
             "effective_benchmark": effective_benchmark_policy(effective_build),
+            "effective_target": _effective_target(effective_build),
             "workflow_stages": list(DEFAULT_WORKFLOW_STAGES),
         },
     )

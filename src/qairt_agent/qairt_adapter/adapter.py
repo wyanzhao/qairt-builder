@@ -36,10 +36,16 @@ from .native_kv import (
     build_native_kv_config,
     require_native_kv_audit,
 )
+from qairt_agent.harness import (
+    HarnessConstraintsError,
+    TargetEntry,
+    require_verified_target,
+    resolve_target,
+    resolve_target_tuple,
+)
+
 from .preflight import (
-    PINNED_DSP_ARCH,
-    PINNED_SOC_MODEL,
-    PINNED_TARGET_SOC,
+    ACTIVE_TARGET,
     PreflightChecker,
     require_preflight,
 )
@@ -453,20 +459,49 @@ class QairtSdkAdapter:
         )
 
     @staticmethod
-    def _validate_target(target_soc: str, dsp_arch: str, soc_model: int) -> None:
-        if str(target_soc).upper() != PINNED_TARGET_SOC:
-            raise QairtConfigurationError(
-                f"target_soc must be {PINNED_TARGET_SOC}; no implicit target is allowed"
+    def _resolve_named_target(target: "TargetEntry | str | None") -> TargetEntry:
+        """Resolve a caller's target, defaulting to the one the harness names.
+
+        The GenAI lanes take a target rather than reading a module constant, so
+        which SoC a container is built for is an argument of the call and shows
+        up in its recorded build report.
+        """
+
+        if isinstance(target, TargetEntry):
+            entry = target
+        else:
+            try:
+                entry = resolve_target(target)
+            except HarnessConstraintsError as error:
+                raise QairtConfigurationError(str(error)) from error
+        try:
+            return require_verified_target(entry)
+        except HarnessConstraintsError as error:
+            raise QairtConfigurationError(str(error)) from error
+
+    @staticmethod
+    def _validate_target(
+        target_soc: str, dsp_arch: str, soc_model: int
+    ) -> TargetEntry:
+        """Require an exact, reviewed, hardware-verified registry entry.
+
+        There is no pinned tuple to compare against any more: a target is legal
+        because it is registered under ``harness/targets/`` and has a
+        ``verified`` block recording a real-device acceptance run, not because
+        it matches a constant.
+        """
+
+        try:
+            entry = resolve_target_tuple(
+                str(target_soc), str(dsp_arch), int(soc_model)
             )
-        if str(dsp_arch).lower() != PINNED_DSP_ARCH:
-            raise QairtConfigurationError(
-                f"dsp_arch must be {PINNED_DSP_ARCH} for {PINNED_TARGET_SOC}; "
-                "an implicitly resolved architecture is forbidden"
-            )
-        if int(soc_model) != PINNED_SOC_MODEL:
-            raise QairtConfigurationError(
-                f"soc_model must be {PINNED_SOC_MODEL} for {PINNED_TARGET_SOC}"
-            )
+        except HarnessConstraintsError as error:
+            raise QairtConfigurationError(str(error)) from error
+        try:
+            require_verified_target(entry)
+        except HarnessConstraintsError as error:
+            raise QairtConfigurationError(str(error)) from error
+        return entry
 
     @staticmethod
     def _context_key(
@@ -978,22 +1013,23 @@ class QairtSdkAdapter:
         )
 
     @staticmethod
-    def _validate_compiler_target(config: Any) -> None:
-        """Refuse a compile whose resolved device target is not the pinned one.
+    def _validate_compiler_target(config: Any, target: TargetEntry) -> None:
+        """Refuse a compile whose resolved device target is not the named one.
 
         An empty device-config list is the SDK's "could not set soc model for
         chipset ... skipping device config creation" path, which leaves the
         compiler on its own defaults. Those defaults are ``dsp_arch v79`` with
-        ``soc_model 69`` -- the exact SM8750 tuple -- so a resolved-value check
-        alone cannot tell an intended SM8750 target from a silent fallback.
-        The empty list must therefore fail closed in its own right.
+        ``soc_model 69`` -- exactly the registered SM8750 tuple -- so for that
+        target a resolved-value check cannot tell an intended target from a
+        silent fallback. The empty list therefore fails closed in its own right,
+        whichever target was named.
         """
 
         device_configs = getattr(config, "device_custom_configs", None)
         if not device_configs:
             raise QairtConfigurationError(
                 "CompileConfig produced no device configuration for "
-                f"{PINNED_TARGET_SOC}; QAIRT skips device-config creation when "
+                f"{target.chipset}; QAIRT skips device-config creation when "
                 "it cannot resolve the requested SoC and would compile against "
                 "its own default target"
             )
@@ -1001,12 +1037,14 @@ class QairtSdkAdapter:
             soc_model = getattr(device_config, "soc_model", None)
             dsp_arch = getattr(device_config, "dsp_arch", None)
             dsp_value = getattr(dsp_arch, "value", dsp_arch)
-            if int(soc_model) != PINNED_SOC_MODEL or str(dsp_value).lower() != PINNED_DSP_ARCH:
+            if (
+                int(soc_model) != target.soc_model
+                or str(dsp_value).lower() != target.dsp_arch
+            ):
                 raise QairtConfigurationError(
                     "CompileConfig resolved "
-                    f"{dsp_value}/soc_model {soc_model} instead of the pinned "
-                    f"{PINNED_TARGET_SOC} {PINNED_DSP_ARCH}/soc_model "
-                    f"{PINNED_SOC_MODEL}; refusing an SDK fallback"
+                    f"{dsp_value}/soc_model {soc_model} instead of the named "
+                    f"{target.tuple_text}; refusing an SDK fallback"
                 )
 
     def compile_context(
@@ -1037,7 +1075,7 @@ class QairtSdkAdapter:
         selected_graph_names = tuple(str(name) for name in graph_names)
         selected_ars = tuple(int(value) for value in ar_values)
         selected_sources = tuple(str(value).lower() for value in source_kinds)
-        self._validate_target(target_soc, dsp_arch, soc_model)
+        target = self._validate_target(target_soc, dsp_arch, soc_model)
         validate_weight_sharing_sources(
             resolved_profile or FamilyId.QWEN3_DENSE,
             selected_sources,
@@ -1166,8 +1204,8 @@ class QairtSdkAdapter:
         config = qairt.CompileConfig(
             backend="HTP",
             soc_details=(
-                f"chipset:{PINNED_TARGET_SOC};dsp_arch:{PINNED_DSP_ARCH};"
-                f"soc_model:{PINNED_SOC_MODEL}"
+                f"chipset:{target.chipset};dsp_arch:{target.dsp_arch};"
+                f"soc_model:{target.soc_model}"
             ),
             data_format_config=str(native_config_path) if native_config_path is not None else None,
             **supplied_config_options,
@@ -1176,10 +1214,10 @@ class QairtSdkAdapter:
             config.set_mode(
                 "weight_sharing",
                 graph_names=list(selected_graph_names),
-                soc_model=PINNED_SOC_MODEL,
-                dsp_arch=PINNED_DSP_ARCH,
+                soc_model=target.soc_model,
+                dsp_arch=target.dsp_arch,
             )
-        self._validate_compiler_target(config)
+        self._validate_compiler_target(config, target)
 
         sdk_models: list[Any] = []
         for item in selected_models:
@@ -1201,9 +1239,9 @@ class QairtSdkAdapter:
             slice_name=resolved_slice,
             graph_names=selected_graph_names,
             ar_values=selected_ars,
-            target_soc=PINNED_TARGET_SOC,
-            dsp_arch=PINNED_DSP_ARCH,
-            soc_model=PINNED_SOC_MODEL,
+            target_soc=target.chipset,
+            dsp_arch=target.dsp_arch,
+            soc_model=target.soc_model,
             weight_sharing=weight_sharing,
             native_kv_config_path=native_config_path,
             context_length=resolved_context,
@@ -1316,17 +1354,20 @@ class QairtSdkAdapter:
             )
 
         target_soc = _first(
-            spec, (("target", "chipset"), ("target_soc",)), default=PINNED_TARGET_SOC
+            spec, (("target", "chipset"), ("target_soc",)),
+            default=ACTIVE_TARGET.chipset,
         )
         dsp_arch = _first(
-            spec, (("target", "dsp_arch"), ("dsp_arch",)), default=PINNED_DSP_ARCH
+            spec, (("target", "dsp_arch"), ("dsp_arch",)),
+            default=ACTIVE_TARGET.dsp_arch,
         )
         soc_model = int(
             _first(
-                spec, (("target", "soc_model"), ("soc_model",)), default=PINNED_SOC_MODEL
+                spec, (("target", "soc_model"), ("soc_model",)),
+                default=ACTIVE_TARGET.soc_model,
             )
         )
-        self._validate_target(str(target_soc), str(dsp_arch), soc_model)
+        target = self._validate_target(str(target_soc), str(dsp_arch), soc_model)
         compile_options = dict(
             _first(
                 effective_config,
@@ -1426,9 +1467,9 @@ class QairtSdkAdapter:
                     "quantization_mode": mode,
                     "graph_name": graph_name,
                     "target": {
-                        "chipset": PINNED_TARGET_SOC,
-                        "dsp_arch": PINNED_DSP_ARCH,
-                        "soc_model": PINNED_SOC_MODEL,
+                        "chipset": target.chipset,
+                        "dsp_arch": target.dsp_arch,
+                        "soc_model": target.soc_model,
                     },
                     "weight_sharing": False,
                     "native_kv": False,
@@ -1774,6 +1815,7 @@ class QairtSdkAdapter:
             GenAIAttachedModel | Mapping[str, Any],
         ]
         | None = None,
+        target: TargetEntry | str | None = None,
         exist_ok: bool = False,
     ) -> GenAIContainerBuildResult:
         """Build and save one production container through QAIRT GenAI Builder.
@@ -1794,6 +1836,7 @@ class QairtSdkAdapter:
         unsupported executor.
         """
 
+        resolved_target = self._resolve_named_target(target)
         resolved_profile = _profile(family)
         assert resolved_profile is not None
         is_multimodal = resolved_profile.family is FamilyId.QWEN3_VL
@@ -2081,8 +2124,9 @@ class QairtSdkAdapter:
             )
         builder.encodings_path = str(source_encodings_path)
         target_spec = (
-            f"chipset:{PINNED_TARGET_SOC};dsp_arch:{PINNED_DSP_ARCH};"
-            f"soc_model:{PINNED_SOC_MODEL}"
+            f"chipset:{resolved_target.chipset};"
+            f"dsp_arch:{resolved_target.dsp_arch};"
+            f"soc_model:{resolved_target.soc_model}"
         )
         builder.set_targets([target_spec])
 
@@ -2279,9 +2323,9 @@ class QairtSdkAdapter:
                         "notes": compatibility_notes,
                     },
                     "target": {
-                        "chipset": PINNED_TARGET_SOC,
-                        "dsp_arch": PINNED_DSP_ARCH,
-                        "soc_model": PINNED_SOC_MODEL,
+                        "chipset": resolved_target.chipset,
+                        "dsp_arch": resolved_target.dsp_arch,
+                        "soc_model": resolved_target.soc_model,
                     },
                     "sequence": {
                         "ar_values": normalized_ars,
@@ -2344,9 +2388,9 @@ class QairtSdkAdapter:
             num_splits=split_plan.num_splits,
             split_embedding=split_plan.split_embedding,
             split_lm_head=split_plan.split_lm_head,
-            target_soc=PINNED_TARGET_SOC,
-            dsp_arch=PINNED_DSP_ARCH,
-            soc_model=PINNED_SOC_MODEL,
+            target_soc=resolved_target.chipset,
+            dsp_arch=resolved_target.dsp_arch,
+            soc_model=resolved_target.soc_model,
             weight_sharing=weight_sharing,
             native_kv=native_kv,
             runtime_supported=runtime_supported,
@@ -2384,6 +2428,7 @@ class QairtSdkAdapter:
             GenAIAttachedModel | Mapping[str, Any],
         ]
         | None = None,
+        target: TargetEntry | str | None = None,
         exist_ok: bool = False,
     ) -> GenAIContainerBuildResult:
         """Build a Qwen3.5-Omni AUDIO_ENCODER -> TEXT_GENERATOR package.
@@ -2394,6 +2439,8 @@ class QairtSdkAdapter:
         method therefore packages both SDK containers while explicitly
         reporting ``runtime_supported=False`` and never probes that executor.
         """
+
+        resolved_target = self._resolve_named_target(target)
 
         if not isinstance(split_plan, SplitPlan):
             raise QairtConfigurationError("split_plan must be a families.SplitPlan")
@@ -2594,8 +2641,9 @@ class QairtSdkAdapter:
             )
 
         target_spec = (
-            f"chipset:{PINNED_TARGET_SOC};dsp_arch:{PINNED_DSP_ARCH};"
-            f"soc_model:{PINNED_SOC_MODEL}"
+            f"chipset:{resolved_target.chipset};"
+            f"dsp_arch:{resolved_target.dsp_arch};"
+            f"soc_model:{resolved_target.soc_model}"
         )
         audio_builder.set_targets([target_spec])
         text_builder.encodings_path = str(text_encodings)
@@ -2708,9 +2756,9 @@ class QairtSdkAdapter:
                         "notes": compatibility_notes,
                     },
                     "target": {
-                        "chipset": PINNED_TARGET_SOC,
-                        "dsp_arch": PINNED_DSP_ARCH,
-                        "soc_model": PINNED_SOC_MODEL,
+                        "chipset": resolved_target.chipset,
+                        "dsp_arch": resolved_target.dsp_arch,
+                        "soc_model": resolved_target.soc_model,
                     },
                     "configs": {
                         "audio": str(audio_model_config),
@@ -2758,9 +2806,9 @@ class QairtSdkAdapter:
             num_splits=split_plan.num_splits,
             split_embedding=split_plan.split_embedding,
             split_lm_head=split_plan.split_lm_head,
-            target_soc=PINNED_TARGET_SOC,
-            dsp_arch=PINNED_DSP_ARCH,
-            soc_model=PINNED_SOC_MODEL,
+            target_soc=resolved_target.chipset,
+            dsp_arch=resolved_target.dsp_arch,
+            soc_model=resolved_target.soc_model,
             weight_sharing=weight_sharing,
             native_kv=native_kv,
             runtime_supported=False,

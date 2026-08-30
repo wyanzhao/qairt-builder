@@ -12,8 +12,13 @@
     "mode": "apply_encodings"
   },
   "sequence": {
-    "ars": [1, 128],
-    "context_lengths": [4096],
+    "ars": [
+      1,
+      128
+    ],
+    "context_lengths": [
+      4096
+    ],
     "weight_sharing": true,
     "native_kv": true
   },
@@ -27,7 +32,11 @@
     "validation_manifest": "/models/qwen3/vectors/validation.json"
   },
   "quality": {
-    "sqnr_modes": ["full_reference", "teacher_forced", "chain"],
+    "sqnr_modes": [
+      "full_reference",
+      "teacher_forced",
+      "chain"
+    ],
     "dump_intermediates_on_failure": true
   },
   "benchmark": {
@@ -37,9 +46,7 @@
   },
   "target": {
     "backend": "HTP",
-    "chipset": "SM8750",
-    "dsp_arch": "v79",
-    "soc_model": 69,
+    "name": "sm8850",
     "device_id": "default"
   },
   "output_root": "/artifacts/qwen3"

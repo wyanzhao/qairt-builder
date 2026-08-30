@@ -29,12 +29,11 @@ Settled program decisions (2026-08-29; details and rationale in
   mode: slice-boundary comparison has landed (T04 tier 1), layer-level
   drilldown has not. Neither is ever a default, and neither alters production
   reports.
-- Hardware: SM8850 and SM8750 through a reviewed target registry (T02). Until
-  T02 lands there is one pinned target, and it is **SM8750 / v79 / soc_model
-  69** — the device this program is currently accepted on. `soc_model` is the
-  `Qnn_SocModel_t` value, not the Android SoC ID (SM8750's SoC IDs are 618 and
-  639); conflating the two is what made the earlier SM8850 pin wrong. SM8850 is
-  `v81 / soc_model 87` and returns with T02.
+- Hardware: **SM8850 and SM8750, through the reviewed target registry** under
+  `harness/targets/`. Both are accepted on real hardware. `soc_model` is the
+  `Qnn_SocModel_t` value the compiler consumes — SM8850 is 87, SM8750 is 69 —
+  and is a different scheme from the Android `soc_id` a device reports (660,
+  and 618/639); conflating the two is what made an earlier pin wrong.
 - **Out of scope by decision** — do not build or claim: direct Genie API
   integration, power/thermal measurement, token-level accuracy metrics,
   end-to-end Omni audio runtime, end-to-end Qwen3-VL multimodal execution.
@@ -307,7 +306,8 @@ after collection. Never broaden cleanup to a parent directory.
 
 `harness/constraints.json` is the reviewed source of truth for the QAIRT
 version/build, Ubuntu image, Python ABI, worker image, runtime CLI versions,
-dependency lock path, Torch version, and target tuple. A project may select a
+dependency lock path, Torch version, and the *name* of the active target; the
+target's own values live in `harness/targets/<name>.json`. A project may select a
 different reviewed constraints file with
 `QAIRT_AGENT_HARNESS_CONSTRAINTS`; do not override individual pins ad hoc.
 `qairt-agent init` materializes the selected Dockerfile/lock and a deterministic
@@ -337,14 +337,31 @@ Do not relax a version mismatch into a warning. Until a new SDK is proven,
 preflight must fail closed. The pin is QAIRT 2.49.0.260730 (build
 `260730134355`), landed by [T01](docs/plan/T01-sdk-upgrade-2.49.md).
 
-The target tuple has the same single source: `harness/constraints.json`.
-`TargetSpec` defaults from it and rejects a spec that names a different tuple,
-so a wrong device fails at spec time rather than at compile time. One guard
-needs care on SM8750: QAIRT's own compile default is `v79`/`soc_model 69`,
-which is exactly the SM8750 tuple, so a resolved-value check cannot distinguish
-an intended target from a silent fallback. An empty `device_custom_configs`
-list — the SDK's "skipping device config creation" path — therefore fails
-closed in its own right.
+Targets live in a reviewed registry, one `harness/targets/<name>.json` per
+target, and `harness/constraints.json` only names which one is active. Each
+entry carries `chipset`, `dsp_arch`, `soc_model` (the `Qnn_SocModel_t` value),
+the Android `soc_id` list, and a `verified` block recording the real-device
+acceptance run that qualified it.
+
+A spec selects a target by `name`, or supplies the complete
+`chipset`/`dsp_arch`/`soc_model` tuple, which is accepted only if it matches a
+registered entry exactly. A partial tuple is never completed implicitly, an
+unregistered name or tuple fails at spec time, and there is no built-in default
+— the harness names one. `qairt-agent plan` renders the resolved target under
+`effective_target`, including whether it is verified.
+
+A target with no `verified` block still plans, but build and device stages
+refuse it: it has never been proven on hardware. Because a target cannot become
+verified without a run and a run is refused while it is unverified, the
+qualifying run is the one explicit exception — set
+`QAIRT_AGENT_TARGET_ACCEPTANCE=<name>` for that run only, and record its
+outcome in the registry entry afterwards.
+
+One guard needs care on SM8750: QAIRT's own compile default is `v79`/`soc_model
+69`, which is exactly the SM8750 tuple, so a resolved-value check cannot
+distinguish an intended target from a silent fallback. An empty
+`device_custom_configs` list — the SDK's "skipping device config creation"
+path — therefore fails closed in its own right, whichever target was named.
 
 ## Development checks
 

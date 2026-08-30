@@ -22,6 +22,7 @@ from qairt_agent.contracts import (
     SqnrMode,
     StageRecord,
     StageStatus,
+    TargetSpec,
     ToolResult,
     TransformSpec,
     VectorMode,
@@ -235,7 +236,8 @@ def test_nested_source_aliases_vectors_and_full_reference_are_canonical() -> Non
     assert serialized["sources"]["text"]["onnx_path"] == "/models/model.onnx"
     assert "onnx" not in serialized["sources"]["text"]
     assert serialized["vectors"]["mode"] == "provided"
-    assert serialized["target"]["soc_model"] == 69
+    assert serialized["target"]["name"] == "sm8850"
+    assert serialized["target"]["soc_model"] == 87
 
 
 @pytest.mark.parametrize(
@@ -355,3 +357,33 @@ def test_tool_result_rejects_ambiguous_states() -> None:
         ToolResult(ok=True, error=error)
     with pytest.raises(ValidationError):
         ToolResult(ok=False)
+
+
+def test_target_spec_selects_a_registered_target_by_name() -> None:
+    default = TargetSpec()
+    assert (default.name, default.chipset, default.dsp_arch, default.soc_model) == (
+        "sm8850",
+        "SM8850",
+        "v81",
+        87,
+    )
+
+    named = TargetSpec(name="sm8750")
+    assert (named.chipset, named.dsp_arch, named.soc_model) == ("SM8750", "v79", 69)
+
+
+def test_target_spec_accepts_only_a_tuple_that_matches_a_registered_target() -> None:
+    assert TargetSpec(chipset="SM8850", dsp_arch="v81", soc_model=87).name == "sm8850"
+
+    # 660 is SM8850's Android SoC ID, not its Qnn_SocModel_t value.
+    with pytest.raises(ValidationError, match="not a reviewed target"):
+        TargetSpec(chipset="SM8850", dsp_arch="v81", soc_model=660)
+
+    with pytest.raises(ValidationError, match="partial tuple is never completed"):
+        TargetSpec(chipset="SM8850")
+
+    with pytest.raises(ValidationError, match="unregistered target"):
+        TargetSpec(name="sm9999")
+
+    with pytest.raises(ValidationError, match="does not match the supplied tuple"):
+        TargetSpec(name="sm8750", chipset="SM8850", dsp_arch="v81", soc_model=87)

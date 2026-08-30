@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "name": "sm8750",
+  "chipset": "SM8750",
+  "dsp_arch": "v79",
+  "soc_model": 69,
+  "soc_id": [618, 639],
+  "notes": [
+    "soc_model is Qnn_SocModel_t (QNN_SOC_MODEL_SM8750 = 69, include/QNN/QnnTypes.h).",
+    "soc_id is the Android SoC ID reported by /sys/devices/soc0/soc_id; it is a different numbering scheme and is never passed to the compiler.",
+    "QAIRT's own compile default is v79/soc_model 69, i.e. this exact tuple, so a resolved-value check cannot distinguish this target from an SDK fallback. The empty-device-config guard is what covers that."
+  ],
+  "verified": {
+    "sdk_build": "260730134355",
+    "date": "2026-08-30",
+    "device": "SM-S931U1 (soc_id 618)",
+    "how": "qairt-agent workflow: build, validate and benchmark on the handset; SQNR 41.63 dB against the supplied golden; manifest 0f6048aa-5374-4a01-b9ce-3354cf5b7fe5 revision 3."
+  }
+}

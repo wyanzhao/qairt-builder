@@ -9,7 +9,11 @@ from types import SimpleNamespace
 from typing import Any
 
 from qairt_agent.families import FamilyId, build_split_plan
-from qairt_agent.harness import DEFAULT_CONSTRAINTS
+from qairt_agent.harness import DEFAULT_CONSTRAINTS, resolve_target
+
+#: Whichever reviewed target this harness names; the fixtures track it
+#: instead of hardcoding one chipset.
+_ACTIVE_TARGET = resolve_target(constraints=DEFAULT_CONSTRAINTS)
 from qairt_agent.qairt_adapter import (
     ExperimentalFeatureError,
     BuildResult,
@@ -61,7 +65,13 @@ class PreflightTests(unittest.TestCase):
         )
         htp.mkdir(parents=True)
         (htp / "htp_v2.json").write_text(
-            json.dumps({"soc_model_to_arch": {"SM8750": "v79"}}),
+            json.dumps(
+                {
+                    "soc_model_to_arch": {
+                        _ACTIVE_TARGET.chipset: _ACTIVE_TARGET.dsp_arch
+                    }
+                }
+            ),
             encoding="utf-8",
         )
         return sdk
@@ -73,14 +83,14 @@ class PreflightTests(unittest.TestCase):
                 {
                     "sdk_root": sdk,
                     "target": {
-                        "chipset": "SM8750",
-                        "dsp_arch": "v79",
-                        "soc_model": 69,
+                        "chipset": _ACTIVE_TARGET.chipset,
+                        "dsp_arch": _ACTIVE_TARGET.dsp_arch,
+                        "soc_model": _ACTIVE_TARGET.soc_model,
                     },
                 }
             )
         self.assertTrue(report.ok, report.issues)
-        self.assertEqual(report.soc_model, 69)
+        self.assertEqual(report.soc_model, _ACTIVE_TARGET.soc_model)
 
     def test_mismatched_arch_or_implicit_soc_model_is_rejected(self) -> None:
         # The right chipset with the wrong architecture, and no soc_model at
@@ -90,7 +100,10 @@ class PreflightTests(unittest.TestCase):
             report = self._checker().check(
                 {
                     "sdk_root": sdk,
-                    "target": {"chipset": "SM8750", "dsp_arch": "v81"},
+                    "target": {
+                        "chipset": _ACTIVE_TARGET.chipset,
+                        "dsp_arch": "v66",
+                    },
                 }
             )
         codes = {issue.code for issue in report.errors}
@@ -126,9 +139,9 @@ class PreflightTests(unittest.TestCase):
                 {
                     "sdk_root": sdk,
                     "target": {
-                        "chipset": constraints.target_chipset,
-                        "dsp_arch": constraints.target_dsp_arch,
-                        "soc_model": constraints.target_soc_model,
+                        "chipset": _ACTIVE_TARGET.chipset,
+                        "dsp_arch": _ACTIVE_TARGET.dsp_arch,
+                        "soc_model": _ACTIVE_TARGET.soc_model,
                     },
                 }
             )
@@ -647,6 +660,8 @@ class AdapterTests(unittest.TestCase):
 
         self.assertEqual(len(result.contexts), 1)
         self.assertEqual(len(result.diagnostic_contexts), 1)
+        # The spec names sm8750 while the harness names sm8850: the compile
+        # follows the spec, not a global constant.
         self.assertEqual(
             FakeCompileConfig.created[0].kwargs,
             {
@@ -1276,7 +1291,7 @@ class GenAIBuilderPackagingTests(unittest.TestCase):
         self.assertIn(
             (
                 "set_targets",
-                ["chipset:SM8750;dsp_arch:v79;soc_model:69"],
+                ["chipset:SM8850;dsp_arch:v81;soc_model:87"],
             ),
             calls,
         )
@@ -1855,8 +1870,8 @@ class GenAIBuilderPackagingTests(unittest.TestCase):
         self.assertEqual(
             target_events,
             [
-                ["chipset:SM8750;dsp_arch:v79;soc_model:69"],
-                ["chipset:SM8750;dsp_arch:v79;soc_model:69"],
+                ["chipset:SM8850;dsp_arch:v81;soc_model:87"],
+                ["chipset:SM8850;dsp_arch:v81;soc_model:87"],
             ],
         )
         workflow_call = next(

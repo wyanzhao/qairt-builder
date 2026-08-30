@@ -108,7 +108,7 @@ def _make_spec(tmp_path: Path, *, external_data: bool = False) -> tuple[dict[str
         "transforms": {"mha2sha": True},
         "quantization": {"mode": "apply_encodings"},
         "compile": {},
-        "target": {"chipset": "SM8750"},
+        "target": {"name": "sm8750"},
         "vectors": {
             "mode": "provided",
             "validation_manifest": str(vector_manifest),

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "name": "sm8850",
+  "chipset": "SM8850",
+  "dsp_arch": "v81",
+  "soc_model": 87,
+  "soc_id": [660],
+  "notes": [
+    "soc_model is Qnn_SocModel_t (QNN_SOC_MODEL_SM8850 = 87, include/QNN/QnnTypes.h).",
+    "soc_id 660 is the Android SoC ID reported by /sys/devices/soc0/soc_id. An earlier pin used 660 as soc_model; that conflated the two schemes, and the acceptance run below settles it: a context compiled with soc_model 87 loads and executes on a device whose soc_id is 660.",
+    "dsp_arch from qti/aisw/converters/common/backend_aware_configs/htp_v2.json soc_model_to_arch."
+  ],
+  "verified": {
+    "sdk_build": "260730134355",
+    "date": "2026-08-30",
+    "device": "PNM-AN20 (ro.soc.model SM8850, soc_id 660)",
+    "how": "qairt-agent workflow: build, validate and benchmark on the handset; SQNR 41.63 dB against the supplied golden; manifest 453248bb-2ee8-43c8-bb58-3d2f5319b59e revision 3."
+  }
+}

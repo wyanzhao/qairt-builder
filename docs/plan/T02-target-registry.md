@@ -1,8 +1,8 @@
 # T02 — Target registry (SM8850, SM8750)
 
-Status: planned — SDK tuple verification done ahead of implementation
-(2026-08-29); see "Verified SoC numbering" below, which **contradicts the
-current SM8850 pin** and must be settled before the registry is seeded.
+Status: done (2026-08-30) — registry landed with both targets verified on real
+hardware. The SM8850 `soc_model` question is settled by a device run: 87 works,
+660 was the Android SoC ID.
 Depends on: T01
 Effort: M
 
@@ -172,3 +172,90 @@ sites above), `project.py`/`harness.py` (registry loading),
   (SM8850 required now; SM8750 when its device is available — until then its
   registry entry stays unverified and that state is visible in `doctor`).
 - `CLAUDE.md`, `docs/architecture.md`, and examples updated together.
+
+
+## Result (2026-08-30)
+
+### The soc_model question is settled on hardware
+
+The SM8850 handset (`PNM-AN20`) reports `ro.soc.model=SM8850` with
+`soc_id=660`, and a context compiled with **`soc_model 87`** for `v81` loaded
+and executed on it: build, validate and benchmark all succeeded, SQNR 41.63 dB
+against the supplied golden, manifest
+`453248bb-2ee8-43c8-bb58-3d2f5319b59e` revision 3. Both numbering schemes are
+now confirmed from two directions — the SM8750 device reports `soc_id 618` and
+runs with `soc_model 69`, the SM8850 device reports `soc_id 660` and runs with
+`soc_model 87` — so the earlier `SM8850 / 660` pin was conflating them.
+
+### What landed
+
+- `harness/targets/sm8850.json` and `harness/targets/sm8750.json`, each with
+  `chipset`, `dsp_arch`, `soc_model` (Qnn enum), `soc_id` (Android, a list),
+  `notes`, and a `verified` block naming the run that qualified it. Both are
+  verified.
+- `harness/constraints.json` no longer holds a tuple; it names the active
+  target (`"target": {"name": "sm8850"}`). The registry travels with the
+  constraints file: `install_default_constraints` copies both, the worker image
+  `COPY`s both, and the wheel force-includes both — a project that has one
+  without the other cannot resolve a target, so they are never separated.
+- `TargetSpec` resolves a `name`, or a complete tuple that matches a registered
+  entry exactly. A partial tuple is refused rather than completed implicitly,
+  and registry errors surface as ordinary pydantic validation errors so a bad
+  target reads like any other bad field.
+- `PINNED_TARGET_SOC`/`PINNED_DSP_ARCH`/`PINNED_SOC_MODEL` are gone. The
+  adapter's `_validate_target` returns the resolved registry entry and
+  `compile_context` now builds its `soc_details`, weight-sharing mode and
+  result artifact from **its own target argument** instead of a module
+  constant — which also removes a latent inconsistency, since it previously
+  validated the caller's target and then compiled with the pinned one. Both
+  GenAI lanes take an explicit `target`, so which SoC a container was built for
+  is an argument of the call and appears in its build report.
+- `_validate_compiler_target` compares against the named target rather than a
+  pin, and still fails closed on an empty `device_custom_configs` list.
+
+### The chicken-and-egg the design had to answer
+
+A target is refused until it is verified, and it cannot be verified without a
+run. Left there, no target could ever be added. The qualifying run is therefore
+one explicit, named exception: `QAIRT_AGENT_TARGET_ACCEPTANCE=<name>` permits
+build/device stages for that one target, preflight downgrades its
+`target.unverified` issue to a warning stating the run is qualifying, and the
+CLI forwards the variable into the worker. It cannot be switched on by
+accident, and it never covers a second target.
+
+This was exercised for real: SM8850 was seeded **unverified**, the suite went
+red on precisely the guard (`target 'sm8850' ... has no verified block ... build
+and device stages are refused`), the acceptance run was made under the
+qualifying flag, and the suite went green once the `verified` block recorded it.
+
+### Deviation from the design, and why
+
+Design item 3 said to remove the `target` block from
+`harness/constraints.json` entirely. It keeps a **name-only** selector instead.
+The tuple — the thing that was actually hard-pinned — is gone, but something
+must still say which reviewed target this checkout builds for by default, and
+constraints.json is already the file an upgrade patch touches. Putting the
+default in code would have been a built-in default, which the task forbids;
+requiring every spec and test to name a target would have made the default
+implicit in whoever wrote the spec. A named selector keeps the choice explicit,
+reviewed, and in one place.
+
+Tests: `test_target_registry_separates_the_two_soc_numbering_schemes`,
+`test_unregistered_target_and_unregistered_tuple_fail_closed` (which asserts
+the old 660 tuple is refused), `test_unverified_target_is_refused_until_an_
+acceptance_run`, `test_both_seeded_targets_record_a_real_device_acceptance_run`,
+`test_target_spec_selects_a_registered_target_by_name`,
+`test_target_spec_accepts_only_a_tuple_that_matches_a_registered_target`, and
+`test_standalone_vit_keeps_diagnostic_outputs_out_of_production`, which now
+proves a spec naming `sm8750` compiles for sm8750 while the harness names
+sm8850.
+
+### Still open
+
+- Per-target acceptance is recorded for both targets on QAIRT 2.49.0.260730.
+  A future SDK invalidates both `verified` blocks; the upgrade procedure should
+  re-run acceptance per target rather than carrying the old records forward.
+- `qairt-agent.toml` still restates the resolved tuple beside the name so
+  `doctor` can detect drift between project config and harness. That is a
+  deliberate cross-check, not the old duplication, but it is worth revisiting
+  if a project ever needs to select a target per run.

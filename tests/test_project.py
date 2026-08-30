@@ -34,7 +34,8 @@ def test_init_creates_config_and_dirs(tmp_path) -> None:
     assert (tmp_path / ".dockerignore").is_file()
     assert config.sdk_root == "./qnn/qnn"
     assert config.worker_backend == "auto"
-    assert config.target_chipset == "SM8750"
+    assert config.target_name == "sm8850"
+    assert config.target_chipset == "SM8850"
 
 
 def test_init_does_not_require_sdk(tmp_path) -> None:
@@ -47,7 +48,7 @@ def test_load_round_trips_and_missing_raises(tmp_path) -> None:
     init(tmp_path)
     config = load(tmp_path)
     assert config.docker_platform == "linux/amd64"
-    assert config.target_soc_model == 69
+    assert config.target_soc_model == 87
     assert config.docker_image.startswith("qairt-agent-worker:")
 
     with pytest.raises(ProjectNotInitializedError, match="not initialized"):

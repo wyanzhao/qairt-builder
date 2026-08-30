@@ -32,7 +32,8 @@ The QAIRT worker is pinned by the editable
 - Ubuntu 22.04 x86_64
 - Python 3.10
 - QAIRT `2.49.0.260730` (build `260730134355`)
-- HTP target `SM8750 / v79 / soc_model 69`
+- HTP targets `SM8850 / v81 / soc_model 87` and `SM8750 / v79 / soc_model 69`,
+  selected by name from `harness/targets/`
 
 The Python package can be imported without QAIRT installed. Operations that
 need the SDK fail with a structured preflight error.

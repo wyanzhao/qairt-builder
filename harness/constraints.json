@@ -25,8 +25,6 @@
     }
   },
   "target": {
-    "chipset": "SM8750",
-    "dsp_arch": "v79",
-    "soc_model": 69
+    "name": "sm8850"
   }
 }

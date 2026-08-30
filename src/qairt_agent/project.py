@@ -28,19 +28,30 @@ from qairt_agent.harness import (
     DEFAULT_CONSTRAINTS_LOGICAL_PATH,
     HarnessConstraints,
     HarnessConstraintsError,
+    TargetEntry,
     install_default_constraints,
     load_harness_constraints,
+    resolve_target,
 )
 from qairt_agent.qairt_adapter.preflight import (
-    PINNED_DSP_ARCH,
+    ACTIVE_TARGET,
     PINNED_QAIRT_BUILD_ID,
-    PINNED_SOC_MODEL,
-    PINNED_TARGET_SOC,
 )
 from qairt_agent.worker_scaffold import (
     ensure_worker_build_context,
     worker_build_context_issues,
 )
+
+def _target_fields(entry: TargetEntry) -> dict[str, Any]:
+    """Project-config fields for one registered target."""
+
+    return {
+        "target_name": entry.name,
+        "target_chipset": entry.chipset,
+        "target_dsp_arch": entry.dsp_arch,
+        "target_soc_model": entry.soc_model,
+    }
+
 
 CONFIG_FILENAME = "qairt-agent.toml"
 DEFAULT_SDK_ROOT = "./qnn/qnn"
@@ -137,9 +148,10 @@ class ProjectConfig:
     docker_image: str = DEFAULT_IMAGE_REF
     docker_platform: str = DEFAULT_PLATFORM
     dockerfile: str = DEFAULT_WORKER_DOCKERFILE
-    target_chipset: str = PINNED_TARGET_SOC
-    target_dsp_arch: str = PINNED_DSP_ARCH
-    target_soc_model: int = PINNED_SOC_MODEL
+    target_name: str = ACTIVE_TARGET.name
+    target_chipset: str = ACTIVE_TARGET.chipset
+    target_dsp_arch: str = ACTIVE_TARGET.dsp_arch
+    target_soc_model: int = ACTIVE_TARGET.soc_model
 
     def abs(self, logical: str) -> Path:
         return (self.project_root / logical).resolve()
@@ -205,9 +217,7 @@ class ProjectConfig:
                 "cache_dir": self.cache_dir,
             },
             "target": {
-                "chipset": self.target_chipset,
-                "dsp_arch": self.target_dsp_arch,
-                "soc_model": self.target_soc_model,
+                "name": self.target_name,
             },
         }
         constraints = self.harness
@@ -262,14 +272,11 @@ class ProjectConfig:
             docker_image=str(docker.get("image", constraints.worker_image)),
             docker_platform=str(docker.get("platform", constraints.platform)),
             dockerfile=str(docker.get("dockerfile", constraints.dockerfile)),
-            target_chipset=str(
-                target.get("chipset", constraints.target_chipset)
-            ),
-            target_dsp_arch=str(
-                target.get("dsp_arch", constraints.target_dsp_arch)
-            ),
-            target_soc_model=int(
-                target.get("soc_model", constraints.target_soc_model)
+            **_target_fields(
+                resolve_target(
+                    target.get("name", constraints.target_name),
+                    constraints=constraints,
+                )
             ),
         )
 
@@ -352,9 +359,7 @@ def init(project_root: str | Path, *, exist_ok: bool = True) -> ProjectConfig:
         docker_image=constraints.worker_image,
         docker_platform=constraints.platform,
         dockerfile=constraints.dockerfile,
-        target_chipset=constraints.target_chipset,
-        target_dsp_arch=constraints.target_dsp_arch,
-        target_soc_model=constraints.target_soc_model,
+        **_target_fields(resolve_target(constraints=constraints)),
     )
 
     target = config_path(root)
@@ -672,18 +677,21 @@ def doctor(project_root: str | Path) -> dict[str, Any]:
         )
     )
 
+    active_target = resolve_target(constraints=constraints)
     target_ok = (
-        config.target_chipset == constraints.target_chipset
-        and config.target_dsp_arch == constraints.target_dsp_arch
-        and config.target_soc_model == constraints.target_soc_model
+        config.target_name == active_target.name
+        and config.target_chipset == active_target.chipset
+        and config.target_dsp_arch == active_target.dsp_arch
+        and config.target_soc_model == active_target.soc_model
     )
     checks.append(
         DoctorCheck(
             "target",
             target_ok,
-            f"target {config.target_chipset}/{config.target_dsp_arch}/soc_model "
-            f"{config.target_soc_model} (expected {constraints.target_chipset}/"
-            f"{constraints.target_dsp_arch}/{constraints.target_soc_model})",
+            f"target {config.target_name} "
+            f"{config.target_chipset}/{config.target_dsp_arch}/soc_model "
+            f"{config.target_soc_model} (expected {active_target.name} "
+            f"{active_target.tuple_text})",
         )
     )
 

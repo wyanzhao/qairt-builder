@@ -41,6 +41,9 @@ RUN "python${PYTHON_VERSION}" -m venv /opt/venv \
 
 COPY docker/.generated/qairt-agent-src.zip ./qairt-agent-src.zip
 COPY ${HARNESS_CONSTRAINTS_FILE} ./harness/constraints.json
+# The target registry travels with the constraints: they name a target by
+# reference and cannot resolve it without these entries.
+COPY harness/targets/ ./harness/targets/
 
 RUN /opt/venv/bin/python -m pip check \
     && /opt/venv/bin/python -c "import sys; expected=tuple(map(int, '${PYTHON_VERSION}'.split('.'))); assert sys.version_info[:2] == expected"

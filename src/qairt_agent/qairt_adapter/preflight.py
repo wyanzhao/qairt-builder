@@ -14,7 +14,12 @@ from typing import Any, Callable, Mapping
 from qairt_agent.harness import (
     DEFAULT_CONSTRAINTS,
     HarnessConstraints,
+    ENV_TARGET_ACCEPTANCE,
+    TargetEntry,
+    acceptance_target_name,
     load_harness_constraints,
+    load_target_registry,
+    resolve_target,
 )
 
 from .errors import QairtPreflightError
@@ -25,9 +30,10 @@ PINNED_QAIRT_VERSION = DEFAULT_CONSTRAINTS.qairt_version
 PINNED_QAIRT_BUILD_ID = DEFAULT_CONSTRAINTS.qairt_build_id
 PINNED_UBUNTU_VERSION = DEFAULT_CONSTRAINTS.ubuntu_version
 PINNED_PYTHON = DEFAULT_CONSTRAINTS.python_version_tuple
-PINNED_TARGET_SOC = DEFAULT_CONSTRAINTS.target_chipset
-PINNED_DSP_ARCH = DEFAULT_CONSTRAINTS.target_dsp_arch
-PINNED_SOC_MODEL = DEFAULT_CONSTRAINTS.target_soc_model
+#: The project's active target, resolved from the reviewed registry. There is
+#: no built-in default: ``harness/constraints.json`` names one registered
+#: target and every unregistered or mismatched tuple fails closed.
+ACTIVE_TARGET = resolve_target(constraints=DEFAULT_CONSTRAINTS)
 
 
 @dataclass(frozen=True)
@@ -37,7 +43,7 @@ class PreflightSpec:
     sdk_root: str | Path | None
     target_soc: str
     dsp_arch: str
-    soc_model: int = PINNED_SOC_MODEL
+    soc_model: int
 
 
 def _read(value: Any, key: str, default: Any = None) -> Any:
@@ -152,6 +158,8 @@ class PreflightChecker:
     def check(self, spec: Any) -> PreflightReport:
         issues: list[PreflightIssue] = []
         constraints = self._constraints
+        # The target is whichever reviewed registry entry this harness names.
+        active_target = resolve_target(constraints=constraints)
 
         sdk_root_value = _first_path(
             spec,
@@ -292,50 +300,86 @@ class PreflightChecker:
                     PreflightIssue(
                         "sdk.target_map_unverified",
                         "htp_v2.json was not found; "
-                        f"{constraints.target_chipset} to "
-                        f"{constraints.target_dsp_arch} SDK mapping could not be verified",
+                        f"{active_target.chipset} to "
+                        f"{active_target.dsp_arch} SDK mapping could not be verified",
                         IssueSeverity.WARNING,
                     )
                 )
             else:
                 mapped_arch = _target_mapping(
                     htp_config,
-                    constraints.target_chipset,
+                    active_target.chipset,
                 )
-                if mapped_arch != constraints.target_dsp_arch:
+                if mapped_arch != active_target.dsp_arch:
                     issues.append(
                         PreflightIssue(
                             "sdk.target_map",
-                            f"{htp_config} must map {constraints.target_chipset} to "
-                            f"{constraints.target_dsp_arch}, "
+                            f"{htp_config} must map {active_target.chipset} to "
+                            f"{active_target.dsp_arch}, "
                             f"got {mapped_arch or '<missing>'}",
                         )
                     )
 
-        if target_soc != constraints.target_chipset:
+        # The spec's own tuple decides; the harness only names the default.
+        # A chipset that is registered gets precise per-field diagnostics, an
+        # unregistered one gets a single unambiguous error, and neither is ever
+        # allowed to resolve implicitly.
+        registry = load_target_registry(constraints)
+        named = next(
+            (
+                entry
+                for entry in registry.values()
+                if entry.chipset.upper() == str(target_soc).upper()
+            ),
+            None,
+        )
+        if named is None:
             issues.append(
                 PreflightIssue(
                     "target.soc",
-                    f"target_soc must be explicit {constraints.target_chipset}; "
-                    "no SDK default is allowed",
+                    f"target_soc {target_soc!r} is not a reviewed target; "
+                    f"registered chipsets are "
+                    f"{sorted(entry.chipset for entry in registry.values())}",
                 )
             )
-        if dsp_arch != constraints.target_dsp_arch:
-            issues.append(
-                PreflightIssue(
-                    "target.dsp_arch",
-                    f"dsp_arch must be explicit {constraints.target_dsp_arch}; "
-                    "SDK fallback is forbidden",
+        else:
+            if dsp_arch != named.dsp_arch:
+                issues.append(
+                    PreflightIssue(
+                        "target.dsp_arch",
+                        f"dsp_arch must be explicit {named.dsp_arch} for "
+                        f"{named.chipset}; an implicitly resolved architecture "
+                        "is forbidden",
+                    )
                 )
-            )
-        if soc_model != constraints.target_soc_model:
-            issues.append(
-                PreflightIssue(
-                    "target.soc_model",
-                    f"soc_model must be explicit {constraints.target_soc_model} "
-                    f"for {constraints.target_chipset}",
+            if soc_model != named.soc_model:
+                issues.append(
+                    PreflightIssue(
+                        "target.soc_model",
+                        f"soc_model must be explicit {named.soc_model} for "
+                        f"{named.chipset}. That is the Qnn_SocModel_t value; "
+                        "the Android SoC ID "
+                        f"({', '.join(str(item) for item in named.soc_id) or 'unrecorded'}) "
+                        "is a different scheme and is never passed to the SDK",
+                    )
                 )
-            )
+            if named.verified is None:
+                qualifying = acceptance_target_name() == named.name
+                issues.append(
+                    PreflightIssue(
+                        "target.unverified",
+                        f"target {named.name!r} ({named.tuple_text}) has no "
+                        "verified block: it has never completed a real-device "
+                        + (
+                            "acceptance run. This run is explicitly qualifying "
+                            f"it ({ENV_TARGET_ACCEPTANCE}={named.name}); record "
+                            f"the outcome in {named.source_path}"
+                            if qualifying
+                            else f"acceptance run. Record one in {named.source_path}"
+                        ),
+                        IssueSeverity.WARNING if qualifying else IssueSeverity.ERROR,
+                    )
+                )
 
         return PreflightReport(
             issues=tuple(issues),

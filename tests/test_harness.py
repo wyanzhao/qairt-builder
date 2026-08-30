@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -12,9 +14,15 @@ from qairt_agent.cli import _default_client
 from qairt_agent.contracts import TargetSpec
 from qairt_agent.harness import (
     DEFAULT_CONSTRAINTS,
+    ENV_TARGET_ACCEPTANCE,
     HarnessConstraintsError,
+    default_targets_dir,
     load_harness_constraints,
+    load_target_registry,
     parse_version,
+    require_verified_target,
+    resolve_target,
+    resolve_target_tuple,
 )
 from qairt_agent.pipeline import QairtAgent
 from qairt_agent.project import init, load
@@ -64,6 +72,12 @@ def test_active_harness_drives_contract_stage_key_and_provenance(
     document["worker"]["platform"] = "linux/amd64"
     path = tmp_path / "constraints.json"
     path.write_text(json.dumps(document), encoding="utf-8")
+    # A constraints file names a target by reference, so its registry travels
+    # with it; a project that copies one without the other cannot resolve.
+    registry = tmp_path / "targets"
+    registry.mkdir()
+    for entry in sorted(default_targets_dir().glob("*.json")):
+        shutil.copyfile(entry, registry / entry.name)
     monkeypatch.setenv("QAIRT_AGENT_HARNESS_CONSTRAINTS", str(path))
 
     target = TargetSpec()
@@ -142,3 +156,56 @@ def test_invalid_harness_fails_closed(tmp_path) -> None:
 )
 def test_parse_version(text, expected) -> None:
     assert parse_version(text) == expected
+
+
+def test_target_registry_separates_the_two_soc_numbering_schemes() -> None:
+    registry = load_target_registry(DEFAULT_CONSTRAINTS)
+
+    assert set(registry) == {"sm8750", "sm8850"}
+    # soc_model is Qnn_SocModel_t; soc_id is the Android SoC ID. Keeping both
+    # in the entry is what stops them being conflated again.
+    assert (registry["sm8850"].soc_model, registry["sm8850"].soc_id) == (87, (660,))
+    assert (registry["sm8750"].soc_model, registry["sm8750"].soc_id) == (69, (618, 639))
+    assert registry["sm8850"].dsp_arch == "v81"
+    assert registry["sm8750"].dsp_arch == "v79"
+
+
+def test_unregistered_target_and_unregistered_tuple_fail_closed() -> None:
+    with pytest.raises(HarnessConstraintsError, match="unregistered target"):
+        resolve_target("sm9999")
+
+    # The old pin used SM8850's Android SoC ID where the QNN SoC model belongs.
+    with pytest.raises(HarnessConstraintsError, match="not a reviewed target"):
+        resolve_target_tuple("SM8850", "v81", 660)
+
+    assert resolve_target_tuple("SM8850", "v81", 87).name == "sm8850"
+
+
+def test_unverified_target_is_refused_until_an_acceptance_run(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(ENV_TARGET_ACCEPTANCE, raising=False)
+    entry = resolve_target("sm8850")
+    unverified = replace(entry, verified=None)
+
+    with pytest.raises(HarnessConstraintsError, match="no verified block"):
+        require_verified_target(unverified)
+
+    # A target cannot be verified without a run and a run is refused while it
+    # is unverified, so the qualifying run names the target explicitly.
+    monkeypatch.setenv(ENV_TARGET_ACCEPTANCE, "sm8850")
+    assert require_verified_target(unverified) is unverified
+
+    # Naming a different target does not qualify this one.
+    monkeypatch.setenv(ENV_TARGET_ACCEPTANCE, "sm8750")
+    with pytest.raises(HarnessConstraintsError, match="no verified block"):
+        require_verified_target(unverified)
+
+
+def test_both_seeded_targets_record_a_real_device_acceptance_run() -> None:
+    for entry in load_target_registry(DEFAULT_CONSTRAINTS).values():
+        assert entry.verified is not None, entry.name
+        assert entry.verified["sdk_build"] == DEFAULT_CONSTRAINTS.qairt_build_id
+        assert entry.verified["device"], entry.name
+        assert entry.verified["how"], entry.name

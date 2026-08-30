@@ -233,6 +233,48 @@ normalized, content-addressed `optrace_evidence` artifact. Thread-cycle records
 use the maximum overlapping thread value rather than a sum, and all per-op
 claims remain reported work attribution rather than additive wall latency.
 
+### Target registry
+
+Targets are reviewed data, one `harness/targets/<name>.json` per target, and
+`harness/constraints.json` only names which one is active:
+
+```json
+{
+  "schema_version": 1,
+  "name": "sm8850",
+  "chipset": "SM8850",
+  "dsp_arch": "v81",
+  "soc_model": 87,
+  "soc_id": [660],
+  "verified": {"sdk_build": "...", "date": "...", "device": "...", "how": "..."}
+}
+```
+
+`soc_model` is the `Qnn_SocModel_t` value the compiler consumes; `soc_id` is
+the Android SoC ID a device reports at `/sys/devices/soc0/soc_id`. They are
+different numbering schemes for the same chip — SM8850 is `soc_model 87` with
+`soc_id 660` — and the entry carries both so they cannot be conflated again.
+
+A spec selects by `name`, or supplies the complete
+`chipset`/`dsp_arch`/`soc_model` tuple, accepted only if it matches a
+registered entry exactly. A partial tuple, an unregistered name, and an
+unregistered tuple each fail at spec time. There is no built-in default: the
+harness names one. `qairt-agent plan` renders the resolution under
+`effective_target`.
+
+`verified` records the real-device acceptance run that qualified the target. An
+entry without one still plans, but build and device stages refuse it. Since a
+target cannot become verified without a run, and a run is refused while it is
+unverified, the qualifying run is the single explicit exception:
+
+```bash
+QAIRT_AGENT_TARGET_ACCEPTANCE=sm8850 qairt-agent workflow --spec spec.json
+```
+
+That names one target, applies to that run only, and preflight downgrades the
+`target.unverified` issue to a warning that says the run is qualifying. Record
+the outcome in the registry entry afterwards.
+
 ### Float-graph reference (debug only)
 
 `stage_configs.validation.float_reference` adds a second reference beside the
@@ -406,7 +448,7 @@ logs/worker-launch.log detached-runtime startup stdout/stderr
   then accepts it only after an import smoke test against the read-only mounted SDK. Run
   `qairt-agent image smoke --root .` to repeat that gate without rebuilding.
 - `doctor` verifies SDK metadata, QAIRT 2.49 capability, Ubuntu/x86_64 ABI, and
-  the `SM8750/v79/soc_model 69` target. On a host without the SDK or selected
+  the named target from `harness/targets/`. On a host without the SDK or selected
   runtime it reports those checks as failing rather than silently passing.
 - Both runtimes use the same Ubuntu 22.04 / Python 3.10 / `linux/amd64`
   image. The SDK, models, and artifacts are mounted, never baked into the
@@ -504,7 +546,7 @@ separate gates:
   evidence normalization; automatic SQNR attribution, compatible fork-profile
   deltas, and fail-closed hotspot-only latency diagnosis.
 - **Gated pending environment prep:** live worker-image construction/execution
-  and SM8750 on-device build/validate/benchmark/optrace. These run
+  and on-device build/validate/benchmark/optrace. These run
   through the same code paths once the selected runtime is ready and the image is built;
   until then `doctor` reports them as not-ready and the engine fails closed at
   preflight.
