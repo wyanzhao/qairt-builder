@@ -1,7 +1,8 @@
 # T04 — ORT float reference and layerwise debug comparison
 
-Status: tier 1 done (2026-08-29), real-device acceptance done (2026-08-30 on
-SM8750); tier 2 still planned.
+Status: tier 1 done (2026-08-29); tier 1 and tier 2 device acceptance done
+(2026-08-30 on SM8750). Low-level tier 2 landed; GenAI tier 2 stays on the
+documented fallback.
 Depends on: T01 (tier 2 capability answer; device acceptance) — tier 1 code
 can be developed against the fake-adapter seams earlier
 Effort: L
@@ -195,3 +196,53 @@ handset attached, and SM8750 is equally verified in the target registry.
   raw-tensor route works in principle, but no GenAI-lane test exercises it yet.
 - **Multi-slice divergence.** See the scope note above; blocked on
   [T08](T08-aimet-vector-import.md).
+
+## Tier 2 low-level half — landed (2026-08-30)
+
+`granularity: "layer"` is implemented. `QairtAgent._diagnostic_device_outputs`
+executes the diagnostic contexts the build has always compiled and hash-verified
+but **never ran**, and feeds their tapped tensors into tier 1's existing binding
+and comparison path, so the name binding, `unmapped_tensors` discipline and
+report shape are shared rather than duplicated.
+
+- **Multi-slice reuses the production chain wiring** — the diagnostic contexts
+  are substituted into `SliceChainRunner` with the same routes, so each slice is
+  fed exactly what it is fed in a real run instead of a guess at its inputs.
+  Several diagnostic contexts with no routes fails closed rather than guessing.
+- **No silent degradation.** `granularity: "layer"` without executed diagnostic
+  contexts fails closed; a build that produced none says so and names the flag
+  to set. Publishing a slice-boundary report under a layer-level label would
+  have been the same overclaim in a new place.
+- **`op_level_dump_available` now means something.** It was previously set from
+  the mere *existence* of a hash-verified context; it is now `true` only when
+  tapped tensors were actually collected.
+- Observations are sorted by the float graph's topology, so the first
+  divergence is the first row.
+
+### Acceptance on SM8750, job `20260830T204543Z-39cd04c7`
+
+One diagnostic context (`vit/tiny`) executed, 3 tensors collected, zero
+unmapped:
+
+| tensor | SQNR | cosine |
+| --- | --- | --- |
+| `h0` (MatMul output) | 41.46 dB | 0.999964 |
+| `h1` (bias_add output) | **3.21 dB** | **0.722643** |
+| `output` (Relu output) | 41.63 dB | 0.999966 |
+
+**This is the capability working, and it is also a live demonstration of why
+the report says `first_observed_divergence_not_root_cause`.** A naive reading
+of `h1` at 3.21 dB is "the bias add is broken". It is not: `h1` feeds a Relu,
+which clamps the negative half of the range, and that is exactly where the
+quantization error lives relative to the signal. The error never reaches the
+output, which matches the boundary result to two decimals. Tier 2 surfaces the
+divergence; it deliberately does not adjudicate it.
+
+### Coverage gap to be honest about
+
+The multi-slice branch (several diagnostic contexts routed through
+`SliceChainRunner`) is implemented and its no-routes guard fails closed, but
+**no fixture test exercises the multi-slice success path** — the existing fake
+adapters do not emit diagnostic contexts through the build path the pipeline
+takes, and the acceptance model is single-slice. A multi-slice model, which
+needs [T08](T08-aimet-vector-import.md), is what would prove it.

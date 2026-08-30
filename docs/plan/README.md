@@ -54,7 +54,7 @@ new decision entry here instead.
 | [T01](T01-sdk-upgrade-2.49.md) | QAIRT SDK upgrade to 2.49.0.260730 | done (2026-08-30) | — |
 | [T02](T02-target-registry.md) | Target registry (SM8850, SM8750) | done (2026-08-30) | T01 |
 | [T03](T03-config-matrix.md) | Model x target config matrix | done (2026-08-30) — reduced to one validated cell | T02 |
-| [T04](T04-ort-float-reference.md) | ORT float reference and layerwise debug | tier 1 + device acceptance done (2026-08-30); tier 2 planned | T01 for tier 2 |
+| [T04](T04-ort-float-reference.md) | ORT float reference and layerwise debug | tier 1 + tier 2 low-level done (2026-08-30) | — |
 | [T05](T05-static-footprint.md) | Static footprint reporting | done (2026-08-29) | — |
 | [T06](T06-latency-refinements.md) | Latency refinements (GenAI defaults, tokens) | done (2026-08-29) | — |
 | [T07](T07-review-bugfixes.md) | Review bug fixes | done (2026-08-29) | — |

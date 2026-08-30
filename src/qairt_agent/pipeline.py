@@ -573,6 +573,15 @@ def _unique_artifacts(
     return tuple(unique)
 
 
+def _layer_float_reference(effective: Mapping[str, Any]) -> bool:
+    """Whether this validation was asked for layer-level float comparison."""
+
+    config = effective.get("float_reference")
+    if not isinstance(config, Mapping):
+        return False
+    return str(config.get("granularity", "slice_boundary")) == "layer"
+
+
 def _output_mapping(
     value: Any,
     *,
@@ -1835,6 +1844,148 @@ class QairtAgent:
         effective["coverage"] = expected_coverage
         return effective
 
+    def _diagnostic_device_outputs(
+        self,
+        manifest: RunManifest,
+        effective: Mapping[str, Any],
+        adapter: Any,
+        *,
+        device: Any,
+        ar: int,
+        inputs: Mapping[str, np.ndarray],
+        initial_native_state: Mapping[str, np.ndarray] | None = None,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+        """Execute the diagnostic contexts and collect their tapped tensors.
+
+        The build has always compiled these contexts and verified their hashes,
+        but nothing ever ran them: an ``op_level_dump_available`` claim that
+        rests on a context's *existence* is not operator evidence. This is the
+        step that turns it into evidence.
+
+        Fails closed rather than degrading -- a layer-level report that quietly
+        fell back to slice boundaries would be the same overclaim in a new
+        place.
+        """
+
+        index = self._runtime_index_for_manifest(manifest)
+        cl_key = str(int(effective["context_length"]))
+        entries = list((index.get("diagnostic_contexts") or {}).get(cl_key) or ())
+        if not entries:
+            raise InvalidSpecError(
+                "layer-level float reference requires diagnostic contexts, and "
+                "this build produced none; set quality."
+                "dump_intermediates_on_failure or compile."
+                "enable_intermediate_outputs and rebuild",
+                stage="validate",
+                details={"context_length": cl_key},
+            )
+
+        artifacts_by_path = {
+            artifact.path.expanduser().resolve(): artifact
+            for artifact in manifest.artifacts
+        }
+        loaded: dict[str, Any] = {}
+        graphs: dict[str, str] = {}
+        executed: list[dict[str, Any]] = []
+        for entry in entries:
+            path = Path(str(entry["context_path"])).expanduser().resolve()
+            artifact = artifacts_by_path.get(path)
+            if artifact is None:
+                raise InvalidSpecError(
+                    "runtime_index references a diagnostic context that is not "
+                    "a verified build artifact",
+                    stage="validate",
+                    details={"context_path": os.fspath(path)},
+                )
+            verify_artifact(artifact)
+            graph_name = (entry.get("graphs_by_ar") or {}).get(str(int(ar)))
+            if graph_name is None:
+                raise InvalidSpecError(
+                    "the diagnostic context carries no graph for the bound AR",
+                    stage="validate",
+                    details={
+                        "context_path": os.fspath(path),
+                        "ar": int(ar),
+                        "available_ars": sorted(
+                            (entry.get("graphs_by_ar") or {})
+                        ),
+                    },
+                )
+            slice_name = str(entry.get("slice") or "model")
+            loaded[slice_name] = (
+                adapter.load_compiled(path)
+                if hasattr(adapter, "load_compiled")
+                else path
+            )
+            graphs[slice_name] = str(graph_name)
+            executed.append(
+                {
+                    "slice": slice_name,
+                    "graph_name": str(graph_name),
+                    "artifact": _jsonable(artifact),
+                }
+            )
+
+        routes = effective.get("routes")
+        execution_options = self._execution_options(effective)
+        native_io = bool(effective.get("native_io", False))
+        if routes:
+            # Reuse the production chain wiring with the diagnostic contexts
+            # substituted, so each slice is fed exactly what it is fed in a
+            # real run instead of a guess at its inputs.
+            runner = SliceChainRunner(
+                routes,
+                self._chain_executors(
+                    adapter,
+                    loaded,
+                    device=device,
+                    native_io=native_io,
+                    execution_options=execution_options,
+                ),
+            )
+            result = runner.run_device_chain(
+                dict(inputs),
+                ar=int(ar),
+                initial_native_state=dict(initial_native_state or {}),
+            )
+            outputs = {
+                str(name): dict(values)
+                for name, values in result.outputs_by_slice().items()
+            }
+        elif len(loaded) == 1:
+            slice_name, compiled = next(iter(loaded.items()))
+            raw = adapter.run_graph(
+                compiled,
+                dict(inputs),
+                graph_name=graphs[slice_name],
+                device=device,
+                native_io=native_io,
+                **execution_options,
+            )
+            outputs = {
+                slice_name: dict(
+                    _output_mapping(raw, graph_name=graphs[slice_name])
+                )
+            }
+        else:
+            raise InvalidSpecError(
+                "several diagnostic contexts but no routes: each slice's "
+                "diagnostic inputs come from the previous slice, so a chain "
+                "definition is required rather than guessed inputs",
+                stage="validate",
+                details={"diagnostic_slices": sorted(loaded)},
+            )
+
+        evidence = {
+            "executed_contexts": executed,
+            "context_count": len(executed),
+            "execution": "device_chain" if routes else "single_graph",
+            "tensor_counts": {
+                name: len(values) for name, values in outputs.items()
+            },
+        }
+        return outputs, evidence
+
     def _float_reference_report(
         self,
         manifest: RunManifest,
@@ -1843,6 +1994,8 @@ class QairtAgent:
         device_outputs: Mapping[str, Mapping[str, Any]] | None,
         output_dir: Path,
         report_suffix: str,
+        diagnostic_outputs: Mapping[str, Mapping[str, Any]] | None = None,
+        diagnostic_evidence: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], tuple[ArtifactRef, ...]]:
         """Compare device slice boundaries against an ONNX Runtime float run.
 
@@ -1863,11 +2016,19 @@ class QairtAgent:
             )
 
         granularity = str(config.get("granularity", "slice_boundary"))
-        if granularity != "slice_boundary":
+        if granularity not in {"slice_boundary", "layer"}:
             raise InvalidSpecError(
-                "only the slice_boundary float reference granularity is "
-                "implemented; layer-level drilldown needs executed diagnostic "
-                "contexts",
+                "float reference granularity must be 'slice_boundary' or "
+                "'layer'",
+                stage="validate",
+                details={"requested_granularity": granularity},
+            )
+        if granularity == "layer" and not diagnostic_outputs:
+            # Degrading to slice boundaries here would republish the exact
+            # overclaim this granularity exists to retire.
+            raise InvalidSpecError(
+                "layer granularity requires executed diagnostic contexts; none "
+                "were collected for this run",
                 stage="validate",
                 details={"requested_granularity": granularity},
             )
@@ -1932,10 +2093,19 @@ class QairtAgent:
                 return direct
             return None
 
+        # Layer granularity compares the tapped intermediates; the boundary
+        # tensors stay in the same comparison so a run shows both.
+        compared_outputs: dict[str, dict[str, Any]] = {
+            str(name): dict(values) for name, values in device_outputs.items()
+        }
+        if diagnostic_outputs:
+            for name, values in diagnostic_outputs.items():
+                compared_outputs.setdefault(str(name), {}).update(dict(values))
+
         producible = VectorPreparer.onnx_producible_tensor_names(resolved_model)
         pairs: list[tuple[str, str, str]] = []
         unmapped: list[dict[str, Any]] = []
-        for slice_name, tensors in device_outputs.items():
+        for slice_name, tensors in compared_outputs.items():
             for tensor_name in tensors:
                 explicit = mapped_name(str(slice_name), str(tensor_name))
                 candidate = explicit if explicit is not None else str(tensor_name)
@@ -1985,7 +2155,7 @@ class QairtAgent:
         for slice_name, tensor_name, float_name in pairs:
             quality = compute_tensor_quality(
                 captured[float_name],
-                device_outputs[slice_name][tensor_name],
+                compared_outputs[slice_name][tensor_name],
                 reference_energy_floor=floor,
             )
             observations.append(
@@ -1997,6 +2167,13 @@ class QairtAgent:
                 }
             )
 
+        # Ordered by the float graph's own topology so the first divergence is
+        # the first row, not something the reader has to search for.
+        topology = {name: order for order, name in enumerate(producible)}
+        observations.sort(
+            key=lambda item: topology.get(item["float_tensor"], len(topology))
+        )
+
         payload = {
             "schema": "qairt-agent.float-reference-report/1",
             "mode": "debug_only",
@@ -2005,6 +2182,8 @@ class QairtAgent:
             "ar": requested_ar,
             "claim_scope": "first_observed_divergence_not_root_cause",
             "comparison": "device_chain_vs_onnxruntime_float_graph",
+            "ordered_by": "float_graph_topology",
+            "op_level_dump_available": bool(diagnostic_outputs),
             "tensor_map": {
                 slice_name: {tensor_name: float_name}
                 for slice_name, tensor_name, float_name in pairs
@@ -2013,6 +2192,8 @@ class QairtAgent:
             "observations": observations,
             **provenance,
         }
+        if diagnostic_evidence is not None:
+            payload["diagnostic_contexts"] = dict(diagnostic_evidence)
         report_ref = atomic_publish_json(
             output_dir / f"float_reference_report{report_suffix}.json",
             payload,
@@ -5163,6 +5344,8 @@ class QairtAgent:
             slice_reference_audit: list[dict[str, Any]] = []
             device_identifier: Any | None = None
             remote_attempt_dir: Any | None = None
+            diagnostic_outputs: dict[str, dict[str, Any]] | None = None
+            diagnostic_evidence: dict[str, Any] | None = None
 
             teacher = (
                 self._slice_tensor_tree(
@@ -5324,6 +5507,19 @@ class QairtAgent:
                                 for name, values
                                 in teacher_result.outputs_by_slice().items()
                             }
+                        if _layer_float_reference(effective):
+                            (
+                                diagnostic_outputs,
+                                diagnostic_evidence,
+                            ) = self._diagnostic_device_outputs(
+                                manifest,
+                                effective,
+                                adapter,
+                                device=device_stage.device,
+                                ar=selected_ar,
+                                inputs=inputs,
+                                initial_native_state=initial_native_state,
+                            )
                         device_identifier = device_stage.identifier
                         remote_attempt_dir = device_stage.adb.attempt_dir
                 elif all(
@@ -5374,6 +5570,21 @@ class QairtAgent:
                                 chain
                                 if SqnrMode.CHAIN in requested_modes
                                 else None
+                            )
+                        if _layer_float_reference(effective):
+                            (
+                                diagnostic_outputs,
+                                diagnostic_evidence,
+                            ) = self._diagnostic_device_outputs(
+                                manifest,
+                                effective,
+                                adapter,
+                                device=device_stage.device,
+                                ar=int(
+                                    effective.get("ar")
+                                    or manifest.build_spec.sequence.ars[0]
+                                ),
+                                inputs=inputs,
                             )
                         device_identifier = device_stage.identifier
                         remote_attempt_dir = device_stage.adb.attempt_dir
@@ -5457,6 +5668,8 @@ class QairtAgent:
                 device_outputs=chain,
                 output_dir=output_dir,
                 report_suffix=report_suffix,
+                diagnostic_outputs=diagnostic_outputs,
+                diagnostic_evidence=diagnostic_evidence,
             )
             if float_reference:
                 payload["float_reference"] = float_reference

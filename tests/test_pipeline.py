@@ -22,7 +22,7 @@ from qairt_agent.contracts import (
     StageExecutionContext,
     StageStatus,
 )
-from qairt_agent.errors import ErrorCode
+from qairt_agent.errors import ErrorCode, InvalidSpecError
 from qairt_agent.pipeline import QairtAgent, _sdk_generated_token_count
 from qairt_agent.qairt_adapter import (
     BuildResult,
@@ -2486,6 +2486,32 @@ def test_float_reference_uses_an_explicit_tensor_map(tmp_path: Path) -> None:
     assert report["unmapped_tensors"] == []
 
 
+def test_layer_granularity_requires_a_build_that_made_diagnostic_contexts(
+    tmp_path: Path,
+) -> None:
+    # A build without them cannot support the claim, and saying so beats
+    # publishing a slice-boundary report under a layer-level label.
+    from qairt_agent.pipeline import QairtAgent
+
+    factory = FakeAdapterFactory()
+    agent = _fake_agent(factory)
+    built = agent.build(_make_spec(tmp_path))
+    assert built.ok, built.error
+    assert built.manifest is not None
+
+    with pytest.raises(InvalidSpecError) as caught:
+        QairtAgent._diagnostic_device_outputs(
+            agent,
+            _load_run(built.manifest),
+            {"context_length": 4096},
+            factory(),
+            device=object(),
+            ar=1,
+            inputs={"x": np.array([1.0], dtype=np.float32)},
+        )
+    assert "produced none" in str(caught.value)
+
+
 def test_float_reference_fails_closed_on_debug_misuse(tmp_path: Path) -> None:
     model = _float_reference_onnx(tmp_path / "float" / "two_layer.onnx")
     outputs = {"decoder": {"h1": np.array([8.0, 10.0], dtype=np.float32)}}
@@ -2506,7 +2532,9 @@ def test_float_reference_fails_closed_on_debug_misuse(tmp_path: Path) -> None:
     )
     assert not layerwise.ok and layerwise.error is not None
     assert layerwise.error.code is ErrorCode.INVALID_SPEC
-    assert "slice_boundary" in layerwise.error.message
+    # Layer granularity is implemented now, but it must never degrade to
+    # slice boundaries: without executed diagnostic contexts it fails closed.
+    assert "executed diagnostic contexts" in layerwise.error.message
 
     nothing_mappable = _float_reference_validate(
         tmp_path / "c",
