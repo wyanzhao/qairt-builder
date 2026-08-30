@@ -301,20 +301,31 @@ in its own reviewed change; and this program's production quantization path is
 AIMET `apply_encodings`, which is the path the successful build above used.
 Filed for a separate task rather than bundled into the SDK pin.
 
+### A third defect: the DNS alias check could not read Apple container 1.0
+
+With the maintainer's `sudo container system dns create` done and
+`container system dns ls` showing the domain, worker startup still refused
+device jobs with "host alias is not configured for ADB". The command was fine;
+the check could not read the answer. Apple `container` 1.0 prints
+`container system dns list --format json` as a **flat array of domain
+strings** -- `["host.container.internal"]` -- while `_has_dns_alias` only
+recognised a domain named under a `domain`/`name` key and treated a bare string
+element as no match. Fixed so a string *list element* counts, while a string
+under an arbitrary dict key still does not, preserving the existing
+false-positive guard (`[{"description": "..."}]` remains "not configured").
+
+With that fixed, the container reached the host ADB server through the bridge
+and the run failed with the server's own
+`error: device 'RFCY30B296K' not found` -- i.e. the DNS half is proven working
+and only the physically disconnected handset remains.
+
 ### What is still required before this task can be marked done
 
-Only the on-device half — validate and benchmark. The build half is done and
-its report is reopenable. The device half is blocked on a host setup step this
-project deliberately refuses to perform. Apple `container` cannot reach an
-ADB server bound to host loopback without a privileged localhost DNS bridge,
-and `docs/worker-runtimes.md` states plainly that "the agent never runs this
-command". The maintainer runs it once:
-
-```bash
-sudo container system dns create host.container.internal --localhost 203.0.113.113
-```
-
-After that, one command produces the acceptance evidence:
+Only the on-device half -- validate and benchmark -- and only because the
+handset is unplugged. The privileged DNS bridge is configured and verified, and
+the build half is done with a reopenable report. Reconnect the SM8750 over USB
+(`adb devices` should list `RFCY30B296K`), then one command produces the
+acceptance evidence:
 
 ```bash
 QAIRT_AGENT_ADB_SERIAL=RFCY30B296K QAIRT_AGENT_ADB_SERVER=localhost:5037 \

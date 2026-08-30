@@ -357,6 +357,22 @@ def test_host_adb_alias_must_be_configured() -> None:
     )
     present.require_host_alias("host.container.internal")
 
+    # What Apple container 1.0 actually prints: a flat array of domains.
+    flat = AppleContainerRunner(
+        command_executor=FakeExecutor(
+            [FakeCompleted(stdout='["host.container.internal"]\n')]
+        )
+    )
+    flat.require_host_alias("host.container.internal")
+
+    other_domain_only = AppleContainerRunner(
+        command_executor=FakeExecutor(
+            [FakeCompleted(stdout='["something.else.internal"]\n')]
+        )
+    )
+    with pytest.raises(AppleContainerUnavailableError):
+        other_domain_only.require_host_alias("host.container.internal")
+
     false_positive = AppleContainerRunner(
         command_executor=FakeExecutor(
             [

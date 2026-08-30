@@ -76,18 +76,29 @@ def _find_string_field(document: Any, field_name: str) -> str | None:
 
 
 def _has_dns_alias(document: Any, alias: str) -> bool:
+    """Whether ``container system dns list --format json`` names ``alias``.
+
+    Apple ``container`` 1.0 answers with a flat array of domain strings
+    (``["host.container.internal"]``); older/structured shapes name the domain
+    under a ``domain``/``name`` key. A bare string is only accepted as a list
+    element, never as an arbitrary dict value, so an unrelated field that
+    happens to contain the alias still does not count as configured.
+    """
+
+    normalized = alias.rstrip(".").lower()
+
+    def is_alias(value: Any) -> bool:
+        return isinstance(value, str) and value.rstrip(".").lower() == normalized
+
     if isinstance(document, dict):
         for key, value in document.items():
-            if (
-                str(key).lower() in {"domain", "name"}
-                and isinstance(value, str)
-                and value.rstrip(".").lower()
-                == alias.rstrip(".").lower()
-            ):
+            if str(key).lower() in {"domain", "name"} and is_alias(value):
                 return True
         return any(_has_dns_alias(value, alias) for value in document.values())
     if isinstance(document, list):
-        return any(_has_dns_alias(value, alias) for value in document)
+        return any(
+            is_alias(item) or _has_dns_alias(item, alias) for item in document
+        )
     return False
 
 
