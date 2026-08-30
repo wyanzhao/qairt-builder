@@ -1584,7 +1584,8 @@ def test_multi_ar_quality_diagnosis_preserves_failing_ar(
     )
     agent = _fake_agent(MultiArFakeAdapterFactory())
     built = agent.build(spec)
-    assert built.ok and built.manifest is not None
+    assert built.ok, built.error
+    assert built.manifest is not None
 
     validated = agent.validate(
         built.manifest.path,
@@ -2295,7 +2296,7 @@ def test_genai_builder_saved_container_auto_benchmarks_with_public_executor(
     )
 
 
-def _float_reference_onnx(path: Path) -> Path:
+def _float_reference_onnx(path: Path, *, width: int = 2) -> Path:
     """A two-layer float graph whose internal activations are not outputs."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2306,11 +2307,11 @@ def _float_reference_onnx(path: Path) -> Path:
             helper.make_node("Identity", ["h1"], ["y"], name="head"),
         ],
         "float-reference",
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2])],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2])],
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [width])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [width])],
         initializer=[
-            helper.make_tensor("one", TensorProto.FLOAT, [2], [1.0, 1.0]),
-            helper.make_tensor("two", TensorProto.FLOAT, [2], [2.0, 2.0]),
+            helper.make_tensor("one", TensorProto.FLOAT, [width], [1.0] * width),
+            helper.make_tensor("two", TensorProto.FLOAT, [width], [2.0] * width),
         ],
     )
     model = helper.make_model(
@@ -3679,6 +3680,76 @@ def test_chain_benchmark_passes_initial_native_state_through_prefill_decode(
     np.testing.assert_array_equal(calls[1]["inputs"]["kv_in"], np.array([2.0]))
 
 
+def test_chain_benchmark_profiles_every_slice_with_its_recorded_inputs(
+    tmp_path: Path,
+) -> None:
+    # A chain slice is fed what the previous slice produced, so its device
+    # profile is only meaningful with those exact inputs. The measured pass
+    # records them; the capture replays them.
+    vector = _vector_case(tmp_path, inputs={"x": np.array([1.0], dtype=np.float32)})
+    factory = FakeAdapterFactory()
+    agent = _fake_agent(factory)
+    plan = agent.plan(_make_spec(tmp_path), offline=True)
+    assert plan.manifest is not None
+
+    result = agent.benchmark(
+        plan.manifest.path,
+        plan.manifest.sha256,
+        config={
+            "routes": [
+                {
+                    "slice_id": "embedding",
+                    "input_names": ["x"],
+                    "output_names": ["h"],
+                    "graph_names": {"1": "embedding_ar1"},
+                },
+                {
+                    "slice_id": "decoder",
+                    "input_names": ["hidden"],
+                    "output_names": ["y"],
+                    "graph_names": {"1": "decoder_ar1"},
+                    "from_previous": {"hidden": "h"},
+                },
+            ],
+            "contexts": {
+                "embedding": tmp_path / "embedding.bin",
+                "decoder": tmp_path / "decoder.bin",
+            },
+            "vector_manifest": vector,
+            "ar": 1,
+            "warmup_runs": 0,
+            "measured_runs": 1,
+            "aa_calibration": False,
+        },
+    )
+
+    assert result.ok, result.error
+    assert result.data is not None
+    device = result.data["device_execution"]
+
+    assert result.data["latency_metric"] == "device_execution"
+    assert device["scope"] == "chain"
+    assert set(device["by_slice"]) == {"embedding", "decoder"}
+    assert device["measured_slice_count"] == 2
+
+    # Slices run one after another, so their device execute times add -- but
+    # the report says the total is a sum of per-slice means, not a measured
+    # end-to-end number.
+    assert device["totals_basis"] == "sum_of_per_slice_means_slices_run_sequentially"
+    assert device["totals"]["accelerator_compute_us"] == 154.0
+
+    # The decoder was profiled with the embedding's output, not the raw input.
+    captures = [
+        details
+        for _, name, details in factory.log.calls
+        if name == "capture_device_execution"
+    ]
+    assert {item["graph_name"] for item in captures} == {
+        "embedding_ar1",
+        "decoder_ar1",
+    }
+
+
 def test_failed_stage_revision_keeps_stage_key_and_can_be_retried(
     tmp_path: Path,
 ) -> None:
@@ -4161,6 +4232,74 @@ def test_auto_quality_uses_sqnr_observation_and_explicit_lineage(
     assert diagnosed.data["layer_attributions"][0]["layer"] == 7
     assert diagnosed.data["op_attributions"][0]["op"] == "MatMul"
     assert diagnosed.data["op_attribution_supported"] is True
+
+
+def test_float_reference_runs_on_the_genai_raw_tensor_route(
+    tmp_path: Path,
+) -> None:
+    # The float reference is lane-neutral -- it compares whatever per-slice
+    # device outputs validation produced -- but nothing exercised it on a GenAI
+    # container's raw-tensor route, so "works on both lanes" was untested.
+    model = _float_reference_onnx(tmp_path / "float" / "one_wide.onnx", width=1)
+    vectors = _vector_case(
+        tmp_path,
+        inputs={"x": np.array([3.0], dtype=np.float32)},
+        goldens={"y": np.array([8.0], dtype=np.float32)},
+        case_id="genai-float-reference",
+    )
+    spec = _make_spec(
+        tmp_path,
+        vectors={
+            "mode": "provided",
+            "validation_manifests_by_ar": {1: vectors},
+        },
+        sequence={
+            "ars": [1],
+            "context_lengths": [4096],
+            "weight_sharing": False,
+            "native_kv": True,
+        },
+    )
+    spec = spec.model_copy(
+        update={
+            "metadata": {
+                **spec.metadata,
+                "attached_models_by_ar": {
+                    "1": {
+                        "model_path": str(spec.sources.text.onnx_path),
+                        "encodings_path": str(spec.sources.text.encodings_path),
+                    }
+                },
+            }
+        }
+    )
+    agent = _fake_agent(FakeAdapterFactory())
+    built = agent.build_genai_container(spec)
+    assert built.ok and built.manifest is not None
+
+    validated = agent.validate(
+        built.manifest.path,
+        built.manifest.sha256,
+        config={
+            "float_reference": {
+                "ar": 1,
+                "model_path": model,
+                "granularity": "slice_boundary",
+            }
+        },
+    )
+
+    assert validated.ok, validated.error
+    assert validated.data is not None
+    report = validated.data["float_reference"]
+
+    assert report["mode"] == "debug_only"
+    assert report["comparison"] == "device_chain_vs_onnxruntime_float_graph"
+    assert report["reference_source"] == "onnxruntime_float"
+    assert report["observations"], "the GenAI raw route bound no tensor"
+    # Debug-only means debug-only on this lane too: the production golden
+    # comparison is untouched.
+    assert validated.data["reference_source"] == "provided"
 
 
 def test_genai_optrace_profiles_raw_tensor_runtime_without_relabeling_wall_time(

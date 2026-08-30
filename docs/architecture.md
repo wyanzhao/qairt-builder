@@ -224,9 +224,11 @@ explicit prompt or prompt file.
 
 ## Evidence separation
 
-Production contexts contain no intermediate outputs. Wall latency is measured
-on a warmed production context. Diagnostic contexts contain only requested
-taps; their latency is never reported as production performance.
+Production contexts contain no intermediate outputs. Diagnostic contexts
+contain only requested taps; their latency is never reported as production
+performance. Validation *executes* those diagnostic contexts when a layer-level
+float comparison is requested, and only then does a report claim
+operator-level evidence — a context's existence is not a dump.
 
 Quality reports distinguish:
 
@@ -236,9 +238,17 @@ Quality reports distinguish:
 
 SQNR uses reference energy and float64 accumulation. Low SQNR or high latency is
 informational by product decision; quality and benchmark records never contain
-a product threshold or pass/fail verdict. Latency reports warmed production-wall
-samples, p50/p95, dispersion, and optional A/A noise calibration. Op trace
-cycles are work attribution and are not added together as wall latency.
+a product threshold or pass/fail verdict.
+
+**Latency is device time.** A benchmark reports `device_execution`, read from
+QAIRT's own profiling log: accelerator compute, accelerator and QNN execute
+time, and per-operator cycles, averaged over ten profiled executes with the
+spread published beside the mean. Host wall-clock samples, their dispersion and
+A/A calibration are kept under `harness_diagnostics` and marked `not_latency`,
+because QAIRT relaunches `qnn-net-run` for every remote call and a wall sample
+therefore measures process launch, context load, HVX/HMX power-on, deinit and
+ADB transport far more than it measures the model. Op trace cycles are work
+attribution and are not added together as wall latency.
 
 Supplied golden tensors have reference priority. If the exact selected vector
 manifest has raw inputs but no goldens, validation automatically captures

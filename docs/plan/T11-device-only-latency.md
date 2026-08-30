@@ -138,5 +138,7 @@ the mean alone.
 
 - GenAI half (`genie_execution`): blocked on [T08](T08-aimet-vector-import.md)
   for a real container.
-- Chain scope: declares its gap with a reason rather than measuring; wiring a
-  per-slice profiled execute needs the runner's dynamically produced inputs.
+- Chain scope: **covered 2026-08-30.** The timed pass records what each slice
+  was actually fed and every slice is then profiled with those exact inputs;
+  `by_slice` carries one block per slice and `totals` is a labelled sum of
+  per-slice means. The low-level lane now has no `available: false` scope.

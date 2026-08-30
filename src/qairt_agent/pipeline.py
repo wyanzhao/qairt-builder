@@ -45,6 +45,7 @@ from qairt_agent.contracts import (
     utc_now,
 )
 from qairt_agent.diagnostics.device_metrics import (
+    DEVICE_EXECUTION_METER,
     DEVICE_EXECUTION_SCHEMA,
     aggregate_device_executions,
 )
@@ -336,14 +337,12 @@ _DEVICE_EXECUTION_UNAVAILABLE = {
         "lane needs its own genie_execution meter (T11)"
     ),
     "chain": (
-        "chain execution feeds each slice from the previous slice's output, so "
-        "a profiled per-slice execute needs per-slice inputs the runner "
-        "produces dynamically; not yet wired (T11)"
+        "no chain slice executed, so no per-slice inputs were recorded to "
+        "profile with"
     ),
     "chain_sequence": (
-        "chain execution feeds each slice from the previous slice's output, so "
-        "a profiled per-slice execute needs per-slice inputs the runner "
-        "produces dynamically; not yet wired (T11)"
+        "no chain slice executed, so no per-slice inputs were recorded to "
+        "profile with"
     ),
 }
 
@@ -4989,6 +4988,120 @@ class QairtAgent:
             executors[str(slice_name)] = execute
         return executors
 
+    @staticmethod
+    def _recording_chain_executors(
+        base: Mapping[str, Callable[[Mapping[str, np.ndarray], Any], Mapping[str, np.ndarray]]],
+        recorded: dict[str, dict[str, Any]],
+    ) -> dict[str, Callable[[Mapping[str, np.ndarray], Any], Mapping[str, np.ndarray]]]:
+        """Wrap chain executors so each slice's exact inputs are captured.
+
+        A profiled per-slice execute needs the inputs that slice is really fed,
+        and in a chain those come from the previous slice at run time. Recording
+        them during one ordinary pass is what lets the device capture replay
+        each slice faithfully instead of guessing.
+        """
+
+        wrapped: dict[
+            str, Callable[[Mapping[str, np.ndarray], Any], Mapping[str, np.ndarray]]
+        ] = {}
+        for slice_name, executor in base.items():
+            def record(
+                inputs: Mapping[str, np.ndarray],
+                invocation: Any,
+                *,
+                bound: str = str(slice_name),
+                inner: Any = executor,
+            ) -> Mapping[str, np.ndarray]:
+                recorded[bound] = {
+                    "inputs": {
+                        str(name): np.asarray(value)
+                        for name, value in inputs.items()
+                    },
+                    "graph_name": str(invocation.graph_name),
+                }
+                return inner(inputs, invocation)
+
+            wrapped[str(slice_name)] = record
+        return wrapped
+
+    def _chain_device_execution(
+        self,
+        adapter: Any,
+        recorded: Mapping[str, Mapping[str, Any]],
+        contexts: Mapping[str, Any],
+        *,
+        device: Any,
+        native_io: bool,
+        execution_options: Mapping[str, Any],
+        working_dir: Path,
+    ) -> dict[str, Any]:
+        """Per-slice device execute time for a chain run.
+
+        Each slice is profiled with the inputs it was actually fed, recorded
+        during the preceding ordinary chain pass.
+        """
+
+        by_slice: dict[str, Any] = {}
+        for slice_name, entry in recorded.items():
+            context = contexts.get(slice_name)
+            if context is None:
+                continue
+            by_slice[str(slice_name)] = self._device_execution_block(
+                adapter,
+                context,
+                entry["inputs"],
+                graph_name=str(entry["graph_name"]),
+                device=device,
+                native_io=native_io,
+                execution_options=execution_options,
+                working_dir=working_dir / str(slice_name),
+            )
+
+        measured = {
+            name: block
+            for name, block in by_slice.items()
+            if isinstance(block, Mapping) and block.get("available") is not False
+        }
+        block: dict[str, Any] = {
+            "schema": DEVICE_EXECUTION_SCHEMA,
+            "meter": DEVICE_EXECUTION_METER,
+            "lane": "low_level",
+            "policy": "report_only",
+            "scope": "chain",
+            "statistic": "mean",
+            "slice_count": len(by_slice),
+            "measured_slice_count": len(measured),
+            "by_slice": by_slice,
+        }
+        if measured and len(measured) == len(by_slice):
+            # Chain slices run sequentially, so their device execute times add.
+            # This is a sum of per-slice means, not a measured end-to-end
+            # number, and says so.
+            block["totals"] = {
+                key: sum(
+                    float(item[key])
+                    for item in measured.values()
+                    if isinstance(item.get(key), (int, float))
+                )
+                for key in (
+                    "accelerator_compute_us",
+                    "accelerator_execute_us",
+                    "qnn_execute_us",
+                )
+                if all(
+                    isinstance(item.get(key), (int, float))
+                    for item in measured.values()
+                )
+            }
+            block["totals_basis"] = "sum_of_per_slice_means_slices_run_sequentially"
+        else:
+            block["available"] = False
+            block["reason"] = (
+                "not every chain slice produced device evidence; a partial "
+                "chain total would understate the work"
+            )
+        return block
+
     def run_chain(
         self,
         manifest_uri: str | Path,
@@ -6053,6 +6166,8 @@ class QairtAgent:
             profile_initial_native_state: dict[str, np.ndarray] = {}
             device_execution: dict[str, Any] | None = None
             execution_owner: Any = None
+            chain_slice_inputs: dict[str, dict[str, Any]] = {}
+            loaded_contexts: dict[str, Any] = {}
             profile_claim_scope = (
                 "production_runtime_optrace"
             )
@@ -6261,7 +6376,6 @@ class QairtAgent:
                     finally:
                         adapter.clean_genai_executor(executor)
                 elif effective.get("routes") is not None:
-                    loaded_contexts: dict[str, Any] = {}
                     for slice_name, context_path in contexts.items():
                         if hasattr(adapter, "load_compiled"):
                             loaded_contexts[str(slice_name)] = (
@@ -6275,12 +6389,15 @@ class QairtAgent:
                             loaded_contexts[str(slice_name)] = context_path
                     runner = SliceChainRunner(
                         effective["routes"],
-                        self._chain_executors(
-                            adapter,
-                            loaded_contexts,
-                            device=device_stage.device,
-                            native_io=native_io,
-                            execution_options=execution_options,
+                        self._recording_chain_executors(
+                            self._chain_executors(
+                                adapter,
+                                loaded_contexts,
+                                device=device_stage.device,
+                                native_io=native_io,
+                                execution_options=execution_options,
+                            ),
+                            chain_slice_inputs,
                         ),
                     )
                     scope = (
@@ -6371,19 +6488,6 @@ class QairtAgent:
                         device=device_stage.device,
                     )
 
-                if device_execution is None:
-                    # Latency is device time, so a scope with no device meter
-                    # says so with a cause rather than quietly omitting the
-                    # block and leaving the wall number to look like latency.
-                    device_execution = {
-                        "schema": DEVICE_EXECUTION_SCHEMA,
-                        "policy": "report_only",
-                        "available": False,
-                        "reason": _DEVICE_EXECUTION_UNAVAILABLE.get(
-                            scope, "no device meter is wired for this scope"
-                        ),
-                    }
-
                 if scope != "genai_generation":
                     # Our own setup -- context loading, Device construction, ADB
                     # staging, graph-runner setup -- is complete before the
@@ -6408,6 +6512,32 @@ class QairtAgent:
                         if execution_owner is not None:
                             adapter.release_execution(execution_owner)
                             execution_owner = None
+
+                if device_execution is None and chain_slice_inputs:
+                    # The measured chain pass recorded what each slice was
+                    # actually fed, so each one can now be profiled with its
+                    # real inputs rather than a guess.
+                    device_execution = self._chain_device_execution(
+                        adapter,
+                        chain_slice_inputs,
+                        loaded_contexts,
+                        device=device_stage.device,
+                        native_io=native_io,
+                        execution_options=execution_options,
+                        working_dir=output_dir / "device_profiling",
+                    )
+                if device_execution is None:
+                    # Latency is device time, so a scope with no device meter
+                    # says so with a cause rather than quietly omitting the
+                    # block and leaving the wall number to look like latency.
+                    device_execution = {
+                        "schema": DEVICE_EXECUTION_SCHEMA,
+                        "policy": "report_only",
+                        "available": False,
+                        "reason": _DEVICE_EXECUTION_UNAVAILABLE.get(
+                            scope, "no device meter is wired for this scope"
+                        ),
+                    }
                 if optrace_enabled:
                     if not hasattr(adapter, "profile"):
                         raise InvalidSpecError(

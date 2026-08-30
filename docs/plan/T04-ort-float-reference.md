@@ -185,15 +185,15 @@ handset attached, and SM8750 is equally verified in the target registry.
 
 ## Still open
 
-- **Tier 2 (layer-level drilldown).** Requesting any granularity other than
-  `slice_boundary` fails closed today. The blocker is unchanged: the low-level
-  lane must actually execute the diagnostic contexts it already builds. T01's
-  probe answered the GenAI half negative — 2.49 exposes no intermediate/debug
-  output for built containers — so that lane takes the documented fail-closed
-  experimental low-level diagnostic build.
-- **GenAI lane tier 1.** The implementation is lane-neutral — it compares
-  whatever per-slice device outputs the validation run produced — so a GenAI
-  raw-tensor route works in principle, but no GenAI-lane test exercises it yet.
+- **Tier 2 low-level: landed 2026-08-30** — see the section below. GenAI tier 2
+  stays on the documented fallback, since T01's probe answered that half
+  negative: 2.49 exposes no intermediate/debug output for built containers, so
+  that lane needs an explicit, fail-closed experimental low-level diagnostic
+  build for Qwen3.5.
+- **GenAI lane tier 1: covered 2026-08-30** by
+  `test_float_reference_runs_on_the_genai_raw_tensor_route`, which drives the
+  debug mode through a container's raw-tensor route and asserts the production
+  golden comparison is untouched.
 - **Multi-slice divergence.** See the scope note above; blocked on
   [T08](T08-aimet-vector-import.md).
 

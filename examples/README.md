@@ -21,6 +21,7 @@ them point at mounted files in your project.
 | `qwen3_5_omni_thinker.json` | GenAI Builder text lane | independent Thinker AR1/AR128 ONNX+encodings and validation manifest per AR | `/artifacts/qwen3.5-omni-thinker` |
 | `qwen3_5_omni.json` | GenAI Builder packaging | Thinker AR1/AR128 plus audio ONNX+encodings; validation manifest per text AR | `/artifacts/qwen3.5-omni` |
 | `qwen3_dense_float_reference_debug.json` | low-level Python API (**debug only**) | same as `qwen3_dense.json` plus the AR-matching float ONNX | `/artifacts/qwen3-float-reference-debug` |
+| `qwen3_dense_float_reference_layer_debug.json` | low-level Python API (**debug only**) | same, plus a build that emitted diagnostic contexts | `/artifacts/qwen3-float-reference-layer-debug` |
 
 `qwen3_5_omni.json` is build/package-only on the pinned SDK because its preset
 sets `runtime_supported=false`; do not run the default validate/benchmark
@@ -52,6 +53,23 @@ before a production run: `tensor_map` names must come from the transform
 lineage of your exact export, because a boundary name is never guessed. Any
 device tensor it cannot bind by an exact name match is listed under
 `unmapped_tensors` rather than silently dropped.
+
+`qwen3_dense_float_reference_layer_debug.json` is the deeper tier of the same
+debug mode: `granularity: "layer"`. Instead of comparing only slice
+boundaries, it **executes the diagnostic contexts** the build compiled and
+compares every tapped tensor against the float graph, ordered by the float
+graph's topology so the first divergence is the first row. It therefore needs a
+build that actually produced those contexts, which is why the example also sets
+`quality.dump_intermediates_on_failure` and `compile.enable_intermediate_outputs`
+— run it against a build made with those, or the stage fails closed and names
+the flag to set. It never degrades to slice boundaries: publishing a
+boundary-only report under a layer-level label would be an overclaim.
+
+Read its output with the same discipline as the boundary tier. The report is
+labelled `first_observed_divergence_not_root_cause` for a reason — an
+intermediate can read far worse than the tensors on either side of it when a
+downstream operator discards the range the error lives in, so the first bad row
+is where to start looking, not the answer.
 
 `legacy/qwen3_5_low_level_experimental.json` preserves an old direct low-level
 experiment for single-source Qwen3.5 AR rewriting. Files under `legacy/` are

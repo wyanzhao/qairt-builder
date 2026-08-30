@@ -331,11 +331,40 @@ under `effective_config.benchmark` (with `lane` and `sample_unit`), and every
 later stage reads the same values. Explicit spec values always win, per field.
 A/A calibration doubles whichever numbers apply.
 
-Every latency report carries a `measurement_scope` block: samples are warmed
-host `perf_counter_ns` wall time around one call and include the
-host-to-SDK-to-device round trip, because the QAIRT Python API exposes no
-device-side synchronization barrier. On-device per-op attribution comes from
-optrace, never from arithmetic on these samples.
+**Latency means device time.** Every latency report names its metric in
+`latency_metric`, which points at the `device_execution` block or at the string
+`unavailable` — never at a host number. `device_execution` is read from QAIRT's
+own profiling log at `level="detailed"` and carries accelerator compute time,
+accelerator and QNN execute time, per-operator cycles, and per-process overhead
+kept separate from execute time. The profiled execute runs **ten times and the
+block reports the mean**, with `spread` and `samples` beside it; on real
+hardware the per-execute variation is large enough that a single sample is not
+a number worth publishing.
+
+`option="optrace"` is **not** how per-op cycles are obtained. It additionally
+requires a schematic binary that this program's compile does not emit, and
+fails with "No op trace raw data found." without one; the detailed log already
+carries per-operator cycles and needs no such asset.
+
+A scope with no device meter sets `latency_metric: "unavailable"` and publishes
+`device_execution.available = false` **with a reason** — today that is GenAI
+generation, because `generate()` reaches Genie as `GenieDialog_query` rather
+than `CompiledModel.__call__` and `qairt.Profiler` cannot observe it. Chain
+scope *is* measured: the timed pass records what each slice was actually fed,
+and every slice is then profiled with those exact inputs, so `by_slice` carries
+one block per slice and `totals` is an explicitly labelled sum of per-slice
+means.
+
+The host wall-clock number survives only under `harness_diagnostics`, marked
+`not_latency: true`, because it still detects ADB, container and transport
+degradation. Its `measurement_scope` block lives there too and lists
+`excluded_from_timer` — context loading, ADB staging, device construction,
+graph-runner setup, the setup *we* control — against `included_in_sample`: the
+`qnn-net-run` process launch, per-call context load, HVX/HMX power-on, per-call
+deinit and the ADB round trip that QAIRT performs inside a single call. On
+SM8750 a 49 KB context measured ~4900 ms of wall time around 79 µs of
+accelerator compute; `aa_calibration` and `p50_ms_per_token` are wall-derived
+and live with it.
 
 `p50_ms_per_token` appears only alongside an explicit `ms_per_token_source`.
 `caller` means the benchmark config supplied `token_count`. `sdk_metrics` is
