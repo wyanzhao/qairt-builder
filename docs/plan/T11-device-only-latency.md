@@ -68,9 +68,15 @@ thing a future SDK build may simply stop doing.
    them directly avoids the count problem entirely — a derived `ms_per_token`
    is what needs a count, a reported rate does not. `time_to_first_token` is
    the other headline.
-3. **Statistics, not one sample.** `device_execution` is currently a single
-   profiled execute. As the primary metric it needs N samples with p50/spread
-   like the wall metric has, and A/A calibration moves onto the device numbers.
+3. **Ten samples, report the mean** (maintainer decision, 2026-08-30).
+   `device_execution` is currently a single profiled execute; as the primary
+   metric it repeats the profiled execute 10 times and publishes the average.
+   No new statistics code is needed — `diagnostics.latency.summarize_latency`
+   already returns mean alongside p50/p90/stddev/MAD from a sample list, so the
+   device samples go through the same summarizer and the mean is the headline
+   with the rest available beside it. A/A calibration moves onto the device
+   numbers or is dropped there; it was calibrating host noise, which is no
+   longer the metric.
 4. **Cover the remaining scopes.** Chain-scope runs get no device capture
    today; the capture is wired only for the single-graph path.
 5. **Demote the wall metric** to a `harness_diagnostics` block: still recorded,
@@ -90,7 +96,8 @@ thing a future SDK build may simply stop doing.
 ## Acceptance criteria
 
 - No report calls a host wall number "latency".
-- Low-level lane publishes `device_execution` with N samples and spread.
+- Low-level lane publishes `device_execution` averaged over 10 profiled
+  executes.
 - GenAI lane publishes `genie_execution` with the device-measured rates and
   time-to-first-token, labelled as its own meter.
 - Chain scope is covered or explicitly fails closed.
