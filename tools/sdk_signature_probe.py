@@ -39,6 +39,19 @@ PROBES = [
     ("qairt.gen_ai_api.containers.container_factory", "load_container"),
     ("qti.aisw.tools.core.modules.converter.quantizer_module", "QuantizerInputConfig"),
     ("qti.aisw.tools.core.modules.converter.quantizer_module", "QAIRTQuantizer"),
+    # Per-model knowledge the low-level lane reads from the SDK instead of
+    # keeping a copy of. A rename here has to fail loudly at upgrade time,
+    # because the fallback would be reslicing the graph or silently dropping
+    # HMX marking.
+    ("qairt.gen_ai_api.builders.gen_ai_utils", "gen_kv_format_config"),
+    ("qairt.optimizer.onnx.graph", "ExportedFiles"),
+    ("qairt.optimizer.onnx.graph", "ExportedFileInfo"),
+]
+
+#: Attributes (not just names) the adapter binds. Probed separately because a
+#: class attribute has no signature.
+ATTRIBUTES = [
+    ("qairt.gen_ai_api.builders.qwen.builder", "Qwen3_5BuilderHTP", "_QWEN3_5_START_POINTS"),
 ]
 METHODS = [
     ("qairt.gen_ai_api.builders.qwen.builder", "Qwen3_5BuilderHTP",
@@ -47,6 +60,24 @@ METHODS = [
 ]
 
 rows, missing = [], []
+for module_name, class_name, attribute in ATTRIBUTES:
+    try:
+        owner = getattr(importlib.import_module(module_name), class_name)
+    except Exception as error:
+        missing.append(f"{module_name}.{class_name}: {error}")
+        continue
+    value = getattr(owner, attribute, None)
+    if value is None:
+        missing.append(f"{class_name}.{attribute}: MISSING")
+        continue
+    rows.append(
+        {
+            "module": f"{module_name}.{class_name}",
+            "attribute": attribute,
+            "signature": f"<{len(value)} entries>",
+        }
+    )
+
 for module_name, attribute in PROBES:
     try:
         module = importlib.import_module(module_name)

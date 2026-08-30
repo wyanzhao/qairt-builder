@@ -81,8 +81,18 @@ following. File:line references are as of commit `8b42269`.
    contracts (`adapter.py:553-724`), and native-KV state exclusion
    (`src/qairt_agent/qairt_adapter/native_kv.py:16-20`) are never exercised by
    the GenAI lane, which passes six generic options and trusts
-   `Qwen3_5BuilderHTP` (`adapter.py:2059-2068`). Accepted: the SDK owns the
-   GenAI lane; SQNR is the after-the-fact guard.
+   `Qwen3_5BuilderHTP` (`adapter.py:2059-2068`).
+   **Corrected and resolved (2026-08-30).** The second half of that reading was
+   wrong: the SDK's `Qwen3_5BuilderHTP` installs the *same four start points*
+   itself at construction, verbatim. So the knowledge was never lost in the
+   GenAI lane — it was **duplicated**, once in the SDK and once here, with
+   nothing to detect drift. Two of the three duplications had in fact already
+   produced real bugs, both found only by reading SDK source during T07 (the
+   `split_llm` N vs N-1 distribution, and the missing `ar > 0` guard in the
+   native-KV gate). The low-level lane now reads start points and the
+   native-KV/HMX selection from the SDK instead of keeping copies; only the
+   split distribution is still reproduced, and its boundaries are labelled
+   `advisory` because they cannot be sourced or cheaply verified.
 
 ## Latent bugs (→ T07)
 

@@ -1,4 +1,18 @@
-"""Native-KV data-format config generation and strict auditing."""
+"""Native-KV data-format policy and strict auditing.
+
+The selection rule -- which tensors get the HMX weight layout, and whether a
+graph's outputs are included -- belongs to QAIRT, not to this program. It is
+read from the SDK's own ``gen_ai_utils.gen_kv_format_config`` at build time
+(see ``QairtSdkAdapter._native_kv_config``) rather than reimplemented here: a
+reimplementation goes stale the moment the SDK changes it, and nothing says so.
+This module previously carried that copy, and it had already drifted -- it was
+missing the SDK's ``ar > 0`` guard.
+
+What stays here is the part that is *ours*: a documented subtraction of tensor
+names whose role proves they are not caches, and a strict audit that fails
+closed when the config the compiler is about to receive disagrees with what the
+SDK selected.
+"""
 
 from __future__ import annotations
 
@@ -12,20 +26,12 @@ from .types import NativeKvAuditReport, NativeKvGraphExpectation
 
 NATIVE_KV_DATA_FORMAT = "QNN_TENSOR_DATA_FORMAT_HMX_WEIGHT_LAYOUT"
 
-# QAIRT emits KV outputs in the native HMX layout only for graphs whose AR is a
-# positive multiple of 32; every other graph carries inputs alone.  Source:
-# QAIRT 2.49.0.260730 ``qairt/gen_ai_api/builders/gen_ai_utils.py``
-# ``gen_kv_format_config``: ``is_multiple_of_32 = ar is not None and ar > 0 and
-# ar % 32 == 0``.
-_HMX_OUTPUT_AR_MULTIPLE = 32
-
-# The SDK selects cache tensors with a bare ``"key" in name or "value" in name``
-# substring test.  We keep that inclusion rule so the generated config stays
-# compatible with the compiler, but subtract names whose role vocabulary proves
-# they are not caches: marking a padding mask or a position index as an HMX
-# weight layout would silently corrupt it, and linear-attention recurrent/conv
-# state is not a KV cache at all.
-_KV_NAME_TOKENS = ("key", "value")
+# QAIRT selects cache tensors with a bare ``"key" in name or "value" in name``
+# substring test. We subtract names whose role vocabulary proves they are not
+# caches: marking a padding mask or a position index as an HMX weight layout
+# would silently corrupt it, and linear-attention recurrent/conv state is not a
+# KV cache at all. This is a deliberate, narrow divergence from the SDK, and
+# ``normalize_sdk_kv_config`` reports what it removed rather than hiding it.
 _NON_CACHE_ROLE_TOKENS = (
     "recurrent_state",
     "conv_state",
@@ -39,15 +45,11 @@ _NON_CACHE_ROLE_TOKENS = (
 )
 
 
-def _has_hmx_kv_outputs(ar: int) -> bool:
-    return ar > 0 and ar % _HMX_OUTPUT_AR_MULTIPLE == 0
+def is_non_cache_role(name: str) -> bool:
+    """Whether a name QAIRT selected is provably not a KV cache tensor."""
 
-
-def _is_kv_name(name: str) -> bool:
     normalized = name.lower()
-    if not any(token in normalized for token in _KV_NAME_TOKENS):
-        return False
-    return not any(token in normalized for token in _NON_CACHE_ROLE_TOKENS)
+    return any(token in normalized for token in _NON_CACHE_ROLE_TOKENS)
 
 
 def _load_config(config: str | Path | Mapping[str, Any]) -> Mapping[str, Any]:
@@ -63,41 +65,85 @@ def _load_config(config: str | Path | Mapping[str, Any]) -> Mapping[str, Any]:
     return document
 
 
-def build_native_kv_config(
-    expectations: Sequence[NativeKvGraphExpectation],
-) -> dict[str, list[dict[str, Any]]]:
-    """Generate QAIRT 2.49's canonical ``graphs[].tensors[]`` JSON shape."""
+def normalize_sdk_kv_config(
+    sdk_config: Mapping[str, Any],
+    expectations: Sequence[NativeKvGraphExpectation] = (),
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, str]]]:
+    """Adopt QAIRT's selection, renamed to our graph names and role-filtered.
 
+    QAIRT names each graph by its ONNX stem; this program addresses graphs by
+    the converted model's graph name, so entries are remapped through the
+    expectation that produced them. Returns the config plus every name the role
+    filter removed, so the divergence from the SDK is reported, not silent.
+    """
+
+    by_stem = {
+        Path(str(item.model_path)).stem: item
+        for item in expectations
+        if item.model_path is not None
+    }
     graphs: list[dict[str, Any]] = []
-    for expectation in expectations:
-        input_names = tuple(name for name in expectation.input_names if _is_kv_name(name))
-        output_names = tuple(name for name in expectation.output_names if _is_kv_name(name))
-        selected = (
-            input_names + output_names
-            if _has_hmx_kv_outputs(expectation.ar)
-            else input_names
-        )
-        if selected:
-            graphs.append(
+    removed: list[dict[str, str]] = []
+    for raw_graph in sdk_config.get("graphs", ()):
+        if not isinstance(raw_graph, Mapping):
+            raise NativeKvConfigError("QAIRT returned a non-object graph entry")
+        stem = str(raw_graph.get("graph_name", ""))
+        expectation = by_stem.get(stem)
+        tensors: list[dict[str, Any]] = []
+        for raw_tensor in raw_graph.get("tensors", ()):
+            name = str(raw_tensor.get("tensor_name", ""))
+            if is_non_cache_role(name):
+                removed.append({"graph_name": stem, "tensor_name": name})
+                continue
+            tensors.append(
                 {
-                    "graph_name": expectation.graph_name,
-                    "tensors": [
-                        {"tensor_name": name, "dataFormat": NATIVE_KV_DATA_FORMAT}
-                        for name in selected
-                    ],
+                    "tensor_name": name,
+                    "dataFormat": str(
+                        raw_tensor.get("dataFormat", NATIVE_KV_DATA_FORMAT)
+                    ),
                 }
             )
-    return {"graphs": graphs}
+        if tensors:
+            graphs.append(
+                {
+                    "graph_name": (
+                        expectation.graph_name if expectation is not None else stem
+                    ),
+                    "tensors": tensors,
+                }
+            )
+    return {"graphs": graphs}, removed
+
+
+def expected_tensors(config: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
+    """Per-graph tensor names, used as the audit's expectation."""
+
+    expected: dict[str, tuple[str, ...]] = {}
+    for raw_graph in config.get("graphs", ()):
+        if not isinstance(raw_graph, Mapping):
+            continue
+        expected[str(raw_graph.get("graph_name", ""))] = tuple(
+            str(item.get("tensor_name", ""))
+            for item in raw_graph.get("tensors", ())
+            if isinstance(item, Mapping)
+        )
+    return expected
 
 
 def audit_native_kv_config(
     config: str | Path | Mapping[str, Any],
     *,
-    expectations: Sequence[NativeKvGraphExpectation] = (),
+    expected: Mapping[str, Sequence[str]] | None = None,
     expected_graph_names: Sequence[str] = (),
     require_nonempty: bool = True,
 ) -> NativeKvAuditReport:
-    """Audit exact graph names, tensor sets, and HMX layout values."""
+    """Audit exact graph names, tensor sets, and HMX layout values.
+
+    ``expected`` is what QAIRT selected for each graph after the role filter.
+    Auditing against that, rather than against a locally recomputed rule, keeps
+    this a check on the config the compiler receives instead of a second copy of
+    the selection logic.
+    """
 
     document = _load_config(config)
     issues: list[str] = []
@@ -136,9 +182,10 @@ def audit_native_kv_config(
                 continue
             if tensor_name in names:
                 issues.append(f"graph {graph_name!r} repeats tensor {tensor_name!r}")
-            if not _is_kv_name(tensor_name):
+            if is_non_cache_role(tensor_name):
                 issues.append(
-                    f"graph {graph_name!r} tensor {tensor_name!r} is not a key/value cache tensor"
+                    f"graph {graph_name!r} tensor {tensor_name!r} is not a key/value "
+                    "cache tensor"
                 )
             if data_format != NATIVE_KV_DATA_FORMAT:
                 issues.append(
@@ -150,35 +197,29 @@ def audit_native_kv_config(
         graph_tensors[graph_name] = tuple(names)
 
     expected_names = set(expected_graph_names)
-    expected_names.update(item.graph_name for item in expectations)
+    if expected is not None:
+        expected_names.update(expected)
     actual_names = set(graph_tensors)
     for graph_name in sorted(expected_names - actual_names):
         issues.append(f"missing native-KV graph entry {graph_name!r}")
     for graph_name in sorted(actual_names - expected_names) if expected_names else ():
         issues.append(f"unexpected native-KV graph entry {graph_name!r}")
 
-    for expectation in expectations:
-        expected_inputs = tuple(name for name in expectation.input_names if _is_kv_name(name))
-        expected_outputs = tuple(name for name in expectation.output_names if _is_kv_name(name))
-        expected_tensors = (
-            expected_inputs + expected_outputs
-            if _has_hmx_kv_outputs(expectation.ar)
-            else expected_inputs
-        )
-        actual = graph_tensors.get(expectation.graph_name, ())
-        missing = set(expected_tensors) - set(actual)
-        extra = set(actual) - set(expected_tensors)
+    for graph_name, tensors in (expected or {}).items():
+        actual = graph_tensors.get(graph_name, ())
+        missing = set(tensors) - set(actual)
+        extra = set(actual) - set(tensors)
         if missing:
             issues.append(
-                f"graph {expectation.graph_name!r} is missing tensors: {sorted(missing)}"
+                f"graph {graph_name!r} is missing tensors: {sorted(missing)}"
             )
         if extra:
             issues.append(
-                f"graph {expectation.graph_name!r} has unexpected tensors: {sorted(extra)}"
+                f"graph {graph_name!r} has unexpected tensors: {sorted(extra)}"
             )
-        if not expected_tensors:
+        if not tensors:
             issues.append(
-                f"graph {expectation.graph_name!r} has no key/value cache tensors; "
+                f"graph {graph_name!r} has no key/value cache tensors; "
                 "native-KV must not be silently enabled"
             )
 

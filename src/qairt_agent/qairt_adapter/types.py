@@ -174,10 +174,19 @@ class GenAIContainerBuildResult:
 
 @dataclass(frozen=True)
 class NativeKvGraphExpectation:
+    """One graph the native-KV data-format config must cover.
+
+    ``model_path`` is the transformed slice ONNX. QAIRT's own
+    ``gen_kv_format_config`` reads the graph from disk, so the path is what
+    lets this program call the SDK's selection rule instead of reimplementing
+    it; ``input_names``/``output_names`` remain for auditing.
+    """
+
     graph_name: str
     ar: int
     input_names: tuple[str, ...]
     output_names: tuple[str, ...]
+    model_path: Path | None = None
 
 
 @dataclass(frozen=True)

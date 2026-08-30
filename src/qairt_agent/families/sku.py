@@ -71,6 +71,7 @@ def _boundaries_from_split_plan(split_plan: SplitPlan) -> tuple[SliceBoundary, .
             slice_id=slice_spec.name,
             layer_start=slice_spec.layer_start,
             layer_end=slice_spec.layer_end,
+            advisory=True,
         )
         for slice_spec in split_plan.slices
         if slice_spec.layer_start is not None and slice_spec.layer_end is not None

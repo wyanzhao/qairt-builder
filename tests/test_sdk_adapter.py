@@ -16,6 +16,7 @@ from qairt_agent.harness import DEFAULT_CONSTRAINTS, resolve_target
 _ACTIVE_TARGET = resolve_target(constraints=DEFAULT_CONSTRAINTS)
 from qairt_agent.qairt_adapter import (
     ExperimentalFeatureError,
+    NativeKvConfigError,
     BuildResult,
     CompiledContextArtifact,
     ConvertedModelArtifact,
@@ -32,7 +33,7 @@ from qairt_agent.qairt_adapter import (
     Qwen35RuntimeValidationResult,
     TransformedSliceArtifact,
     audit_native_kv_config,
-    build_native_kv_config,
+    expected_tensors,
 )
 
 
@@ -149,102 +150,204 @@ class PreflightTests(unittest.TestCase):
         self.assertTrue(report.ok, report.issues)
 
 
+class FakeGenAiUtils:
+    """Stands in for QAIRT's gen_ai_utils: same selection rule as the SDK's.
+
+    Mirrors gen_kv_format_config exactly, including the ``ar > 0`` guard that
+    the previous local reimplementation was missing, so these tests exercise
+    the adapter's use of the SDK rather than a second copy of the rule.
+    """
+
+    def __init__(self, io_by_stem: dict[str, tuple[tuple[str, ...], tuple[str, ...]]]):
+        self.io_by_stem = io_by_stem
+        self.seen_sequence_lengths: list[Any] = []
+
+    def gen_kv_format_config(self, split_files) -> dict:
+        graphs = []
+        for exported in split_files:
+            stem = Path(exported.onnx_path).stem
+            inputs, outputs = self.io_by_stem[stem]
+            ar = exported.info.sequence_length if exported.info is not None else None
+            self.seen_sequence_lengths.append(ar)
+            multiple_of_32 = ar is not None and ar > 0 and ar % 32 == 0
+            candidates = inputs + outputs if multiple_of_32 else inputs
+            tensors = [
+                {
+                    "tensor_name": name,
+                    "dataFormat": NATIVE_KV_DATA_FORMAT,
+                }
+                for name in candidates
+                if "key" in name or "value" in name
+            ]
+            if tensors:
+                graphs.append({"graph_name": stem, "tensors": tensors})
+        return {"graphs": graphs}
+
+
+class FakeExportedFileInfo:
+    def __init__(self, sequence_length=None, context_length=None) -> None:
+        self.sequence_length = sequence_length
+        self.context_length = context_length
+
+
+class FakeExportedFiles:
+    """Mirrors the SDK: _info is unset until the caller stamps it."""
+
+    def __init__(self, onnx_path, data_path) -> None:
+        self.onnx_path = Path(onnx_path)
+        self.data_path = Path(data_path)
+        self._info = None
+
+    @property
+    def info(self):
+        return self._info
+
+
 class NativeKvTests(unittest.TestCase):
-    def test_ar1_inputs_only_ar128_inputs_and_outputs(self) -> None:
-        expectations = (
-            NativeKvGraphExpectation(
-                "decoder_ar1",
-                1,
-                ("past_key_0_in", "recurrent_state_0_in", "hidden"),
-                ("past_key_0_out",),
+    def _adapter_with_sdk(self, io_by_stem):
+        utils = FakeGenAiUtils(io_by_stem)
+        modules = {
+            "qairt.gen_ai_api.builders.gen_ai_utils": utils,
+            "qairt.optimizer.onnx.graph": SimpleNamespace(
+                ExportedFiles=FakeExportedFiles,
+                ExportedFileInfo=FakeExportedFileInfo,
             ),
-            NativeKvGraphExpectation(
-                "decoder_ar128",
-                128,
-                ("past_value_0_in", "conv_state_0_in"),
-                ("past_value_0_out",),
-            ),
+        }
+        adapter = QairtSdkAdapter(
+            module_loader=lambda name: modules[name],
+            require_successful_preflight=False,
         )
-        config = build_native_kv_config(expectations)
-        report = audit_native_kv_config(config, expectations=expectations)
-        self.assertTrue(report.ok, report.issues)
+        return adapter, utils
+
+    def _expectation(self, directory, stem, graph_name, ar, inputs, outputs):
+        model = Path(directory) / f"{stem}.onnx"
+        model.write_bytes(b"onnx")
+        return NativeKvGraphExpectation(
+            graph_name=graph_name,
+            ar=ar,
+            input_names=inputs,
+            output_names=outputs,
+            model_path=model,
+        )
+
+    def test_ar1_inputs_only_ar128_inputs_and_outputs(self) -> None:
+        io_by_stem = {
+            "slice_ar1": (("past_key_0_in", "recurrent_state_0_in", "hidden"), ("past_key_0_out",)),
+            "slice_ar128": (("past_value_0_in", "conv_state_0_in"), ("past_value_0_out",)),
+        }
+        adapter, _ = self._adapter_with_sdk(io_by_stem)
+        with tempfile.TemporaryDirectory() as directory:
+            expectations = (
+                self._expectation(directory, "slice_ar1", "decoder_ar1", 1,
+                                  *io_by_stem["slice_ar1"]),
+                self._expectation(directory, "slice_ar128", "decoder_ar128", 128,
+                                  *io_by_stem["slice_ar128"]),
+            )
+            config = adapter._native_kv_config(expectations)
+
         tensors = {
             graph["graph_name"]: [tensor["tensor_name"] for tensor in graph["tensors"]]
             for graph in config["graphs"]
         }
+        # Graph names are ours, tensor selection is QAIRT's.
         self.assertEqual(tensors["decoder_ar1"], ["past_key_0_in"])
         self.assertEqual(
-            tensors["decoder_ar128"],
+            tensors["decoder_ar128"], ["past_value_0_in", "past_value_0_out"]
+        )
+        report = audit_native_kv_config(config, expected=expected_tensors(config))
+        self.assertTrue(report.ok, report.issues)
+
+    def test_the_ar_is_stamped_so_the_sdk_can_see_it(self) -> None:
+        # GraphContext.export leaves ExportedFiles._info unset and the SDK reads
+        # the AR from there. Unstamped, every graph would silently demote to
+        # inputs-only and AR128 would lose its output marking.
+        io_by_stem = {"slice_ar128": (("past_value_0_in",), ("past_value_0_out",))}
+        adapter, utils = self._adapter_with_sdk(io_by_stem)
+        with tempfile.TemporaryDirectory() as directory:
+            expectations = (
+                self._expectation(directory, "slice_ar128", "decoder_ar128", 128,
+                                  *io_by_stem["slice_ar128"]),
+            )
+            config = adapter._native_kv_config(expectations)
+
+        self.assertEqual(utils.seen_sequence_lengths, [128])
+        self.assertEqual(
+            [t["tensor_name"] for t in config["graphs"][0]["tensors"]],
             ["past_value_0_in", "past_value_0_out"],
         )
 
     def test_unknown_ar_keeps_outputs_out_of_the_hmx_layout(self) -> None:
-        # A slice artifact without an AR reaches the expectation as ar=0.  The
-        # SDK guards its multiple-of-32 test with ``ar > 0``; without that guard
-        # 0 % 32 == 0 would wrongly mark output tensors.
-        expectations = (
-            NativeKvGraphExpectation(
-                "decoder_unknown_ar",
-                0,
-                ("past_key_0_in",),
-                ("past_key_0_out",),
-            ),
-        )
-        config = build_native_kv_config(expectations)
+        # A slice artifact without an AR reaches the expectation as ar=0; it is
+        # passed to the SDK as None so its own ``ar > 0`` guard applies.
+        io_by_stem = {"slice": (("past_key_0_in",), ("past_key_0_out",))}
+        adapter, utils = self._adapter_with_sdk(io_by_stem)
+        with tempfile.TemporaryDirectory() as directory:
+            expectations = (
+                self._expectation(directory, "slice", "decoder_unknown_ar", 0,
+                                  *io_by_stem["slice"]),
+            )
+            config = adapter._native_kv_config(expectations)
+
+        self.assertEqual(utils.seen_sequence_lengths, [None])
         self.assertEqual(
-            [
-                tensor["tensor_name"]
-                for tensor in config["graphs"][0]["tensors"]
-            ],
+            [t["tensor_name"] for t in config["graphs"][0]["tensors"]],
             ["past_key_0_in"],
-        )
-        self.assertTrue(
-            audit_native_kv_config(config, expectations=expectations).ok
         )
 
     def test_non_cache_role_names_are_never_marked(self) -> None:
-        expectations = (
-            NativeKvGraphExpectation(
-                "decoder_ar128",
-                128,
-                (
-                    "past_key_0_in",
-                    "key_padding_mask",
-                    "value_position_index",
-                    "recurrent_state_0_in",
-                ),
+        # QAIRT's bare substring rule sweeps these in; the documented role
+        # filter takes them back out and records that it did.
+        io_by_stem = {
+            "slice": (
+                ("past_key_0_in", "key_padding_mask", "value_position_index"),
                 ("past_key_0_out",),
-            ),
-        )
-        config = build_native_kv_config(expectations)
+            )
+        }
+        adapter, _ = self._adapter_with_sdk(io_by_stem)
+        with tempfile.TemporaryDirectory() as directory:
+            expectations = (
+                self._expectation(directory, "slice", "decoder_ar128", 128,
+                                  *io_by_stem["slice"]),
+            )
+            config = adapter._native_kv_config(expectations)
+
         self.assertEqual(
-            [
-                tensor["tensor_name"]
-                for tensor in config["graphs"][0]["tensors"]
-            ],
+            [t["tensor_name"] for t in config["graphs"][0]["tensors"]],
             ["past_key_0_in", "past_key_0_out"],
         )
+        self.assertEqual(
+            [item["tensor_name"] for item in adapter._native_kv_role_filtered],
+            ["key_padding_mask", "value_position_index"],
+        )
+
         swept_in = {
             "graphs": [
                 {
                     "graph_name": "decoder_ar128",
                     "tensors": [
-                        {
-                            "tensor_name": name,
-                            "dataFormat": NATIVE_KV_DATA_FORMAT,
-                        }
-                        for name in (
-                            "past_key_0_in",
-                            "key_padding_mask",
-                            "past_key_0_out",
-                        )
+                        {"tensor_name": name, "dataFormat": NATIVE_KV_DATA_FORMAT}
+                        for name in ("past_key_0_in", "key_padding_mask", "past_key_0_out")
                     ],
                 }
             ]
         }
-        report = audit_native_kv_config(swept_in, expectations=expectations)
+        report = audit_native_kv_config(swept_in, expected=expected_tensors(config))
         self.assertFalse(report.ok)
         self.assertIn("key_padding_mask", " ".join(report.issues))
+
+    def test_missing_slice_onnx_fails_closed(self) -> None:
+        adapter, _ = self._adapter_with_sdk({})
+        with self.assertRaises(NativeKvConfigError):
+            adapter._native_kv_config(
+                (
+                    NativeKvGraphExpectation(
+                        graph_name="decoder_ar1",
+                        ar=1,
+                        input_names=("past_key_0_in",),
+                        output_names=(),
+                    ),
+                )
+            )
 
     def test_wrong_layout_is_rejected(self) -> None:
         config = {
@@ -273,6 +376,32 @@ def _device_configs(kwargs: dict[str, Any]) -> list[Any]:
         SimpleNamespace(dsp_arch=fields["dsp_arch"], soc_model=int(model))
         for model in fields["soc_model"].split("|")
     ]
+
+
+
+#: The values QAIRT 2.49.0.260730's Qwen3_5BuilderHTP actually carries. The
+#: adapter reads them from the SDK, so the fakes must supply them rather than
+#: the adapter carrying a copy.
+_QWEN3_5_SDK_START_POINTS = [
+    (r"/model_layers_(\d+)_linear_attn_norm_Mul_3/Mul_output_0", 1, None),
+    (r"/model_layers_(\d+)_self_attn_Mul_8/Mul_output_0", 2, {4096: 256}),
+    (r"recurrent_state_(\d+)_out", 1, None),
+    (r"conv_state_(\d+)_out", 1, None),
+]
+
+
+def _fake_qwen35_builder_module(points=None) -> SimpleNamespace:
+    """A stand-in for the SDK module that owns Qwen3.5's MHA2SHA start points."""
+
+    selected = _QWEN3_5_SDK_START_POINTS if points is None else points
+
+    class Qwen3_5BuilderHTP:
+        _QWEN3_5_START_POINTS = [
+            SimpleNamespace(name_pattern=pattern, split_axis=axis, split_map=split_map)
+            for pattern, axis, split_map in selected
+        ]
+
+    return SimpleNamespace(Qwen3_5BuilderHTP=Qwen3_5BuilderHTP)
 
 
 class FakeCompileConfig:
@@ -1016,6 +1145,7 @@ class AdapterTests(unittest.TestCase):
                 "qairt.api.transforms._transform": SimpleNamespace(transform=transform),
                 "qairt.api.transforms.model_transformer_config": config_module,
                 "qairt.api.configs.common": common_module,
+                "qairt.gen_ai_api.builders.qwen.builder": _fake_qwen35_builder_module(),
             }
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -1044,7 +1174,74 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(all(item.external_data_paths for item in slices))
         mha = calls["transform"][1]["mha_config"]
         self.assertTrue(mha.permute_kv_cache_io)
-        self.assertEqual(len(mha.m2s_additional_start_points), 4)
+        # The start points are the SDK's own objects, passed straight through
+        # rather than rebuilt from a copy in this repository.
+        self.assertEqual(
+            [item.name_pattern for item in mha.m2s_additional_start_points],
+            [item[0] for item in _QWEN3_5_SDK_START_POINTS],
+        )
+
+    def _transform_with_sdk_points(self, module: Any) -> Any:
+        """Run one transform against a fake SDK that owns the start points."""
+
+        def transform(model: str, **kwargs: Any):
+            return [SimpleNamespace(
+                export=lambda directory, prefix: SimpleNamespace(
+                    onnx_path=Path(directory) / f"{prefix}.onnx",
+                    data_path=Path(directory) / f"{prefix}.data",
+                    encodings_path=None,
+                )
+            )] * kwargs["split_model"].num_splits
+
+        adapter = self._adapter(
+            {
+                "qairt.optimizer.onnx": SimpleNamespace(
+                    M2sStartPoint=lambda **kwargs: SimpleNamespace(**kwargs)
+                ),
+                "qairt.api.transforms._transform": SimpleNamespace(transform=transform),
+                "qairt.api.transforms.model_transformer_config": SimpleNamespace(
+                    SplitModelConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+                    MhaConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+                    QuantizationStage=SimpleNamespace(POST_QUANT="post"),
+                ),
+                "qairt.api.configs.common": SimpleNamespace(
+                    BackendType=SimpleNamespace(HTP="htp")
+                ),
+                "qairt.gen_ai_api.builders.qwen.builder": module,
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "base.onnx"
+            model.write_bytes(b"onnx")
+            return adapter.transform(
+                model,
+                split_plan=build_split_plan(4, decoder_slices=2),
+                family=FamilyId.QWEN3_5,
+                output_dir=Path(directory) / "split",
+                native_kv=True,
+            )
+
+    def test_changed_sdk_start_points_fail_closed_with_the_difference(self) -> None:
+        # A silent upstream change would reslice attention heads. The profile
+        # holds no copy of the values, only a fingerprint, so drift surfaces
+        # here instead of in the compiled graph.
+        drifted = list(_QWEN3_5_SDK_START_POINTS)
+        drifted[1] = (drifted[1][0], 1, {4096: 128})
+
+        with self.assertRaises(QairtConfigurationError) as caught:
+            self._transform_with_sdk_points(_fake_qwen35_builder_module(drifted))
+
+        message = str(caught.exception)
+        self.assertIn("MHA2SHA start points for this family changed", message)
+        self.assertIn("reviewed", message)
+        # The new values are named, so a reviewer sees what moved.
+        self.assertIn("4096: 128", message)
+
+    def test_missing_sdk_start_points_are_never_guessed(self) -> None:
+        with self.assertRaises(QairtConfigurationError) as caught:
+            self._transform_with_sdk_points(SimpleNamespace())
+
+        self.assertIn("no longer exposes", str(caught.exception))
 
     def test_adapter_source_contains_no_subprocess_path(self) -> None:
         import qairt_agent.qairt_adapter.adapter as adapter_module

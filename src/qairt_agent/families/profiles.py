@@ -7,9 +7,11 @@ where the pinned SDK is not installed.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 class FamilyId(str, Enum):
@@ -52,6 +54,55 @@ class MhaStartPointSpec:
     note: str = ""
 
 
+def start_point_fingerprint(
+    points: "Sequence[MhaStartPointSpec] | Sequence[tuple[str, int, Mapping[int, int] | None]]",
+) -> str:
+    """Hash a start-point set so a change in the SDK's copy is never silent.
+
+    Normalizes to ``[(pattern, axis, {int: int})]`` before hashing, so the
+    fingerprint compares the *meaning* rather than an object repr that could
+    drift with an unrelated SDK refactor.
+    """
+
+    normalized: list[list[Any]] = []
+    for item in points:
+        if isinstance(item, MhaStartPointSpec):
+            pattern, axis, split_map = item.output_name_regex, item.axis, item.split_map
+        else:
+            pattern, axis, split_map = item
+        normalized.append(
+            [
+                str(pattern),
+                int(axis),
+                (
+                    {str(int(key)): int(value) for key, value in dict(split_map).items()}
+                    if split_map
+                    else None
+                ),
+            ]
+        )
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class SdkStartPointSource:
+    """Where the SDK keeps a family's own MHA2SHA start points.
+
+    The values are read from the SDK at transform time rather than copied here,
+    so an upper-layer change does not have to be mirrored by hand. The
+    fingerprint is the guard: it only ever changes when the SDK pin moves, which
+    is already a reviewed event with a device acceptance run, and a mismatch
+    fails closed naming exactly what changed instead of silently reslicing the
+    graph.
+    """
+
+    module: str
+    qualname: str
+    reviewed_sha256: str
+    note: str = ""
+
+
 @dataclass(frozen=True)
 class FamilyProfile:
     """Declarative family capabilities and strict safety policy."""
@@ -66,7 +117,7 @@ class FamilyProfile:
     is_multimodal: bool = False
     is_hybrid_attention: bool = False
     config_container: str | None = None
-    mha_start_points: tuple[MhaStartPointSpec, ...] = ()
+    sdk_mha_start_points: SdkStartPointSource | None = None
 
     @property
     def experimental_auto_ar(self) -> bool:
@@ -135,20 +186,21 @@ QWEN3_5 = FamilyProfile(
     factory_support=QairtFactorySupport.EXPLICIT,
     auto_ar_policy=AutoArPolicy.EXPERIMENTAL_FAIL_CLOSED,
     is_hybrid_attention=True,
-    mha_start_points=(
-        MhaStartPointSpec(
-            r"/model_layers_(\d+)_linear_attn_norm_Mul_3/Mul_output_0",
-            axis=1,
-            note="linear-attention normalization output",
+    # Not copied here on purpose. The SDK's own Qwen3.5 builder carries these,
+    # and duplicating them means an upper-layer change silently reslices the
+    # graph. The adapter reads them from the SDK at transform time; the
+    # fingerprint below is what makes a change loud instead of invisible.
+    sdk_mha_start_points=SdkStartPointSource(
+        module="qairt.gen_ai_api.builders.qwen.builder",
+        qualname="Qwen3_5BuilderHTP._QWEN3_5_START_POINTS",
+        reviewed_sha256=(
+            "e6276e42e66ae5826d91e552709ff99371d03b87624d4c3315898627923ea960"
         ),
-        MhaStartPointSpec(
-            r"/model_layers_(\d+)_self_attn_Mul_8/Mul_output_0",
-            axis=2,
-            split_map={4096: 256},
-            note="full-attention output",
+        note=(
+            "Linear-attention norm output (axis 1), full-attention output "
+            "(axis 2, 4096 -> 256 per KV head), and the recurrent/conv state "
+            "outputs (axis 1). Reviewed against QAIRT 2.49.0.260730."
         ),
-        MhaStartPointSpec(r"recurrent_state_(\d+)_out", axis=1),
-        MhaStartPointSpec(r"conv_state_(\d+)_out", axis=1),
     ),
 )
 
@@ -162,7 +214,7 @@ QWEN3_5_OMNI = FamilyProfile(
     is_multimodal=True,
     is_hybrid_attention=True,
     config_container="text_config",
-    mha_start_points=QWEN3_5.mha_start_points,
+    sdk_mha_start_points=QWEN3_5.sdk_mha_start_points,
 )
 
 

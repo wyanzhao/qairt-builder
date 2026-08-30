@@ -176,15 +176,35 @@ Weight sharing packages the exact AR set `{1, 128}` per semantic slice.
 For a wider source such as AR2073/CL4096, the build exports independent
 AR1/AR128 ONNX and AIMET-encoding artifacts and target-ABI vector manifests;
 supplied compatible goldens win, otherwise ORT capture is recorded.
-Embedding, decoder slices, and LM head retain explicit boundaries. The planned
-boundaries reproduce `split_llm` exactly: with `split_lm_head` the final decoder
-layer is folded into the lm_head split, so `N-1` layers are distributed across
-the decoder slices with the remainder front-loaded, and captured slice
-boundaries record the folded layer instead of losing it. Native KV must
-preserve exact tensor names, graph routing, shape/layout, and CL alignment; it
-marks key/value cache tensors only, never mask/position-style tensors that
-merely share a substring, and marks output tensors only for a graph whose AR is
-a positive multiple of 32.
+Embedding, decoder slices, and LM head retain explicit boundaries.
+
+**Per-model knowledge comes from the SDK, not from a copy here.** Whatever the
+GenAI Builder already knows about a family is read from it at build time, so an
+upper-layer change cannot leave a stale duplicate in this repository:
+
+- MHA2SHA start points are read from the SDK's own family builder
+  (`Qwen3_5BuilderHTP._QWEN3_5_START_POINTS` for Qwen3.5) and passed through
+  unchanged. The profile stores only where to find them plus a fingerprint of
+  what was reviewed; a fingerprint mismatch fails closed naming the new values,
+  because these decide where attention heads are cut.
+- The native-KV/HMX selection is QAIRT's own `gen_kv_format_config`, including
+  its rule that a graph's outputs are marked only when its AR is a positive
+  multiple of 32. `GraphContext.export` leaves `ExportedFiles._info` unset and
+  the SDK reads the AR from there, so the adapter stamps it exactly as the SDK's
+  builder does; unstamped, every graph would silently demote to inputs-only.
+  One documented subtraction is applied on top of QAIRT's answer — names whose
+  role proves they are not caches (mask, padding, position, index, ...) are
+  removed, and what was removed is reported.
+
+The one thing still reproduced locally is the `split_llm` layer distribution
+(with `split_lm_head`, `N-1` layers across the decoder slices, remainder
+front-loaded, the final layer folded into the lm_head split). It cannot be
+sourced: planning must work without the SDK, and the SDK's split graphs carry
+no per-split layer range. Captured slice boundaries are therefore marked
+`advisory`; what a build verifies is the split count.
+
+Native KV must preserve exact tensor names, graph routing, shape/layout, and CL
+alignment.
 
 GenAI Builder owns its internal transform/convert/quantize/compile sequence;
 do not invoke the low-level build behind it. Qwen3.5 production specs supply

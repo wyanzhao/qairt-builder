@@ -12,7 +12,9 @@ from .errors import (
 from .native_kv import (
     NATIVE_KV_DATA_FORMAT,
     audit_native_kv_config,
-    build_native_kv_config,
+    expected_tensors,
+    is_non_cache_role,
+    normalize_sdk_kv_config,
     require_native_kv_audit,
 )
 from .preflight import (
@@ -83,7 +85,9 @@ __all__ = [
     "Qwen35RuntimeValidationResult",
     "TransformedSliceArtifact",
     "audit_native_kv_config",
-    "build_native_kv_config",
+    "expected_tensors",
+    "is_non_cache_role",
+    "normalize_sdk_kv_config",
     "require_native_kv_audit",
     "require_preflight",
 ]

@@ -1152,11 +1152,20 @@ class FamilyPreset(FrozenContract):
 
 
 class SliceBoundary(FrozenContract):
-    """An exact, captured decoder-slice layer boundary (half-open)."""
+    """A decoder-slice layer boundary (half-open).
+
+    ``advisory`` marks these as a *reproduction* of QAIRT's ``split_llm``
+    distribution rather than something read back from a real split. The SDK's
+    split graphs carry no per-split layer range, and deriving one would mean
+    reimplementing its residual-add detection -- more duplication, not less --
+    so the honest label is that these are predicted. What a build does verify
+    is the split *count*, which the transform stage compares against the plan.
+    """
 
     slice_id: str
     layer_start: int = Field(ge=0)
     layer_end: int = Field(ge=0)
+    advisory: bool = True
 
     @model_validator(mode="after")
     def validate_range(self) -> "SliceBoundary":

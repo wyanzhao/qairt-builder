@@ -13,6 +13,7 @@ from qairt_agent.families import (
     build_split_plan,
     get_family_profile,
     resolve_family_profile,
+    start_point_fingerprint,
     validate_weight_sharing_sources,
 )
 
@@ -32,14 +33,47 @@ class FamilyProfileTests(unittest.TestCase):
         self.assertTrue(hybrid.is_hybrid_attention)
         self.assertIs(thinker, hybrid)
 
-    def test_qwen35_start_points_match_sdk_contract(self) -> None:
+    def test_qwen35_start_points_are_sourced_from_the_sdk_not_copied(self) -> None:
+        # The values live in the SDK's own Qwen3.5 builder. The profile records
+        # only where to find them and what was reviewed, so an upper-layer
+        # change cannot go unnoticed while a copy here goes stale.
         profile = get_family_profile(FamilyId.QWEN3_5)
-        self.assertEqual(len(profile.mha_start_points), 4)
-        self.assertEqual(profile.mha_start_points[0].axis, 1)
-        self.assertEqual(profile.mha_start_points[1].axis, 2)
-        self.assertEqual(profile.mha_start_points[1].split_map, {4096: 256})
-        self.assertIn("recurrent_state", profile.mha_start_points[2].output_name_regex)
-        self.assertIn("conv_state", profile.mha_start_points[3].output_name_regex)
+        source = profile.sdk_mha_start_points
+        assert source is not None
+        self.assertEqual(source.module, "qairt.gen_ai_api.builders.qwen.builder")
+        self.assertEqual(
+            source.qualname, "Qwen3_5BuilderHTP._QWEN3_5_START_POINTS"
+        )
+        self.assertEqual(len(source.reviewed_sha256), 64)
+        self.assertFalse(hasattr(profile, "mha_start_points"))
+
+    def test_start_point_fingerprint_tracks_meaning_not_object_identity(self) -> None:
+        reviewed = [
+            (r"/model_layers_(\d+)_linear_attn_norm_Mul_3/Mul_output_0", 1, None),
+            (r"/model_layers_(\d+)_self_attn_Mul_8/Mul_output_0", 2, {4096: 256}),
+            (r"recurrent_state_(\d+)_out", 1, None),
+            (r"conv_state_(\d+)_out", 1, None),
+        ]
+        source = get_family_profile(FamilyId.QWEN3_5).sdk_mha_start_points
+        assert source is not None
+        # These are the values QAIRT 2.49.0.260730 carries; the reviewed
+        # fingerprint must be theirs.
+        self.assertEqual(start_point_fingerprint(reviewed), source.reviewed_sha256)
+
+        # An empty split_map and no split_map mean the same thing.
+        self.assertEqual(
+            start_point_fingerprint([("a", 1, {})]),
+            start_point_fingerprint([("a", 1, None)]),
+        )
+        # A changed axis or pattern is a different fingerprint.
+        self.assertNotEqual(
+            start_point_fingerprint([("a", 1, None)]),
+            start_point_fingerprint([("a", 2, None)]),
+        )
+        self.assertNotEqual(
+            start_point_fingerprint(reviewed),
+            start_point_fingerprint(reviewed[:-1]),
+        )
 
     def test_qwen35_single_source_is_not_preemptively_rejected(self) -> None:
         # The adapter's validation evidence gates fail closed later.  A derived

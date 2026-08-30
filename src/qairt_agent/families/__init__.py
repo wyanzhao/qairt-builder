@@ -34,9 +34,11 @@ from .profiles import (
     FamilyId,
     FamilyProfile,
     MhaStartPointSpec,
+    SdkStartPointSource,
     QairtFactorySupport,
     get_family_profile,
     resolve_family_profile,
+    start_point_fingerprint,
     validate_weight_sharing_sources,
 )
 from .sku import capture_sku, merge_sku
@@ -53,6 +55,7 @@ __all__ = [
     "GENAI_OUTPUT_LAYOUT",
     "InitializerInfo",
     "MhaStartPointSpec",
+    "SdkStartPointSource",
     "NodeInfo",
     "OnnxInspector",
     "OnnxModelInfo",
@@ -86,6 +89,7 @@ __all__ = [
     "is_genai_builder_family",
     "merge_sku",
     "resolve_family_profile",
+    "start_point_fingerprint",
     "resolve_workflow",
     "to_build_spec",
     "validate_weight_sharing_sources",

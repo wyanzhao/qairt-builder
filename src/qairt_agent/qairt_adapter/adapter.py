@@ -21,6 +21,7 @@ from qairt_agent.families import (
     SplitPlan,
     build_split_plan,
     get_family_profile,
+    start_point_fingerprint,
     validate_weight_sharing_sources,
 )
 
@@ -33,7 +34,8 @@ from .errors import (
 )
 from .native_kv import (
     audit_native_kv_config,
-    build_native_kv_config,
+    expected_tensors,
+    normalize_sdk_kv_config,
     require_native_kv_audit,
 )
 from qairt_agent.harness import (
@@ -158,6 +160,9 @@ class QairtSdkAdapter:
         self._preflight_report: PreflightReport | None = None
         self._onnx_inspector = onnx_inspector or OnnxInspector()
         self._validated_qwen35_evidence_ids: set[str] = set()
+        # Names QAIRT selected that our role filter removed, reported rather
+        # than silently dropped.
+        self._native_kv_role_filtered: list[dict[str, str]] = []
 
     def _load_module(self, name: str) -> Any:
         try:
@@ -273,14 +278,7 @@ class QairtSdkAdapter:
         common_module = self._load_module("qairt.api.configs.common")
         optimizer = self._load_module("qairt.optimizer.onnx")
 
-        start_points = [
-            optimizer.M2sStartPoint(
-                name_pattern=item.output_name_regex,
-                split_axis=item.axis,
-                split_map=dict(item.split_map) if item.split_map is not None else None,
-            )
-            for item in resolved_profile.mha_start_points
-        ]
+        start_points = self._sdk_mha_start_points(resolved_profile)
         validation_kwargs: dict[str, str] = {}
         if input_raw_list_path is not None:
             validation_kwargs["input_raw_list_path"] = str(input_raw_list_path)
@@ -457,6 +455,102 @@ class QairtSdkAdapter:
             encodings_path=_path_or_none(getattr(output, "encoding_json", None)),
             sdk_output=output,
         )
+
+    def _native_kv_config(
+        self,
+        expectations: Sequence[NativeKvGraphExpectation],
+    ) -> dict[str, Any]:
+        """Build the HMX data-format config from QAIRT's own selection rule.
+
+        ``gen_ai_utils.gen_kv_format_config`` is the SDK's own answer to "which
+        tensors get the HMX weight layout, and does this graph's AR qualify for
+        its outputs". Calling it keeps that policy in one place; the previous
+        local reimplementation had already drifted from it.
+
+        One trap has to be handled explicitly: ``GraphContext.export`` leaves
+        ``ExportedFiles._info`` unset, and the SDK reads the AR from there. An
+        unstamped file would read as ``ar=None``, quietly demoting every graph
+        to inputs-only and dropping output-tensor marking on AR128. The SDK's
+        own builder stamps it right after construction; so does this.
+        """
+
+        if not expectations:
+            return {"graphs": []}
+        missing = [item.graph_name for item in expectations if item.model_path is None]
+        if missing:
+            raise NativeKvConfigError(
+                "native-KV configuration needs the transformed slice ONNX for "
+                f"each graph; missing for {sorted(missing)}"
+            )
+        gen_ai_utils = self._load_module("qairt.gen_ai_api.builders.gen_ai_utils")
+        graph_module = self._load_module("qairt.optimizer.onnx.graph")
+        split_files = []
+        for item in expectations:
+            model_path = Path(str(item.model_path))
+            exported = graph_module.ExportedFiles(
+                onnx_path=model_path,
+                # Unread by gen_kv_format_config; the directory satisfies the
+                # model's required-path validation without inventing a file.
+                data_path=model_path.parent,
+            )
+            exported._info = graph_module.ExportedFileInfo(
+                sequence_length=int(item.ar) or None,
+                context_length=None,
+            )
+            split_files.append(exported)
+        raw = gen_ai_utils.gen_kv_format_config(split_files)
+        config, removed = normalize_sdk_kv_config(raw, expectations)
+        if removed:
+            self._native_kv_role_filtered.extend(removed)
+        return config
+
+    def _sdk_mha_start_points(self, profile: Any) -> list[Any]:
+        """Read a family's MHA2SHA start points from the SDK that owns them.
+
+        The SDK's own family builder carries these, so copying them into this
+        repository would mean an upper-layer change silently reslices the
+        graph while our copy went stale. They are read live instead, and the
+        profile stores only a fingerprint of what was reviewed.
+
+        The fingerprint can only change when the SDK pin moves -- itself a
+        reviewed event with a device acceptance run -- so this costs nothing in
+        steady state and turns an upstream change into a failure that names the
+        difference.
+        """
+
+        source = getattr(profile, "sdk_mha_start_points", None) if profile else None
+        if source is None:
+            return []
+        module = self._load_module(source.module)
+        target: Any = module
+        for part in source.qualname.split("."):
+            target = getattr(target, part, None)
+            if target is None:
+                raise QairtConfigurationError(
+                    f"QAIRT {source.module}.{source.qualname} is missing; the SDK "
+                    "no longer exposes this family's MHA2SHA start points where "
+                    "the profile expects them, and guessing them would reslice "
+                    "the graph"
+                )
+        points = list(target)
+        normalized = [
+            (item.name_pattern, item.split_axis, item.split_map) for item in points
+        ]
+        actual = start_point_fingerprint(normalized)
+        if actual != source.reviewed_sha256:
+            listed = "; ".join(
+                f"{pattern!r} axis={axis} split_map={dict(split_map) if split_map else None}"
+                for pattern, axis, split_map in normalized
+            )
+            raise QairtConfigurationError(
+                "QAIRT's MHA2SHA start points for this family changed: "
+                f"{source.module}.{source.qualname} now fingerprints {actual}, "
+                f"reviewed {source.reviewed_sha256}. They decide where attention "
+                "heads are cut, so following a change silently is not safe: "
+                "review the new points and update the profile's "
+                f"reviewed_sha256. SDK now reports: {listed}"
+            )
+        return points
 
     @staticmethod
     def _resolve_named_target(target: "TargetEntry | str | None") -> TargetEntry:
@@ -892,7 +986,7 @@ class QairtSdkAdapter:
             )
             standalone_native_config: Mapping[str, Any] | None = None
             if expect_native_kv:
-                standalone_native_config = build_native_kv_config(
+                standalone_native_config = self._native_kv_config(
                     standalone_expectations
                 )
             diagnostics.append(
@@ -1166,7 +1260,11 @@ class QairtSdkAdapter:
         if native_kv_config is not None:
             audit = audit_native_kv_config(
                 native_kv_config,
-                expectations=native_kv_expectations,
+                expected=(
+                    expected_tensors(self._native_kv_config(native_kv_expectations))
+                    if native_kv_expectations
+                    else None
+                ),
                 expected_graph_names=(
                     selected_graph_names if expect_native_kv and not native_kv_expectations else ()
                 ),
@@ -3256,13 +3354,14 @@ class QairtSdkAdapter:
                                 ar=int(slice_artifact.ar or 0),
                                 input_names=tuple(item.name for item in info.inputs),
                                 output_names=tuple(item.name for item in info.outputs),
+                                model_path=slice_artifact.model_path,
                             )
                         )
 
                 native_config: Mapping[str, Any] | None = None
                 expect_slice_native_kv = native_kv and slice_name.startswith("decoder")
                 if expect_slice_native_kv:
-                    native_config = build_native_kv_config(native_expectations)
+                    native_config = self._native_kv_config(native_expectations)
 
                 selected_ars = [int(item.ar or 0) for item in ordered_slices]
                 qwen35_evidence: Qwen35ValidationEvidence | None = None
@@ -3340,7 +3439,7 @@ class QairtSdkAdapter:
                         ]
                         standalone_native_config: Mapping[str, Any] | None = None
                         if expect_slice_native_kv:
-                            standalone_native_config = build_native_kv_config(
+                            standalone_native_config = self._native_kv_config(
                                 standalone_expectations
                             )
                         contexts.append(
@@ -3410,7 +3509,7 @@ class QairtSdkAdapter:
                             ]
                             standalone_native_config: Mapping[str, Any] | None = None
                             if expect_slice_native_kv:
-                                standalone_native_config = build_native_kv_config(
+                                standalone_native_config = self._native_kv_config(
                                     standalone_expectations
                                 )
                             diagnostic_contexts.append(

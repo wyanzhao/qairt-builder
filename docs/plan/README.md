@@ -99,6 +99,19 @@ image and its import smoke, T08's Torch archives, T04 tier 2's diagnostic
 context execution, and every device acceptance run — including the one that
 must settle the SM8850 `soc_model` discrepancy T02 now documents.
 
+## Program decisions (amendment 2026-08-30)
+
+- **Per-model knowledge is sourced from the SDK, not copied.** Where the GenAI
+  Builder already knows something about a family — MHA2SHA start points, the
+  native-KV/HMX tensor selection — the low-level lane reads it from the SDK at
+  build time. Hand-maintained copies go stale silently, and two of the three we
+  had already produced real bugs. Where a value cannot be sourced (the
+  `split_llm` layer distribution, because planning must work without the SDK),
+  the reproduction stays but is labelled `advisory` rather than presented as
+  observed. Drift is made loud, never followed silently: a reviewed fingerprint
+  guards the start points, and the signature probe covers every newly bound
+  surface.
+
 ## Progress log
 
 - **2026-08-29** — session 2. Environment created (`.venv`, CPython 3.11.15);
