@@ -38,6 +38,13 @@ The QAIRT worker is pinned by the editable
 The Python package can be imported without QAIRT installed. Operations that
 need the SDK fail with a structured preflight error.
 
+## Start here
+
+New to this repository? [**First run**](docs/first-run.md) walks from a fresh
+clone to a real report on a real device using a fixture this repository
+generates — no proprietary model needed. The rest of this file is reference
+material.
+
 ## Install
 
 ```bash

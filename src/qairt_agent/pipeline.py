@@ -2097,9 +2097,20 @@ class QairtAgent:
         compared_outputs: dict[str, dict[str, Any]] = {
             str(name): dict(values) for name, values in device_outputs.items()
         }
+        # A tensor can legitimately appear from both paths -- the production
+        # context's boundary and the diagnostic context's tap. Recording which
+        # produced each observation keeps the duplicate readable instead of
+        # looking like the same tensor measured twice for no reason.
+        tensor_source: dict[tuple[str, str], str] = {
+            (str(name), str(tensor)): "production_boundary"
+            for name, values in device_outputs.items()
+            for tensor in values
+        }
         if diagnostic_outputs:
             for name, values in diagnostic_outputs.items():
                 compared_outputs.setdefault(str(name), {}).update(dict(values))
+                for tensor in values:
+                    tensor_source[(str(name), str(tensor))] = "diagnostic_context" 
 
         producible = VectorPreparer.onnx_producible_tensor_names(resolved_model)
         pairs: list[tuple[str, str, str]] = []
@@ -2162,6 +2173,9 @@ class QairtAgent:
                     "slice": slice_name,
                     "tensor": tensor_name,
                     "float_tensor": float_name,
+                    "device_tensor_source": tensor_source.get(
+                        (slice_name, tensor_name), "production_boundary"
+                    ),
                     "quality": quality.to_dict(),
                 }
             )

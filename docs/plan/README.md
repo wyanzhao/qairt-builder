@@ -75,7 +75,9 @@ Status values: `planned`, `blocked(<task>)`, `in-progress(<date>)`,
    typed contract, `qairt-agent plan` output, canonical example, tests, and
    documentation together (root `CLAUDE.md` rule).
 3. Run the gates: `.venv/bin/pytest -q`, `.venv/bin/python -m compileall -q src
-   tests`, and `qairt-agent doctor` where applicable. Tasks touching the SDK or
+   tests`, and `qairt-agent doctor` where applicable. A device acceptance run
+   needs no proprietary model: `python tools/make_smoke_fixture.py` generates a
+   deterministic one, so the run is reproducible by whoever reads the result. Tasks touching the SDK or
    device additionally require the acceptance runs named in the task.
 4. Update this status board and the task file's `Status:` line with the date
    and a one-line result. If the task exposed a new decision, record it under

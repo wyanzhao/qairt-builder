@@ -56,6 +56,26 @@ Settled program decisions (2026-08-29; details and rationale in
 - Do not claim device latency, SQNR, transform equivalence, or runtime support
   without reopenable reports from the corresponding run.
 
+## Onboarding and skills
+
+A newcomer starts at [`docs/first-run.md`](docs/first-run.md): clone to a real
+report on a real device, using a fixture this repository generates. Because no
+model payload is committed, every spec in `examples/` and `configs/` points at a
+model the user must supply, so `tools/make_smoke_fixture.py` is the only
+runnable entry point. It emits a tiny ONNX, AIMET-style encodings computed from
+real tensor ranges, vectors whose golden is the float graph's own output, and
+two specs (one plain, one wired for the layer-level float reference). It is
+deterministic from a fixed seed, which is what lets an acceptance result
+recorded under `docs/plan/` be reproduced on another machine. Artifacts must not
+be written under the models directory: the worker mounts it read-only.
+`tests/test_smoke_fixture.py` keeps that entry point from rotting.
+
+Recurring procedures are packaged as skills under `.claude/skills/`:
+`qairt-first-run`, `qairt-diagnose-quality`, `qairt-diagnose-latency`,
+`qairt-add-target`, `qairt-sdk-upgrade`. They restate the operational sequence
+and the traps; this file remains the authority on the contract itself, so when
+behavior changes the affected skill moves with it.
+
 ## CLI-first workflow
 
 ```bash
