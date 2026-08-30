@@ -296,24 +296,38 @@ summed into it, diagnostic contexts sit in a separate `diagnostic` section with
 than a zero. Benchmark reports embed the block copied verbatim from the verified
 build receipt rather than re-measuring. This is the only RAM metric.
 
-Benchmark warmed production contexts only. *Our* setup — context loading, ADB
-staging, device construction, graph-runner setup — is outside the latency
-sample, and the report says so as `harness_setup_excluded`. What the SDK does
-inside one call is **not** outside it: on the low-level lane QAIRT implements a
-remote call by relaunching `qnn-net-run` on the device, so per-call context
-load, HVX/HMX power-on, deinit and the ADB round trip are all inside the
-sample. The wall metric is therefore named `host_orchestrated_call_latency`,
-and a report never claims setup was excluded when it was not.
+**Latency means device time.** A latency report names its metric in
+`latency_metric`, and that names the `device_execution` block or the string
+`unavailable` — never a host number. `device_execution` comes from QAIRT's own
+profiling log: accelerator compute and execute time, QNN execute time, per-op
+cycles, and per-process overhead kept separate. It is read at `level="detailed"`
+with **no** profiling option — `option="optrace"` additionally requires a
+schematic binary that this program's compile does not emit, and fails with "No
+op trace raw data found." without one; per-op cycles need no optrace. The
+profiled execute is repeated **ten times and averaged**: `statistic` says
+`mean`, and `spread` plus `samples` keep the per-sample values so an average is
+never taken on faith. The block names its `meter` (`qnn_accelerator`) and
+`lane`, because the GenAI lane's meter is a different one and the two must
+never be conflated.
 
-Device-side latency comes from QAIRT's own profiling log, published as the
-`device_execution` block: accelerator execute time, QNN execute time, per-op
-cycles, and per-process overhead reported separately. It is read at
-`level="detailed"` with **no** profiling option — `option="optrace"`
-additionally requires a schematic binary that this program's compile does not
-emit, and fails with "No op trace raw data found." without one. Per-op cycles
-need no optrace. The gap between the two metrics is large and expected: on
-SM8750 the tiny acceptance graph measures ~4900 ms of wall time around 77 µs of
-accelerator compute.
+A scope with no device meter sets `latency_metric: "unavailable"` and publishes
+`device_execution.available = false` **with a reason**. Today that is the GenAI
+generation scope (`generate()` reaches Genie as `GenieDialog_query`, so
+`qairt.Profiler` observes nothing) and chain scope (per-slice profiled executes
+need per-slice inputs the runner produces dynamically). An absent device number
+is always a declared gap, never a silent omission.
+
+The host wall-clock number is kept only under `harness_diagnostics`, marked
+`not_latency: true`, because it still detects ADB, container and transport
+degradation. It never grounds a regression verdict, and `aa_calibration` and
+`p50_ms_per_token` live there too since both derive from it. Its
+`measurement_scope` lists `excluded_from_timer` (context loading, ADB staging,
+device construction, graph-runner setup — what *we* control) against
+`included_in_sample` (qnn-net-run process launch, per-call context load,
+HVX/HMX power-on, per-call deinit, the ADB round trip — what the SDK does
+inside one call). Benchmark warmed production contexts only. The gap between
+the two metrics is large and expected: on SM8750 the tiny acceptance graph
+measured ~4900 ms of wall time around 79 µs of accelerator compute.
 
 `initialize_execution` establishes QAIRT's persistent execution context before
 the timer and `release_execution` frees it afterwards; without it the SDK
@@ -324,8 +338,9 @@ the adapter fails closed rather than letting that happen.
 
 For a quality regression, generate a diagnostic context and bisect component,
 slice, layer, tensor, then operator. For a latency regression, compare the
-`device_execution` block first; wall time moves with host and transport
-conditions that have nothing to do with the model.
+`device_execution` block; wall time moves with host and transport conditions
+that have nothing to do with the model, so it diagnoses the harness, not the
+model.
 Diagnostic-context latency is not production latency.
 For a multi-AR GenAI container, raw-tensor SQNR still covers each exact AR.
 Production generation latency is one public-executor prefill/decode workload,

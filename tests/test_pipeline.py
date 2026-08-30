@@ -2585,10 +2585,13 @@ def test_genai_lane_resolves_cheaper_benchmark_defaults(tmp_path: Path) -> None:
     )
     assert benchmarked.ok, benchmarked.error
     assert benchmarked.data is not None
-    measurement = benchmarked.data["measurement"]
+    measurement = benchmarked.data["harness_diagnostics"]["measurement"]
     assert measurement["warmup_count"] == 3
     assert measurement["repeat_count"] == 10
-    assert benchmarked.data["measurement_scope"]["sample_unit"] == "generate_call"
+    assert (
+        benchmarked.data["harness_diagnostics"]["measurement_scope"]["sample_unit"]
+        == "generate_call"
+    )
 
 
 def test_explicit_benchmark_values_beat_the_genai_lane_defaults(
@@ -2652,7 +2655,7 @@ def test_latency_report_labels_the_token_metric_source_and_wall_scope(
     assert benchmarked.data is not None
     assert benchmarked.data["token_count"] == 4
     assert benchmarked.data["ms_per_token_source"] == "caller"
-    scope = benchmarked.data["measurement_scope"]
+    scope = benchmarked.data["harness_diagnostics"]["measurement_scope"]
     assert scope["clock"] == "host_perf_counter_ns"
     assert scope["device_side_sync_barrier"] is False
     assert scope["sample_unit"] == "graph_invocation"
@@ -2677,75 +2680,69 @@ def _benchmark_once(tmp_path: Path, factory: FakeAdapterFactory) -> Any:
     )
 
 
-def test_latency_report_publishes_device_side_execution_beside_wall_time(
+def test_device_execution_is_averaged_over_ten_profiled_executes(
     tmp_path: Path,
 ) -> None:
-    # The wall sample is host time around one SDK call; on the low-level lane
-    # QAIRT relaunches qnn-net-run per call, so it is thousands of times the
-    # device's own execute time.  The report must carry both.
-    benchmarked = _benchmark_once(tmp_path, FakeAdapterFactory())
+    # Device time is the latency metric, so it is sampled rather than measured
+    # once: one execute cannot show a regression.
+    factory = FakeAdapterFactory()
+    benchmarked = _benchmark_once(tmp_path, factory)
 
     assert benchmarked.ok, benchmarked.error
     assert benchmarked.data is not None
     device = benchmarked.data["device_execution"]
 
+    assert benchmarked.data["latency_metric"] == "device_execution"
+    assert device["statistic"] == "mean"
+    assert device["sample_count"] == 10
+    assert factory.log.names().count("capture_device_execution") == 10
+    assert len(device["samples"]["accelerator_execute_us"]) == 10
+
+    # The headline scalars are the mean of the samples, and the spread is kept
+    # so a reader is not asked to trust an average of ten on faith.
     assert device["accelerator_compute_us"] == 77.0
     assert device["qnn_execute_us"] == 3001.0
-    assert device["source"] == "qairt_profiler_detailed_log"
-    assert device["claim_scope"] == "one_profiled_execute_not_the_timed_samples"
+    assert device["spread"]["accelerator_execute_us"]["p50"] == 1734.0
+    assert device["spread"]["accelerator_execute_us"]["stddev"] == 0.0
+
+    assert device["meter"] == "qnn_accelerator"
+    assert device["lane"] == "low_level"
     assert {item["identifier"] for item in device["per_op_cycles"]} == {
         "fc:OpId_17",
         "act:OpId_23",
     }
-    # Per-process cost is reported, never folded into execute time.
     assert device["per_process_overhead_us"]["QNN (load binary) time"] == 9009.0
 
 
-def test_latency_report_no_longer_claims_per_call_setup_is_excluded(
-    tmp_path: Path,
-) -> None:
-    # The old report published setup_excluded=true, which was false: per-call
-    # context load, HVX/HMX power-on and deinit happen inside the timed call.
+def test_the_wall_number_is_demoted_out_of_being_latency(tmp_path: Path) -> None:
+    # It still detects ADB/container/transport degradation, so it is kept --
+    # but it is not latency and must not read as though it were.
     benchmarked = _benchmark_once(tmp_path, FakeAdapterFactory())
 
     assert benchmarked.data is not None
     assert "setup_excluded" not in benchmarked.data
-    assert benchmarked.data["harness_setup_excluded"] is True
-    assert benchmarked.data["sdk_per_call_setup_included"] is True
-    assert benchmarked.data["metric_name"] == "host_orchestrated_call_latency"
+    assert "measurement" not in benchmarked.data
+    assert "measurement_scope" not in benchmarked.data
+    assert benchmarked.data["latency_metric"] == "device_execution"
 
-    scope = benchmarked.data["measurement_scope"]
+    diagnostics = benchmarked.data["harness_diagnostics"]
+    assert diagnostics["not_latency"] is True
+    assert diagnostics["metric_name"] == "host_orchestrated_call_latency"
+    assert diagnostics["harness_setup_excluded"] is True
+    assert diagnostics["sdk_per_call_setup_included"] is True
+
+    scope = diagnostics["measurement_scope"]
     assert "adb_staging" in scope["excluded_from_timer"]
     assert "qnn_net_run_process_launch" in scope["included_in_sample"]
     assert "hvx_hmx_power_on_and_acquire" in scope["included_in_sample"]
 
 
-def test_benchmark_captures_device_metrics_before_initializing_and_releases_after(
+def test_a_scope_without_a_device_meter_says_so_with_a_cause(
     tmp_path: Path,
 ) -> None:
-    # Ordering is load-bearing twice over: profiling must happen before
-    # initialize() (an initialized model carries a profiling-disabled context),
-    # and the persistent context must be released even though the timed loop
-    # sits between them.
-    factory = FakeAdapterFactory()
-    benchmarked = _benchmark_once(tmp_path, factory)
-    assert benchmarked.ok, benchmarked.error
-
-    names = factory.log.names()
-    capture = names.index("capture_device_execution")
-    initialize = names.index("initialize_execution")
-    release = names.index("release_execution")
-    first_run = names.index("run_graph")
-
-    assert capture < initialize < first_run < release
-    # Nothing is left holding backend artifacts on the device.
-    assert all(not adapter.initialized_contexts for adapter in factory.adapters)
-
-
-def test_benchmark_survives_an_adapter_that_cannot_profile(tmp_path: Path) -> None:
-    # Device evidence is report-only enrichment: an adapter without it still
-    # produces a valid benchmark, and the report says why rather than claiming
-    # a device number it never measured.
+    # An absent device number must be a declared gap, not an omission the
+    # reader has to notice -- otherwise the wall number silently looks like
+    # the latency again.
     class NoProfilingFactory(FakeAdapterFactory):
         def __call__(self, *args: Any, **kwargs: Any) -> Any:
             adapter = super().__call__(*args, **kwargs)
@@ -2756,9 +2753,12 @@ def test_benchmark_survives_an_adapter_that_cannot_profile(tmp_path: Path) -> No
 
     assert benchmarked.ok, benchmarked.error
     assert benchmarked.data is not None
-    assert "device_execution" not in benchmarked.data
-    # The honest scope statement does not depend on the capture succeeding.
-    assert benchmarked.data["sdk_per_call_setup_included"] is True
+    assert benchmarked.data["latency_metric"] == "unavailable"
+    device = benchmarked.data["device_execution"]
+    assert device["available"] is False
+    assert "capture_device_execution" in device["reason"]
+    # The demotion does not depend on the capture succeeding.
+    assert benchmarked.data["harness_diagnostics"]["not_latency"] is True
 
 
 def test_sdk_generated_token_count_never_derives_from_a_rate() -> None:
@@ -3546,7 +3546,10 @@ def test_validate_benchmark_and_diagnoses_publish_report_only_artifacts(
     )
     assert benchmark.ok and benchmark.manifest is not None and benchmark.data is not None
     assert benchmark.data["scope"] == "graph"
-    assert benchmark.data["measurement"]["summary"]["count"] == 2
+    assert (
+        benchmark.data["harness_diagnostics"]["measurement"]["summary"]["count"]
+        == 2
+    )
     assert benchmark.data["policy"] == "report_only"
     benchmark_graph_calls = [
         details

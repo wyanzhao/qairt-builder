@@ -1,6 +1,6 @@
 # T11 — Make device the only latency metric
 
-Status: planned (opened 2026-08-30)
+Status: low-level half done (2026-08-30); GenAI half blocked on T08
 Depends on: [T10](T10-latency-measurement-correction.md)
 Effort: M
 
@@ -69,14 +69,13 @@ thing a future SDK build may simply stop doing.
    is what needs a count, a reported rate does not. `time_to_first_token` is
    the other headline.
 3. **Ten samples, report the mean** (maintainer decision, 2026-08-30).
-   `device_execution` is currently a single profiled execute; as the primary
-   metric it repeats the profiled execute 10 times and publishes the average.
-   No new statistics code is needed — `diagnostics.latency.summarize_latency`
-   already returns mean alongside p50/p90/stddev/MAD from a sample list, so the
-   device samples go through the same summarizer and the mean is the headline
-   with the rest available beside it. A/A calibration moves onto the device
-   numbers or is dropped there; it was calibrating host noise, which is no
-   longer the metric.
+   The profiled execute repeats 10 times and the block publishes the average.
+   *Correction to the original plan:* this does **not** reuse
+   `summarize_latency`. That summarizer names every field `*_ms`, and putting
+   microseconds or cycle counts behind a millisecond label is precisely the
+   class of mislabelling this metric exists to correct, so
+   `aggregate_device_executions` does its own small aggregation. A/A
+   calibration stays with the wall number, which is what it was calibrating.
 4. **Cover the remaining scopes.** Chain-scope runs get no device capture
    today; the capture is wired only for the single-graph path.
 5. **Demote the wall metric** to a `harness_diagnostics` block: still recorded,
@@ -104,3 +103,40 @@ thing a future SDK build may simply stop doing.
 - The `CLAUDE.md` token-count claim is restated precisely.
 - One real-device run per lane. The GenAI half is blocked on
   [T08](T08-aimet-vector-import.md).
+
+## Low-level half — landed (2026-08-30)
+
+`aggregate_device_executions` averages N parsed executes; the benchmark stage
+takes `DEVICE_EXECUTION_SAMPLES = 10`. The payload was restructured: the wall
+number moved under `harness_diagnostics` with `not_latency: true`, carrying
+`measurement`, `measurement_scope`, `aa_calibration` and `p50_ms_per_token`
+(all wall-derived), and a top-level `latency_metric` names the block that is
+the latency. A scope with no device meter publishes
+`device_execution.available = false` **with a reason** — GenAI generation and
+chain scope each state theirs — so an absent device number is a declared gap.
+
+**Acceptance on SM8750**, job `20260830T203637Z-2fc25926`, 10 profiled
+executes:
+
+| metric | mean | p50 | min | max | stddev |
+| --- | --- | --- | --- | --- | --- |
+| accelerator compute (us) | 76.8 | 74.0 | 67 | 111 | 12.8 |
+| accelerator execute (us) | 1730.8 | 1720.5 | 1711 | 1814 | 30.5 |
+| QNN execute (us) | 3043.6 | 2987.5 | 2960 | 3374 | 132.1 |
+| accelerator execute (cycles) | 30038 | 28446 | 26083 | 46467 | 5982 |
+
+Per-op cycle means: `Input` 8828.7, `act` 9095.2, `Output` 6217.8, `fc` 5896.3,
+`bias_add` 0.0. Wall p50 was 2552.9 ms, published under `harness_diagnostics`.
+
+**The spread vindicates sampling.** Accelerator cycles ranged 26083 to 46467 —
+a 78% spread with stddev ~6000 on a graph doing fixed work. A single profiled
+execute, which is what T10 shipped, could have reported anything in that band
+as *the* number. This is why `spread` and `samples` are published rather than
+the mean alone.
+
+### Still open in this task
+
+- GenAI half (`genie_execution`): blocked on [T08](T08-aimet-vector-import.md)
+  for a real container.
+- Chain scope: declares its gap with a reason rather than measuring; wiring a
+  per-slice profiled execute needs the runner's dynamically produced inputs.

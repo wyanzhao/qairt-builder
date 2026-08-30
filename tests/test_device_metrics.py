@@ -3,8 +3,10 @@ from __future__ import annotations
 import unittest
 
 from qairt_agent.diagnostics.device_metrics import (
+    DEVICE_EXECUTION_METER,
     DEVICE_EXECUTION_SCHEMA,
     DeviceMetricsError,
+    aggregate_device_executions,
     parse_device_execution,
 )
 
@@ -145,6 +147,102 @@ class DeviceExecutionParsingTests(unittest.TestCase):
         # COUNT events would otherwise land in the time map as bare numbers.
         self.assertNotIn("Number of HVX threads used", block["execute_events_us"])
         self.assertNotIn("Num times yield occured", block["execute_events_us"])
+
+
+def _report_with(compute_us: int, execute_us: int, fc_cycles: int) -> dict[str, object]:
+    return {
+        "metadata": {"appName": "qnn-net-run"},
+        "messages": [
+            {
+                "method": "BACKEND_EXECUTE",
+                "profilingEvents": [
+                    {
+                        "identifier": "Accelerator (execute excluding wait) time",
+                        "unit": "MICROSEC",
+                        "value": compute_us,
+                    },
+                    {
+                        "identifier": "Accelerator (execute) time",
+                        "unit": "MICROSEC",
+                        "value": execute_us,
+                    },
+                    {
+                        "identifier": "Accelerator (execute) time (cycles)",
+                        "unit": "CYCLES",
+                        "value": fc_cycles * 2,
+                        "sub-events": [
+                            {
+                                "identifier": "fc:OpId_17 (cycles)",
+                                "unit": "CYCLES",
+                                "type": "NODE",
+                                "value": fc_cycles,
+                            }
+                        ],
+                    },
+                ],
+            }
+        ],
+    }
+
+
+class DeviceExecutionAggregationTests(unittest.TestCase):
+    def test_headline_scalars_are_the_mean_of_the_samples(self) -> None:
+        blocks = [
+            parse_device_execution(_report_with(compute, compute * 10, compute * 100))
+            for compute in (70, 80, 90)
+        ]
+
+        aggregated = aggregate_device_executions(blocks)
+
+        self.assertEqual(aggregated["statistic"], "mean")
+        self.assertEqual(aggregated["sample_count"], 3)
+        self.assertEqual(aggregated["accelerator_compute_us"], 80.0)
+        self.assertEqual(aggregated["accelerator_execute_us"], 800.0)
+        # Per-op cycles are averaged too, not taken from one arbitrary sample.
+        self.assertEqual(
+            aggregated["per_op_cycles"],
+            [{"identifier": "fc:OpId_17 (cycles)", "cycles": 8000.0}],
+        )
+
+    def test_spread_and_raw_samples_are_kept(self) -> None:
+        # An average of ten hides a bimodal device; the reader must be able to
+        # see that without rerunning the benchmark.
+        blocks = [
+            parse_device_execution(_report_with(compute, compute * 10, compute * 100))
+            for compute in (70, 80, 90)
+        ]
+
+        aggregated = aggregate_device_executions(blocks)
+        spread = aggregated["spread"]["accelerator_compute_us"]
+
+        self.assertEqual(aggregated["samples"]["accelerator_compute_us"], [70.0, 80.0, 90.0])
+        self.assertEqual(spread["p50"], 80.0)
+        self.assertEqual(spread["min"], 70.0)
+        self.assertEqual(spread["max"], 90.0)
+        self.assertGreater(spread["stddev"], 0.0)
+
+    def test_single_sample_reports_zero_spread_not_an_error(self) -> None:
+        aggregated = aggregate_device_executions(
+            [parse_device_execution(_report_with(77, 1734, 6137))]
+        )
+        self.assertEqual(aggregated["sample_count"], 1)
+        self.assertEqual(aggregated["spread"]["accelerator_compute_us"]["stddev"], 0.0)
+
+    def test_the_block_names_its_meter_and_lane(self) -> None:
+        # The GenAI lane cannot use this meter, so the block says which one it
+        # is rather than leaving the two lanes' numbers to look interchangeable.
+        aggregated = aggregate_device_executions(
+            [parse_device_execution(_report_with(77, 1734, 6137))]
+        )
+        self.assertEqual(aggregated["meter"], DEVICE_EXECUTION_METER)
+        self.assertEqual(aggregated["lane"], "low_level")
+        self.assertEqual(
+            aggregated["claim_scope"], "profiled_executes_not_the_host_wall_samples"
+        )
+
+    def test_aggregating_nothing_fails_closed(self) -> None:
+        with self.assertRaises(DeviceMetricsError):
+            aggregate_device_executions([])
 
 
 class DeviceExecutionFailClosedTests(unittest.TestCase):

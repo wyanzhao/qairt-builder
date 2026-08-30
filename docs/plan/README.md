@@ -61,7 +61,7 @@ new decision entry here instead.
 | [T08](T08-aimet-vector-import.md) | AIMET vector import and runbook | blocked — awaiting the AIMET pickle files | the delivered pickles |
 | [T09](T09-docs-agent-organization.md) | Docs and agent organization | done (2026-08-29) | — |
 | [T10](T10-latency-measurement-correction.md) | Latency is host-harness time, not device time | done (2026-08-30) | — |
-| [T11](T11-device-only-latency.md) | Make device the only latency metric | planned (2026-08-30) | T10; GenAI half needs T08 |
+| [T11](T11-device-only-latency.md) | Make device the only latency metric | low-level half done (2026-08-30); GenAI half blocked | T10; GenAI half needs T08 |
 
 Status values: `planned`, `blocked(<task>)`, `in-progress(<date>)`,
 `done(<date>)`.

@@ -44,7 +44,10 @@ from qairt_agent.contracts import (
     preset_id_for_family,
     utc_now,
 )
-from qairt_agent.diagnostics.device_metrics import DEVICE_EXECUTION_SCHEMA
+from qairt_agent.diagnostics.device_metrics import (
+    DEVICE_EXECUTION_SCHEMA,
+    aggregate_device_executions,
+)
 from qairt_agent.diagnostics.latency import LatencyDiagnoser
 from qairt_agent.diagnostics.sqnr import QualityDiagnoser, compute_tensor_quality
 from qairt_agent.device import DeviceRuntime
@@ -319,6 +322,30 @@ def _sdk_generated_token_count(metrics: Any) -> int | None:
             return int(value)
     return None
 
+
+# Device latency is the reported metric, so it is sampled rather than measured
+# once (maintainer decision 2026-08-30: ten executes, averaged).
+DEVICE_EXECUTION_SAMPLES = 10
+
+# Why a scope has no device meter. Stated in the report so an absent device
+# number is a declared gap rather than an omission the reader must notice.
+_DEVICE_EXECUTION_UNAVAILABLE = {
+    "genai_generation": (
+        "generate() reaches Genie as GenieDialog_query rather than "
+        "CompiledModel.__call__, so qairt.Profiler observes nothing; the GenAI "
+        "lane needs its own genie_execution meter (T11)"
+    ),
+    "chain": (
+        "chain execution feeds each slice from the previous slice's output, so "
+        "a profiled per-slice execute needs per-slice inputs the runner "
+        "produces dynamically; not yet wired (T11)"
+    ),
+    "chain_sequence": (
+        "chain execution feeds each slice from the previous slice's output, so "
+        "a profiled per-slice execute needs per-slice inputs the runner "
+        "produces dynamically; not yet wired (T11)"
+    ),
+}
 
 _STATIC_FOOTPRINT_SCHEMA = "qairt-agent.static-footprint/1"
 
@@ -867,28 +894,41 @@ class QairtAgent:
         native_io: bool,
         execution_options: Mapping[str, Any],
         working_dir: Path,
+        repeats: int = DEVICE_EXECUTION_SAMPLES,
     ) -> dict[str, Any] | None:
         """Device-side execute evidence, or ``None`` when unavailable.
 
-        This is report-only enrichment of a latency report: an adapter that
-        cannot profile still produces a valid benchmark, so a missing capture
-        degrades the report rather than failing the stage.  What it must never
-        do is publish a device claim it did not measure.
+        The profiled execute is repeated and averaged, because this is the
+        latency metric and one sample cannot show a regression.  An adapter
+        that cannot profile still produces a valid benchmark, so a failed
+        capture degrades the report rather than failing the stage -- what it
+        must never do is publish a device claim it did not measure.
         """
 
         capture = getattr(adapter, "capture_device_execution", None)
         if not callable(capture):
-            return None
+            return {
+                "schema": DEVICE_EXECUTION_SCHEMA,
+                "policy": "report_only",
+                "available": False,
+                "reason": (
+                    "the QAIRT adapter does not expose capture_device_execution"
+                ),
+            }
         try:
-            return capture(
-                compiled,
-                inputs,
-                graph_name=graph_name,
-                device=device,
-                native_io=native_io,
-                working_dir=working_dir,
-                **dict(execution_options),
-            )
+            blocks = [
+                capture(
+                    compiled,
+                    inputs,
+                    graph_name=graph_name,
+                    device=device,
+                    native_io=native_io,
+                    working_dir=working_dir,
+                    **dict(execution_options),
+                )
+                for _ in range(max(1, int(repeats)))
+            ]
+            return aggregate_device_executions(blocks)
         except Exception as error:  # report-only: never fail the benchmark
             return {
                 "schema": DEVICE_EXECUTION_SCHEMA,
@@ -6118,6 +6158,19 @@ class QairtAgent:
                         device=device_stage.device,
                     )
 
+                if device_execution is None:
+                    # Latency is device time, so a scope with no device meter
+                    # says so with a cause rather than quietly omitting the
+                    # block and leaving the wall number to look like latency.
+                    device_execution = {
+                        "schema": DEVICE_EXECUTION_SCHEMA,
+                        "policy": "report_only",
+                        "available": False,
+                        "reason": _DEVICE_EXECUTION_UNAVAILABLE.get(
+                            scope, "no device meter is wired for this scope"
+                        ),
+                    }
+
                 if scope != "genai_generation":
                     # Our own setup -- context loading, Device construction, ADB
                     # staging, graph-runner setup -- is complete before the
@@ -6389,53 +6442,71 @@ class QairtAgent:
                     logical_name=f"optrace_evidence{report_suffix}",
                 )
             payload: dict[str, Any] = {
-                "measurement": measurement.to_dict(),
                 "policy": "report_only",
-                # Our own setup is outside the timer; what the SDK does inside
-                # one call is not, and on the low-level lane that includes a
-                # fresh qnn-net-run process per call.  Reporting a single
-                # "setup_excluded" flag conflated the two.
-                "harness_setup_excluded": True,
-                "sdk_per_call_setup_included": (
-                    "unverified"
-                    if scope == "genai_generation"
-                    else True
-                ),
-                "metric_name": "host_orchestrated_call_latency",
                 "scope": scope,
-                "measurement_scope": {
-                    "clock": "host_perf_counter_ns",
-                    "includes": "host_to_sdk_to_device_round_trip",
-                    "device_side_sync_barrier": False,
+                # Latency means device time. The host wall number is kept for
+                # diagnosing the harness -- it still detects ADB, container and
+                # transport degradation -- but it is not this report's latency
+                # and never grounds a regression verdict.
+                "latency_metric": (
+                    "device_execution"
+                    if device_execution is not None
+                    and device_execution.get("available") is not False
+                    else "unavailable"
+                ),
+                "harness_diagnostics": {
+                    "metric_name": "host_orchestrated_call_latency",
+                    "not_latency": True,
                     "note": (
-                        "the QAIRT Python API exposes no device-side "
-                        "synchronization barrier, so each sample is the warmed "
-                        "host wall time around one call, including whatever "
-                        "per-call setup the SDK performs inside it; this is not "
-                        "device execution time -- see 'device_execution'"
+                        "host wall time around one SDK call, kept to detect "
+                        "harness and transport degradation; the reported "
+                        "latency is the block named by 'latency_metric'"
                     ),
-                    "excluded_from_timer": [
-                        "context_loading",
-                        "device_construction",
-                        "adb_staging",
-                        "graph_runner_setup",
-                    ],
-                    "included_in_sample": (
-                        []
+                    "measurement": measurement.to_dict(),
+                    # Our own setup is outside the timer; what the SDK does
+                    # inside one call is not, and on the low-level lane that
+                    # includes a fresh qnn-net-run process per call.  Reporting
+                    # a single "setup_excluded" flag conflated the two.
+                    "harness_setup_excluded": True,
+                    "sdk_per_call_setup_included": (
+                        "unverified"
                         if scope == "genai_generation"
-                        else [
-                            "qnn_net_run_process_launch",
-                            "per_call_context_load",
-                            "hvx_hmx_power_on_and_acquire",
-                            "per_call_deinit",
-                            "adb_input_push_and_output_pull",
-                        ]
+                        else True
                     ),
-                    "sample_unit": (
-                        "generate_call"
-                        if scope == "genai_generation"
-                        else "graph_invocation"
-                    ),
+                    "measurement_scope": {
+                        "clock": "host_perf_counter_ns",
+                        "includes": "host_to_sdk_to_device_round_trip",
+                        "device_side_sync_barrier": False,
+                        "note": (
+                            "the QAIRT Python API exposes no device-side "
+                            "synchronization barrier, so each sample is the warmed "
+                            "host wall time around one call, including whatever "
+                            "per-call setup the SDK performs inside it; this is not "
+                            "device execution time -- see 'device_execution'"
+                        ),
+                        "excluded_from_timer": [
+                            "context_loading",
+                            "device_construction",
+                            "adb_staging",
+                            "graph_runner_setup",
+                        ],
+                        "included_in_sample": (
+                            []
+                            if scope == "genai_generation"
+                            else [
+                                "qnn_net_run_process_launch",
+                                "per_call_context_load",
+                                "hvx_hmx_power_on_and_acquire",
+                                "per_call_deinit",
+                                "adb_input_push_and_output_pull",
+                            ]
+                        ),
+                        "sample_unit": (
+                            "generate_call"
+                            if scope == "genai_generation"
+                            else "graph_invocation"
+                        ),
+                    },
                 },
                 "runtime_binding": {
                     key: _jsonable(effective.get(key))
@@ -6523,11 +6594,16 @@ class QairtAgent:
             if token_source is not None:
                 payload["token_count"] = normalized_tokens
                 payload["ms_per_token_source"] = token_source
-                payload["p50_ms_per_token"] = (
+                # Derived from the host wall samples, so it lives with them:
+                # it inherits everything that makes them not device latency.
+                payload["harness_diagnostics"]["p50_ms_per_token"] = (
                     measurement.summary.p50_ms / normalized_tokens
                 )
             if aa_measurement is not None:
-                payload["aa_calibration"] = aa_measurement.to_dict()
+                # A/A calibrated host noise, which is no longer the metric.
+                payload["harness_diagnostics"]["aa_calibration"] = (
+                    aa_measurement.to_dict()
+                )
             if optrace_ref is not None:
                 payload["optrace_evidence"] = _jsonable(optrace_ref)
             footprint = self._build_static_footprint(manifest)
@@ -6862,8 +6938,12 @@ class QairtAgent:
             aggregate_payload: dict[str, Any] = {
                 "schema": "qairt-agent.multi-ar-latency-report.v1",
                 "policy": "report_only",
-                "harness_setup_excluded": True,
-                "metric_name": "host_orchestrated_call_latency",
+                "latency_metric": "device_execution",
+                "harness_diagnostics": {
+                    "metric_name": "host_orchestrated_call_latency",
+                    "not_latency": True,
+                    "harness_setup_excluded": True,
+                },
                 "coverage": coverage,
                 "results_by_ar": results_by_ar,
             }

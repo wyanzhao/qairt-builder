@@ -20,9 +20,23 @@ detailed level needs no such asset and already carries per-op cycles.
 
 from __future__ import annotations
 
+import statistics
 from typing import Any, Mapping, Sequence
 
-DEVICE_EXECUTION_SCHEMA = "qairt-agent.device-execution/1"
+DEVICE_EXECUTION_SCHEMA = "qairt-agent.device-execution/2"
+
+# The meter this block reports. The GenAI lane cannot use it: generate() reaches
+# Genie as GenieDialog_query rather than CompiledModel.__call__, so the profiler
+# observes nothing there and that lane needs its own, differently named block.
+DEVICE_EXECUTION_METER = "qnn_accelerator"
+
+# Headline scalars averaged across samples.
+_AGGREGATED_SCALARS = (
+    "accelerator_compute_us",
+    "accelerator_execute_us",
+    "qnn_execute_us",
+    "accelerator_execute_cycles",
+)
 
 _EXECUTE_METHOD = "BACKEND_EXECUTE"
 _INIT_METHOD = "BACKEND_CREATE_FROM_BINARY"
@@ -174,8 +188,111 @@ def parse_device_execution(report_data: Mapping[str, Any]) -> dict[str, Any]:
     return block
 
 
+def _spread(values: Sequence[float]) -> dict[str, float]:
+    ordered = sorted(values)
+    return {
+        "mean": statistics.fmean(ordered),
+        "p50": statistics.median(ordered),
+        "min": ordered[0],
+        "max": ordered[-1],
+        "stddev": statistics.stdev(ordered) if len(ordered) > 1 else 0.0,
+    }
+
+
+def _mean_by_key(
+    blocks: Sequence[Mapping[str, Any]], field: str
+) -> dict[str, float]:
+    collected: dict[str, list[float]] = {}
+    for block in blocks:
+        for name, value in (block.get(field) or {}).items():
+            if isinstance(value, (int, float)):
+                collected.setdefault(str(name), []).append(float(value))
+    return {name: statistics.fmean(values) for name, values in collected.items()}
+
+
+def aggregate_device_executions(
+    blocks: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Average N parsed executes into one block, with the mean as the headline.
+
+    Deliberately not routed through ``summarize_latency``: that summarizer
+    names every field ``*_ms``, and putting microseconds or cycle counts behind
+    a millisecond label is the exact class of mislabelling this metric exists
+    to correct.
+
+    Per-sample values are kept so a reader can see the spread rather than
+    trusting an average of ten.
+    """
+
+    if not blocks:
+        raise DeviceMetricsError("no device execute samples to aggregate")
+
+    samples: dict[str, list[float]] = {}
+    for name in _AGGREGATED_SCALARS:
+        values = [
+            float(block[name])
+            for block in blocks
+            if isinstance(block.get(name), (int, float))
+        ]
+        if values:
+            samples[name] = values
+
+    if not samples:
+        raise DeviceMetricsError(
+            "device execute samples carried no numeric metrics to average"
+        )
+
+    per_op = _mean_by_key(
+        [
+            {
+                "per_op": {
+                    str(item.get("identifier", "")): item.get("cycles")
+                    for item in block.get("per_op_cycles", ())
+                    if isinstance(item, Mapping)
+                }
+            }
+            for block in blocks
+        ],
+        "per_op",
+    )
+
+    first = blocks[0]
+    aggregated: dict[str, Any] = {
+        "schema": DEVICE_EXECUTION_SCHEMA,
+        "meter": DEVICE_EXECUTION_METER,
+        "lane": "low_level",
+        "policy": "report_only",
+        "source": first.get("source"),
+        "profiler_level": first.get("profiler_level"),
+        "profiler_option": first.get("profiler_option"),
+        "statistic": "mean",
+        "sample_count": len(blocks),
+        "sample_unit": "one_profiled_graph_execute",
+        "producer": first.get("producer"),
+        "per_op_cycles": [
+            {"identifier": name, "cycles": value}
+            for name, value in sorted(per_op.items())
+        ],
+        "execute_events_us": _mean_by_key(blocks, "execute_events_us"),
+        "per_process_overhead_us": _mean_by_key(blocks, "per_process_overhead_us"),
+        "spread": {name: _spread(values) for name, values in samples.items()},
+        "samples": samples,
+        "claim_scope": "profiled_executes_not_the_host_wall_samples",
+        "note": (
+            "device-side values QAIRT reported for each profiled execute, "
+            "averaged; the host wall samples under 'harness_diagnostics' "
+            "measure a different thing and are not comparable"
+        ),
+    }
+    for name, values in samples.items():
+        aggregated[name] = statistics.fmean(values)
+    return aggregated
+
+
 __all__ = [
     "ACCELERATOR_IDENTIFIER",
+    "DEVICE_EXECUTION_METER",
+    "aggregate_device_executions",
     "COMPUTE_IDENTIFIER",
     "CYCLES_IDENTIFIER",
     "DEVICE_EXECUTION_SCHEMA",
