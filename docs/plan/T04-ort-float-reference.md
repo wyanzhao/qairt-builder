@@ -1,7 +1,7 @@
 # T04 — ORT float reference and layerwise debug comparison
 
-Status: tier 1 done (2026-08-29); tier 2 still planned, and the real-device
-acceptance run is still owed.
+Status: tier 1 done (2026-08-29), real-device acceptance done (2026-08-30 on
+SM8750); tier 2 still planned.
 Depends on: T01 (tier 2 capability answer; device acceptance) — tier 1 code
 can be developed against the fake-adapter seams earlier
 Effort: L
@@ -156,14 +156,42 @@ plus `tests/test_vectors.py`
 `examples/README.md`. Documentation: root `CLAUDE.md` and
 `docs/native-workflow.md` ("Float-graph reference (debug only)").
 
+## Tier 1 real-device acceptance (2026-08-30) — done
+
+Run on the SM8750 handset (serial RFCY30B296K, `ro.soc.model SM8750`) from
+`models/acceptance/spec-t04-float-reference.json`; job
+`20260830T110455Z-b71f5a66`, run `0601fee2-a12d-4a99-bb67-2a5829cc1c79`,
+workflow succeeded through build, validate and benchmark.
+
+The published `float_reference_report` records
+`comparison: device_chain_vs_onnxruntime_float_graph`, ONNX Runtime 1.17.1 with
+`CPUExecutionProvider`, the reference model hash
+`b4f52600b4a717ce4fbbd0cb35591029ab766d4750c8e8e7c9b5e5af296d54d7`, an explicit
+`tensor_map` of `{"model": {"output": "output"}}` resolved by exact name match,
+`unmapped_tensors: []`, and SQNR 41.634 dB / cosine 0.99997 / normalized RMSE
+0.00829 at the slice boundary.
+
+**Honest scope of what this proves.** The acceptance model is a single-slice
+3-node graph, so it has exactly one boundary and its float reference coincides
+with the supplied golden — the same 41.63 dB appears in both. The run therefore
+proves the *mechanism* end to end on hardware (ORT capture, name binding,
+report publication, artifact immutability), not that the two references diverge
+under quantization. A multi-slice model is still needed to show separation
+between quantization error and backend error, and that requires the T08 vectors.
+
+The acceptance criterion named SM8850; it was run on SM8750 because that is the
+handset attached, and SM8750 is equally verified in the target registry.
+
 ## Still open
 
 - **Tier 2 (layer-level drilldown).** Requesting any granularity other than
   `slice_boundary` fails closed today. The blocker is unchanged: the low-level
-  lane must actually execute the diagnostic contexts it already builds, and the
-  GenAI lane needs T01's capability probe.
+  lane must actually execute the diagnostic contexts it already builds. T01's
+  probe answered the GenAI half negative — 2.49 exposes no intermediate/debug
+  output for built containers — so that lane takes the documented fail-closed
+  experimental low-level diagnostic build.
 - **GenAI lane tier 1.** The implementation is lane-neutral — it compares
   whatever per-slice device outputs the validation run produced — so a GenAI
   raw-tensor route works in principle, but no GenAI-lane test exercises it yet.
-- **Real-device acceptance.** No SM8850 run has produced a slice-boundary float
-  comparison report; the acceptance criterion above still stands.
+- **Multi-slice divergence.** See the scope note above; blocked on
+  [T08](T08-aimet-vector-import.md).
