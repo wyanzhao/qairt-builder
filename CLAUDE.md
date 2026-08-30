@@ -146,10 +146,14 @@ end-to-end: an unscoped run must fail. Use an explicit `component = "text"` or
 
 Canonical examples live in `examples/`. Run `qairt-agent plan` after changing a
 spec; the resolved JSON must show the expected `pipeline`, AR policy, native-KV
-policy, and output layout before starting a build. `examples/README.md` states
-which examples are normal CLI workflows and which capability-gated or legacy
-files must not be treated as production templates. Deployable model x target
-spec cells land under `configs/` with T03.
+policy, target, and output layout before starting a build. `examples/README.md`
+states which examples are normal CLI workflows and which capability-gated or
+legacy files must not be treated as production templates.
+
+Deployable cells live under `configs/{preset}/{target}.json` and are what a real
+run is launched from; `configs/README.md` carries the conventions. A test
+resolves every cell and requires its directory/file names to agree with the
+preset and target inside, and requires that target to be verified.
 
 ## Input and transformation contract
 

@@ -35,6 +35,7 @@ from qairt_agent.families.presets import (
 )
 from qairt_agent.families.sku import capture_sku, merge_sku
 from qairt_agent.families.split_plan import build_split_plan
+from qairt_agent.harness import resolve_target
 
 
 def make_workflow(preset: str = "qwen3_dense", **updates) -> WorkflowSpec:
@@ -376,3 +377,44 @@ def test_capture_sku_unknown_preset_raises() -> None:
 def test_workflow_spec_rejects_blank_preset() -> None:
     with pytest.raises(ValidationError, match="blank"):
         make_workflow(preset="   ")
+
+
+def test_deployment_configs_resolve_to_their_named_target() -> None:
+    """Every `configs/` cell must stay plannable without the SDK.
+
+    A deployment config is what a real run is launched from, so it rots
+    silently unless something parses it: this resolves each cell and asserts
+    the pipeline, AR policy, native-KV policy, output layout and target it will
+    actually build with.
+    """
+
+    root = Path(__file__).parents[1] / "configs"
+    cells = sorted(root.glob("*/*.json"))
+    assert cells, "configs/ must contain at least one deployment cell"
+
+    for path in cells:
+        workflow = WorkflowSpec.model_validate(
+            json.loads(path.read_text(encoding="utf-8"))
+        )
+        build = to_build_spec(workflow)
+        resolved = resolve_workflow(workflow)
+
+        # The directory names carry the model and the target, so a misfiled
+        # cell is a test failure rather than a surprise at build time.
+        model_dir, target_name = path.parent.name, path.stem
+        assert workflow.preset == model_dir, path
+        assert build.target.name == target_name, path
+
+        entry = resolve_target(target_name)
+        assert (build.target.chipset, build.target.dsp_arch, build.target.soc_model) == (
+            entry.chipset,
+            entry.dsp_arch,
+            entry.soc_model,
+        ), path
+        assert entry.verified is not None, f"{path} names an unverified target"
+
+        assert resolved.to_dict()["output_layout"], path
+        assert resolved.pipeline.value in {"low_level", "genai_builder"}, path
+        assert workflow.model_dump(mode="json")["output_root"].startswith(
+            "/artifacts/"
+        ), path

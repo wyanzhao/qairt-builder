@@ -1,0 +1,64 @@
+{
+  "name": "qwen3.5-sm8850",
+  "preset": "qwen3_5",
+  "sources": {
+    "text": {
+      "onnx": "/models/qwen3.5/ar1/model.onnx",
+      "encodings": "/models/qwen3.5/ar1/model.encodings",
+      "config_path": "/models/qwen3.5/config.json",
+      "tokenizer": "/models/qwen3.5/tokenizer.json"
+    }
+  },
+  "sequence": {
+    "ars": [1, 128],
+    "context_lengths": [4096],
+    "weight_sharing": true,
+    "native_kv": true
+  },
+  "split": {
+    "embedding_mode": "compiled",
+    "decoder_slice_count": 4,
+    "split_lm_head": true
+  },
+  "quantization": {
+    "mode": "apply_encodings"
+  },
+  "vectors": {
+    "mode": "provided",
+    "validation_manifests_by_ar": {
+      "1": "/models/qwen3.5/vectors/ar1/vector_manifest.json",
+      "128": "/models/qwen3.5/vectors/ar128/vector_manifest.json"
+    }
+  },
+  "quality": {
+    "sqnr_modes": ["full_reference"],
+    "dump_intermediates_on_failure": true
+  },
+  "stage_configs": {
+    "benchmark": {
+      "prompt": [
+        {
+          "role": "user",
+          "content": "Summarize why deterministic model builds matter."
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "attached_models_by_ar": {
+      "1": {
+        "model_path": "/models/qwen3.5/ar1/model.onnx",
+        "encodings_path": "/models/qwen3.5/ar1/model.encodings"
+      },
+      "128": {
+        "model_path": "/models/qwen3.5/ar128/model.onnx",
+        "encodings_path": "/models/qwen3.5/ar128/model.encodings"
+      }
+    }
+  },
+  "target": {
+    "backend": "HTP",
+    "name": "sm8850"
+  },
+  "output_root": "/artifacts/qwen3.5-sm8850"
+}

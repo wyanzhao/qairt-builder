@@ -52,12 +52,12 @@ new decision entry here instead.
 | --- | --- | --- | --- |
 | [T01](T01-sdk-upgrade-2.49.md) | QAIRT SDK upgrade to 2.49.0.260730 | done (2026-08-30) | — |
 | [T02](T02-target-registry.md) | Target registry (SM8850, SM8750) | done (2026-08-30) | T01 |
-| [T03](T03-config-matrix.md) | Model x target config matrix | planned | T02 |
+| [T03](T03-config-matrix.md) | Model x target config matrix | done (2026-08-30) — reduced to one validated cell | T02 |
 | [T04](T04-ort-float-reference.md) | ORT float reference and layerwise debug | tier 1 done (2026-08-29); tier 2 planned | T01 for tier 2 and device acceptance |
 | [T05](T05-static-footprint.md) | Static footprint reporting | done (2026-08-29) | — |
 | [T06](T06-latency-refinements.md) | Latency refinements (GenAI defaults, tokens) | done (2026-08-29) | — |
 | [T07](T07-review-bugfixes.md) | Review bug fixes | done (2026-08-29) | — |
-| [T08](T08-aimet-vector-import.md) | AIMET vector import and runbook | planned | T01 for Torch archives |
+| [T08](T08-aimet-vector-import.md) | AIMET vector import and runbook | blocked — awaiting the AIMET pickle files | the delivered pickles |
 | [T09](T09-docs-agent-organization.md) | Docs and agent organization | done (2026-08-29) | — |
 
 Status values: `planned`, `blocked(<task>)`, `in-progress(<date>)`,

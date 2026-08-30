@@ -1,6 +1,7 @@
 # T03 — Model x target config matrix
 
-Status: planned
+Status: done (2026-08-30) — scope reduced by the maintainer to one validated
+cell rather than a full matrix.
 Depends on: T02
 Effort: S
 
@@ -59,3 +60,43 @@ file per model x hardware cell, validated by `qairt-agent plan` in tests.
 - All seed cells parse and `plan` cleanly in the test suite.
 - Path conventions documented; no host-specific absolute paths inside configs.
 - Root `CLAUDE.md` points to `configs/` beside `examples/`.
+
+
+## Result (2026-08-30)
+
+### Scope reduced, deliberately
+
+The maintainer asked for the matrix to be dropped: one cell that a test
+validates is enough. Building the full model x target grid now would have
+committed five more configs whose sources and vectors do not exist yet, so
+every extra cell would have been an unverifiable guess about paths that T08 has
+not produced.
+
+What landed instead:
+
+- `configs/qwen3_5/sm8850.json` — the primary model on the target this program
+  is currently accepted on, as a complete `WorkflowSpec`: per-AR attached
+  models, per-AR validation manifests, `apply_encodings`, CL4096, an explicit
+  benchmark prompt, its own `output_root`, and `"target": {"name": "sm8850"}`.
+- `configs/README.md` — the layout rule (`configs/{preset}/{target}.json`), how
+  a cell differs from an `examples/` template, and the path/identity
+  conventions.
+- `test_deployment_configs_resolve_to_their_named_target` — iterates every cell
+  under `configs/`, resolves it without the SDK, and asserts that the directory
+  name matches the preset, the file name matches the target, the resolved tuple
+  matches the registry entry, that entry is **verified**, and the output layout
+  and `/artifacts/` root are present. It is written over a glob, so adding a
+  cell later extends the coverage without touching the test.
+
+Verified live: `qairt-agent plan --spec configs/qwen3_5/sm8850.json` resolves
+the GenAI Builder pipeline, ARs `[1, 128]`, 4 decoder slices, native KV, the
+`sm8850` target (SM8850/v81/soc_model 87, verified), and the GenAI benchmark
+defaults 3+10 per generate call.
+
+### Adding the remaining cells later
+
+The test is a glob, and the registry now guarantees a cell cannot name an
+unverified target, so a new cell is one file plus the real vector paths. The
+cells deliberately not written yet are `qwen3_5/sm8750`, `qwen3_dense/*` and
+`qwen3_moe/*`; they need their exports and their T08 vector manifests to exist
+first.

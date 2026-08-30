@@ -1,8 +1,10 @@
 # T08 — AIMET vector import and runbook
 
-Status: planned
-Depends on: T01 (Torch archives require the rebuilt worker image; restricted
-NumPy pickles import host-side and can proceed earlier)
+Status: blocked (2026-08-30) — **waiting on the AIMET pickles themselves.**
+The maintainer confirmed they are not available yet. The T01 dependency is
+cleared (the 2.49 worker image is built and its SDK import smoke passes, so
+Torch archives can be dispatched), so nothing but the input files is missing.
+Depends on: the delivered AIMET pickle files
 Effort: S
 
 ## Goal
@@ -50,6 +52,28 @@ repeatable runbook.
    reference, so deliver goldens whenever available.
 6. Manifests and raw tensors are immutable and content-addressed; re-imports
    go to a new directory, never edit in place.
+
+## What unblocks this
+
+One AIMET-quantized pickle per model/AR, ideally shaped
+`{"inputs": {name: tensor}, "goldens": {name: tensor}}`. For Qwen3.5 that is
+two files, AR1 and AR128. Separate input-only / golden-only files also work via
+`--section inputs|goldens`.
+
+Tensor names must match the exported graph I/O exactly, because the
+manifest-to-model binding is validated per AR at plan/validate time. Goldens
+are optional in the mechanism — an inputs-only manifest triggers the audited
+ORT fallback capture — but the decided production reference is the AIMET
+golden, so deliver goldens wherever they exist.
+
+Nothing else is outstanding: the CLI path (`qairt-agent vectors import-pickle
+--trusted-local`), the restricted NumPy loader, and the rlimit-subprocess Torch
+loader all exist, and the worker that runs Torch archives is built and smoked.
+
+Until the files arrive, `configs/qwen3_5/sm8850.json` points at the intended
+manifest destinations rather than existing files, so that cell plans but its
+validation fails closed on the missing manifest. That is the correct state, not
+a defect.
 
 ## Acceptance criteria
 
