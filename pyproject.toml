@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 mcp = ["mcp==1.8.0"]
-dev = ["pytest==8.1.1", "pytest-cov>=5,<7"]
+dev = ["pytest==8.1.1", "pytest-cov>=5,<7", "mypy>=2.3,<3"]
 
 [project.scripts]
 qairt-agent = "qairt_agent.cli:main"
@@ -30,10 +30,39 @@ packages = ["src/qairt_agent"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "harness/constraints.json" = "qairt_agent/_data/harness_constraints.json"
-"harness/targets/sm8850.json" = "qairt_agent/_data/targets/sm8850.json"
-"harness/targets/sm8750.json" = "qairt_agent/_data/targets/sm8750.json"
+# The whole reviewed target registry, not a list of filenames: adding
+# harness/targets/sm8950.json used to ship a wheel silently missing it.
+"harness/targets" = "qairt_agent/_data/targets"
 "docker/worker.Dockerfile" = "qairt_agent/_data/worker/docker/worker.Dockerfile"
+# The dependency lock cannot be derived here -- hatchling does not read
+# harness/constraints.json -- so tests/test_packaging.py asserts this literal
+# still names the file `worker.dependencies_file` points at, and names
+# pyproject.toml when it does not.
 "docker/requirements-qairt-2.49.0.260730.txt" = "qairt_agent/_data/worker/docker/requirements-qairt-2.49.0.260730.txt"
+
+[tool.mypy]
+# Scoped deliberately: the pipeline<->adapter Protocol boundary, the contracts,
+# and the two leaf packages that are already close to typed. A whole-repo
+# strictness jump would produce hundreds of findings nobody reads; this gate is
+# meant to fail on real drift, which means it has to stay green.
+python_version = "3.11"
+files = [
+  "src/qairt_agent/contracts.py",
+  "src/qairt_agent/contracts_reports.py",
+  "src/qairt_agent/family_registry.py",
+  "src/qairt_agent/families",
+  "src/qairt_agent/diagnostics",
+  "src/qairt_agent/qairt_adapter/types.py",
+]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# Pydantic's own generated signatures are not what this gate is about.
+module = "pydantic.*"
+follow_imports = "skip"
 
 [tool.pytest.ini_options]
 addopts = "-ra"

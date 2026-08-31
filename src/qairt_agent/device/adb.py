@@ -343,6 +343,38 @@ class AdbClient:
             )
         return digest
 
+    def read_soc_id(self) -> dict[str, Any]:
+        """Read the Android SoC ID the handset reports.
+
+        The registry records each target's ``soc_id`` list precisely so a
+        report can never publish under a target identity the hardware
+        contradicts. This is the read half: a pure adb property read, no SDK
+        involvement. ``ro.soc.id`` is the modern property; the sysfs node is
+        the fallback for handsets that do not export it.
+
+        Returns the parsed ``soc_id`` when one could be read, plus every raw
+        source output so an unreadable value stays inspectable instead of
+        becoming an unexplained absence.
+        """
+
+        sources: list[dict[str, Any]] = []
+        soc_id: int | None = None
+        for kind, command in (
+            ("getprop ro.soc.id", "getprop ro.soc.id"),
+            ("getprop ro.soc.model", "getprop ro.soc.model"),
+            ("sysfs", "cat /sys/devices/soc0/soc_id"),
+        ):
+            try:
+                result = self.shell(command)
+            except Exception as error:  # noqa: BLE001 - absence is a warning
+                sources.append({"source": kind, "error": str(error)})
+                continue
+            raw = (getattr(result, "stdout", "") or "").strip()
+            sources.append({"source": kind, "raw": raw})
+            if soc_id is None and raw.isdigit():
+                soc_id = int(raw)
+        return {"soc_id": soc_id, "sources": sources}
+
     def remote_exists(self, remote_path: str) -> bool:
         result = self._execute([*self._config.adb_base_argv(), "shell", "test", "-e", remote_path])
         return getattr(result, "returncode", 1) == 0

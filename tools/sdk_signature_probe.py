@@ -55,8 +55,20 @@ ATTRIBUTES = [
 ]
 METHODS = [
     ("qairt.gen_ai_api.builders.qwen.builder", "Qwen3_5BuilderHTP",
-     ("from_pretrained", "attach_model_for_arn", "build")),
+     ("from_pretrained", "attach_model_for_arn", "build", "set_targets")),
     ("qairt", "CompileConfig", ("set_mode",)),
+    # The GenAI lane reads its resolved compile target back off the builder
+    # rather than echoing the input into the receipt. A build that stops
+    # assembling this config must fail the upgrade gate loudly, not quietly
+    # downgrade every GenAI receipt to "input_only".
+    ("qairt.gen_ai_api.builders.htp_mixin", "HTPMixin", ("set_targets", "set_compilation_options")),
+]
+#: Metadata fields the AR->graph binding proof reads. Names alone cannot
+#: distinguish an AR1 graph from an AR128 one; the dimensions can, so losing
+#: them silently would take the proof with them.
+GRAPH_METADATA = [
+    ("qairt.modules.common.graph_info_models", "GraphInfo", ("name", "inputs", "outputs")),
+    ("qairt.modules.common.graph_info_models", "TensorInfo", ("name", "dimensions")),
 ]
 
 rows, missing = [], []
@@ -111,6 +123,20 @@ for module_name, class_name, methods in METHODS:
             signature = "<no signature>"
         rows.append({"module": f"{module_name}.{class_name}", "attribute": method,
                      "signature": signature})
+
+for module_name, class_name, fields in GRAPH_METADATA:
+    try:
+        owner = getattr(importlib.import_module(module_name), class_name)
+    except Exception as error:
+        missing.append(f"{module_name}.{class_name}: {error}")
+        continue
+    declared = set(getattr(owner, "model_fields", {}) or {})
+    for field in fields:
+        if field not in declared and not hasattr(owner, field):
+            missing.append(f"{class_name}.{field}: MISSING")
+            continue
+        rows.append({"module": f"{module_name}.{class_name}", "attribute": field,
+                     "signature": "<model field>"})
 
 print(json.dumps({"probed": len(rows) + len(missing), "present": len(rows),
                   "missing": missing, "rows": rows}, indent=1))

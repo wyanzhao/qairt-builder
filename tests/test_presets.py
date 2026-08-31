@@ -257,6 +257,8 @@ def test_presets_publish_serializable_output_layouts_beneath_output_root() -> No
         "qwen3_5_omni.json",
         "qwen3_5_omni_thinker.json",
         "vit.json",
+        "qwen3_dense_float_reference_debug.json",
+        "qwen3_dense_float_reference_layer_debug.json",
     ],
 )
 def test_canonical_model_examples_resolve_and_serialize(filename: str) -> None:

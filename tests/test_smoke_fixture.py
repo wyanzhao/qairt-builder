@@ -106,3 +106,23 @@ def test_the_layer_debug_spec_actually_asks_for_a_drilldown(tmp_path: Path) -> N
     assert float_reference["granularity"] == "layer"
     assert float_reference["ar"] == 1
     assert Path(float_reference["model_path"]).is_file()
+
+
+def test_the_fixture_target_defaults_to_the_active_harness_target(
+    tmp_path: Path,
+) -> None:
+    """A first run must not silently plan for a chip the harness is not on.
+
+    The generator used to hardcode its default target, so flipping
+    `harness/constraints.json` to another chip left the fixture planning for
+    the old one -- with everything downstream looking perfectly healthy.
+    """
+
+    constraints = json.loads(
+        (REPO_ROOT / "harness" / "constraints.json").read_text(encoding="utf-8")
+    )
+    produced = _generate(tmp_path / "smoke")
+
+    for key in ("spec", "layer_debug_spec"):
+        spec = json.loads(Path(produced[key]).read_text())
+        assert spec["target"]["name"] == constraints["target"]["name"]

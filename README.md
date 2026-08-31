@@ -107,7 +107,10 @@ only an exact `<job>/<stage>/<attempt>/` sandbox.
 The native CLI consumes a complete `WorkflowSpec` with a `preset`. Legacy
 `BuildSpec.family` input remains accepted and is normalized through
 `to_workflow_spec`; it is not a second routing policy. The JSON files listed in
-`examples/README.md` are the canonical references. Important fields are:
+`examples/README.md` are the canonical references, and
+[`docs/spec-reference.md`](docs/spec-reference.md) documents **every** field,
+every `stage_configs` key, and the AR/CL/native-KV decisions a wide export
+needs. The fields that matter most often:
 
 - `sources.text`: ONNX, AIMET encodings, and Hugging Face `config_path`
 - `sources.vision`: required for Qwen3-VL

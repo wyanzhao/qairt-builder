@@ -20,6 +20,11 @@ may select a different reviewed constraints file with
 2. Add or rename the pinned dependency file referenced by
    `worker.dependencies_file`. **Do not silently reuse an old release lock** —
    re-derive it from the new SDK's own dependency check and verify item by item.
+   Renaming it is a **two-file change**: `pyproject.toml` force-includes the
+   lock by literal filename, so the new name must go there too or the wheel
+   ships without it. `tests/test_packaging.py` reads
+   `worker.dependencies_file` and fails naming `pyproject.toml` when the two
+   disagree — run the suite before assuming the rename is complete.
 3. Update Docker / Apple-container image inputs only through the harness values.
 4. Run `tools/sdk_signature_probe.py` **inside the worker container**, where the
    SDK imports. It fails naming any bound surface the new build dropped. Update

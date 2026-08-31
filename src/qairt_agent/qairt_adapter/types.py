@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, Callable, Protocol, runtime_checkable
 
 
 class IssueSeverity(str, Enum):
@@ -42,6 +43,43 @@ class PreflightReport:
     @property
     def warnings(self) -> tuple[PreflightIssue, ...]:
         return tuple(issue for issue in self.issues if issue.severity is IssueSeverity.WARNING)
+
+
+#: Fields that hold a live QAIRT SDK object rather than a published path.
+#:
+#: They are excluded from serialization, and released once the artifact they
+#: belong to has been published: a real multi-GB build accumulates one per
+#: (context length, AR, slice), and holding them all for the whole build is an
+#: OOM risk on top of from-zero crash restarts.
+LIVE_SDK_FIELDS = frozenset(
+    {
+        "execution_result",
+        "graph_context",
+        "reports",
+        "sdk_container",
+        "sdk_compiled_model",
+        "sdk_model",
+        "sdk_output",
+    }
+)
+
+
+def without_live_sdk_objects(artifact: Any) -> Any:
+    """A copy of ``artifact`` with its live SDK references dropped.
+
+    The live fields are declared ``compare=False``, so the released copy still
+    compares equal to the original: releasing changes what is *reachable*, not
+    what the artifact means.
+    """
+
+    if not is_dataclass(artifact) or isinstance(artifact, type):
+        return artifact
+    cleared = {
+        field.name: None
+        for field in fields(artifact)
+        if field.name in LIVE_SDK_FIELDS
+    }
+    return replace(artifact, **cleared) if cleared else artifact
 
 
 @dataclass(frozen=True)
@@ -188,6 +226,34 @@ class NativeKvGraphExpectation:
     output_names: tuple[str, ...]
     model_path: Path | None = None
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "graph_name": self.graph_name,
+            "ar": self.ar,
+            "input_names": list(self.input_names),
+            "output_names": list(self.output_names),
+            "model_path": None if self.model_path is None else str(self.model_path),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "NativeKvGraphExpectation":
+        """Rebuild from JSON, ``model_path`` included.
+
+        Dropping ``model_path`` here is not a cosmetic loss: QAIRT names each
+        graph by its ONNX stem, and the path is the only thing that maps that
+        stem back to this program's graph name. Without it the audit compares
+        SDK stems against our names and can never pass.
+        """
+
+        raw_path = value.get("model_path")
+        return cls(
+            graph_name=str(value["graph_name"]),
+            ar=int(value["ar"]),
+            input_names=tuple(str(name) for name in value["input_names"]),
+            output_names=tuple(str(name) for name in value["output_names"]),
+            model_path=None if raw_path is None else Path(str(raw_path)),
+        )
+
 
 @dataclass(frozen=True)
 class NativeKvAuditReport:
@@ -290,3 +356,96 @@ class Qwen35DerivationValidation:
     diagnostic_contexts: tuple[CompiledContextArtifact, ...]
     structural_report_path: Path
     runtime_results: tuple[Qwen35RuntimeValidationResult, ...]
+
+
+# --------------------------------------------------------------------------- #
+# The pipeline <-> adapter boundary
+# --------------------------------------------------------------------------- #
+
+
+@runtime_checkable
+class QairtAdapterProtocol(Protocol):
+    """The adapter surface the pipeline actually consumes.
+
+    The pipeline took its adapter through ``Callable[[], Any]``, so ~30 methods
+    crossed that boundary with no type at all: drift between the real adapter,
+    the 500-line test fake, and the call sites was caught only by eye. Declaring
+    the surface once lets a type checker compare all three against the same
+    thing.
+
+    Signatures are deliberately permissive (``*args``/``**kwargs`` where the
+    real method takes many keyword-only options): the value here is that the
+    *method exists with the right name and arity class*, which is exactly the
+    drift that used to go unnoticed. Tightening individual signatures is
+    incremental work that can follow.
+
+    Methods the pipeline probes with ``hasattr``/``getattr`` before calling --
+    ``load_compiled``, ``profile``, ``capture_device_execution``,
+    ``initialize_execution``, ``release_execution``, ``create_calibration_config``
+    -- are declared in :class:`QairtAdapterOptionalProtocol` instead, because an
+    adapter that lacks them still produces a valid (degraded, and labelled) run.
+    """
+
+    def preflight(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def build(self, *args: Any, **kwargs: Any) -> BuildResult: ...
+
+    def build_standalone_vit(self, *args: Any, **kwargs: Any) -> BuildResult: ...
+
+    def build_genai_container(
+        self, *args: Any, **kwargs: Any
+    ) -> GenAIContainerBuildResult: ...
+
+    def build_qwen35_omni_components(
+        self, *args: Any, **kwargs: Any
+    ) -> GenAIContainerBuildResult: ...
+
+    def ar_convert(self, *args: Any, **kwargs: Any) -> ModelVariantArtifact: ...
+
+    def transform(
+        self, *args: Any, **kwargs: Any
+    ) -> "tuple[TransformedSliceArtifact, ...]": ...
+
+    def convert(self, *args: Any, **kwargs: Any) -> ConvertedModelArtifact: ...
+
+    def quantize(self, *args: Any, **kwargs: Any) -> QuantizedModelArtifact: ...
+
+    def compile_context(
+        self, *args: Any, **kwargs: Any
+    ) -> CompiledContextArtifact: ...
+
+    def run_graph(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def create_genai_executor(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def clean_genai_executor(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
+@runtime_checkable
+class QairtAdapterOptionalProtocol(Protocol):
+    """Adapter methods the pipeline probes for before using.
+
+    Each of these has a documented degraded path: a missing
+    ``capture_device_execution`` publishes ``device_execution.available =
+    false`` with a reason rather than failing the benchmark, and a missing
+    ``profile`` refuses an optrace request by name. They are typed here so a
+    fake that *claims* to provide one is checked against the real signature.
+    """
+
+    def load_compiled(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def profile(self, *args: Any, **kwargs: Any) -> ProfileResult: ...
+
+    def capture_device_execution(
+        self, *args: Any, **kwargs: Any
+    ) -> "Mapping[str, Any]": ...
+
+    def initialize_execution(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def release_execution(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def create_calibration_config(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
+#: What ``QairtAgent(adapter_factory=...)`` must return.
+QairtAdapterFactory = Callable[[], QairtAdapterProtocol]

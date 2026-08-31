@@ -12,6 +12,10 @@ qairt-agent build --spec examples/qwen3_5_omni.json
 role before a build starts. The paths are deployment-shaped placeholders; make
 them point at mounted files in your project.
 
+These files show shapes; [`docs/spec-reference.md`](../docs/spec-reference.md)
+explains every field one can carry, including the `stage_configs` keys none of
+these examples exercise.
+
 | Example | Pipeline | Required model/vector inputs | Output root |
 |---|---|---|---|
 | `qwen3_dense.json` | low-level Python API | source ONNX (for example AR2073/CL4096), AIMET encodings, config, validation vectors | `/artifacts/qwen3` |

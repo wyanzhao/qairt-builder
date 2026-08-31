@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import pickle
 import zipfile
@@ -533,3 +534,57 @@ def test_isolate_rejects_malicious_input() -> None:
 
     with pytest.raises(PickleRejectedError):
         safe_load_pickle(pickle.dumps(Evil()), isolate=True, timeout=60.0)
+
+
+def test_the_import_skill_command_produces_a_usable_manifest(tmp_path) -> None:
+    """`.claude/skills/qairt-import-vectors` must work without T08's pickles.
+
+    The skill documents a NumPy-tree rehearsal so the per-AR wiring can be
+    practised before the real AIMET files exist; if that path breaks, the skill
+    is teaching something that does not run.
+    """
+
+    import pickle
+    import subprocess
+    import sys
+
+    source = tmp_path / "demo-vectors.pkl"
+    source.write_bytes(
+        pickle.dumps(
+            {
+                "inputs": {"x": np.ones((1, 64), dtype=np.float32)},
+                "goldens": {"y": np.zeros((1, 32), dtype=np.float32)},
+            }
+        )
+    )
+    destination = tmp_path / "imported"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "qairt_agent.cli",
+            "vectors",
+            "import-pickle",
+            str(source),
+            "--output-dir",
+            str(destination),
+            "--trusted-local",
+            "--format",
+            "auto",
+            "--section",
+            "auto",
+            "--isolate",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["execution_ready"] is True
+    # The filename the skill tells a spec to point at.
+    manifest = Path(payload["manifest_path"])
+    assert manifest.name == "vector_manifest.json"
+    assert manifest.is_file()

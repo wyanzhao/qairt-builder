@@ -57,6 +57,7 @@ from .preflight import (
     require_preflight,
 )
 from .types import (
+    without_live_sdk_objects,
     BuildResult,
     CompiledContextArtifact,
     ConvertedModelArtifact,
@@ -1146,6 +1147,140 @@ class QairtSdkAdapter:
                     f"{target.tuple_text}; refusing an SDK fallback"
                 )
 
+    @staticmethod
+    def _ar_graph_order_error(
+        index: int, ar_values: "Sequence[int]", graphs: "Sequence[Any]"
+    ) -> str | None:
+        """Prove the AR->graph binding instead of trusting list order.
+
+        Raw slices are bound to ARs positionally, and the ABI check that sits
+        beside it compares tensor *names* -- which are identical between an AR1
+        and an AR128 graph by construction, so it cannot see an inverted order.
+        The shapes can: some dimension carries the AR, and across the AR graphs
+        that dimension takes exactly the AR values, each once. Find such a
+        dimension and the order is proven; find none and the binding is
+        unprovable, which fails closed naming the graphs rather than guessing.
+
+        Returns ``None`` when the order is proven, otherwise the reason.
+        """
+
+        expected = tuple(int(value) for value in ar_values)
+        if len(expected) < 2:
+            # One graph for one AR: there is no order to invert.
+            return None
+
+        def shapes(attribute: str) -> list[list[tuple[int, ...]]]:
+            collected: list[list[tuple[int, ...]]] = []
+            for graph in graphs:
+                tensors = getattr(graph, attribute, ()) or ()
+                collected.append(
+                    [
+                        tuple(int(dim) for dim in (getattr(tensor, "dimensions", ()) or ()))
+                        for tensor in tensors
+                    ]
+                )
+            return collected
+
+        names = [str(getattr(graph, "name", "")) for graph in graphs]
+        observed: list[tuple[int, ...]] = []
+        for attribute in ("inputs", "outputs"):
+            per_graph = shapes(attribute)
+            if len({len(entry) for entry in per_graph}) != 1:
+                continue
+            for tensor_index in range(len(per_graph[0])):
+                tensor_shapes = [entry[tensor_index] for entry in per_graph]
+                if len({len(shape) for shape in tensor_shapes}) != 1:
+                    continue
+                for axis in range(len(tensor_shapes[0])):
+                    column = tuple(shape[axis] for shape in tensor_shapes)
+                    if len(set(column)) == len(column) and set(column) == set(expected):
+                        observed.append(column)
+
+        if not observed:
+            return (
+                f"split_{index} cannot prove its AR->graph binding: no tensor "
+                f"dimension distinguishes ARs {list(expected)} across graphs "
+                f"{names}; refusing a positional guess"
+            )
+        disagreeing = [column for column in observed if column != expected]
+        if disagreeing:
+            return (
+                f"split_{index} AR->graph order is inverted: graphs {names} "
+                f"carry AR order {list(disagreeing[0])} where the spec requests "
+                f"{list(expected)}"
+            )
+        return None
+
+    @staticmethod
+    def _release_published(
+        accumulator: list[Any], published: "Sequence[Any]"
+    ) -> None:
+        """Drop the live SDK references of artifacts that are now on disk.
+
+        Nothing downstream reads them: the pipeline strips these fields before
+        serializing and never consults them, and every in-build consumer
+        (convert, compile, the Qwen3.5 derivation check, native-KV stamping)
+        has already run by the time a slice's contexts are written. Holding
+        them anyway accumulates one live graph/model per (context length, AR,
+        slice) for the whole build -- invisible on the smoke fixture, an OOM
+        risk on a real multi-GB one.
+
+        The released copy still compares equal to the original, because the
+        live fields are declared ``compare=False``.
+        """
+
+        released = {
+            id(item): without_live_sdk_objects(item) for item in published
+        }
+        for index, item in enumerate(accumulator):
+            replacement = released.get(id(item))
+            if replacement is not None:
+                accumulator[index] = replacement
+
+    @classmethod
+    def _verify_genai_target(
+        cls, builder: Any, target: TargetEntry, *, component: str
+    ) -> dict[str, Any]:
+        """Verify what ``set_targets`` actually resolved on a GenAI builder.
+
+        The low-level lane refuses a compile whose resolved device target is
+        not the named one; the GenAI lane used to write the target spec and
+        then echo the *input* into the receipt, which reads like a resolved
+        value but proves nothing. QAIRT 2.49's builders assemble the same
+        ``CompileConfig`` the low-level path validates
+        (``htp_mixin.set_targets`` -> ``_compilation_config``), so the identical
+        guard applies -- including the empty-``device_custom_configs`` case,
+        which is the SDK's "skipping device config creation" fallback and must
+        fail closed whichever target was named.
+
+        If a builder exposes no compilation config at all, the receipt says
+        ``input_only`` rather than claiming a verification that did not happen.
+        """
+
+        config = getattr(builder, "_compilation_config", None)
+        if config is None:
+            return {
+                "status": "input_only",
+                "component": component,
+                "reason": (
+                    f"{type(builder).__name__} exposes no readable compilation "
+                    "config after set_targets; the target could not be read back"
+                ),
+                "surface": "_compilation_config",
+            }
+        cls._validate_compiler_target(config, target)
+        device_config = config.device_custom_configs[0]
+        dsp_arch = getattr(device_config, "dsp_arch", None)
+        return {
+            "status": "resolved_verified",
+            "component": component,
+            "surface": "_compilation_config.device_custom_configs",
+            "resolved": {
+                "dsp_arch": str(getattr(dsp_arch, "value", dsp_arch)),
+                "soc_model": int(getattr(device_config, "soc_model")),
+            },
+        }
+
     def compile_context(
         self,
         models: Sequence[ConvertedModelArtifact | str | Path | Any],
@@ -1958,6 +2093,11 @@ class QairtSdkAdapter:
                     (f"split_{index} exposes no graph metadata",),
                 )
             if len(graphs) == len(ar_values):
+                order_error = QairtSdkAdapter._ar_graph_order_error(
+                    index, ar_values, graphs
+                )
+                if order_error is not None:
+                    return ((), False, (order_error,))
                 graph_names_by_ar = {
                     int(ar): str(graph.name)
                     for ar, graph in zip(ar_values, graphs)
@@ -2350,6 +2490,9 @@ class QairtSdkAdapter:
             f"soc_model:{resolved_target.soc_model}"
         )
         builder.set_targets([target_spec])
+        target_verification = self._verify_genai_target(
+            builder, resolved_target, component="text"
+        )
 
         if resolved_profile.family is FamilyId.QWEN3_5:
             builder.skip_ar_conversion = False
@@ -2380,6 +2523,7 @@ class QairtSdkAdapter:
         builder.weight_sharing = weight_sharing
 
         vision_builder: Any = None
+        vision_target_verification: dict[str, Any] | None = None
         if is_multimodal:
             assert resolved_vision_model_path is not None
             assert resolved_vision_encodings_path is not None
@@ -2406,6 +2550,9 @@ class QairtSdkAdapter:
                 resolved_vision_encodings_path
             )
             vision_builder.set_targets([target_spec])
+            vision_target_verification = self._verify_genai_target(
+                vision_builder, resolved_target, component="vision"
+            )
             workflow_graph = self.create_qwen3_vl_workflow_config(
                 vision_path=resolved_vision_model_path,
                 text_path=source_model_path,
@@ -2547,6 +2694,13 @@ class QairtSdkAdapter:
                         "chipset": resolved_target.chipset,
                         "dsp_arch": resolved_target.dsp_arch,
                         "soc_model": resolved_target.soc_model,
+                        # What set_targets resolved, not an echo of the input.
+                        "verification": target_verification,
+                        **(
+                            {"vision_verification": vision_target_verification}
+                            if vision_target_verification is not None
+                            else {}
+                        ),
                     },
                     "sequence": {
                         "ar_values": normalized_ars,
@@ -2867,8 +3021,14 @@ class QairtSdkAdapter:
             f"soc_model:{resolved_target.soc_model}"
         )
         audio_builder.set_targets([target_spec])
+        audio_target_verification = self._verify_genai_target(
+            audio_builder, resolved_target, component="audio"
+        )
         text_builder.encodings_path = str(text_encodings)
         text_builder.set_targets([target_spec])
+        text_target_verification = self._verify_genai_target(
+            text_builder, resolved_target, component="text"
+        )
         text_builder.skip_ar_conversion = False
         text_builder.set_transformation_options(
             options={
@@ -2980,6 +3140,8 @@ class QairtSdkAdapter:
                         "chipset": resolved_target.chipset,
                         "dsp_arch": resolved_target.dsp_arch,
                         "soc_model": resolved_target.soc_model,
+                        "verification": text_target_verification,
+                        "audio_verification": audio_target_verification,
                     },
                     "configs": {
                         "audio": str(audio_model_config),
@@ -3050,8 +3212,16 @@ class QairtSdkAdapter:
         ]
         | None = None,
         qwen35_validation_payload: Any = None,
+        on_publish: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> BuildResult:
         """Compose the production path: one context per slice+CL, ARs inside.
+
+        ``on_publish`` is called once per ``(context_length, slice)`` after its
+        contexts are written, with the slice name, ARs and output paths. A
+        build stage that dies partway can then *report* exactly what completed
+        -- this is not resume, which needs its own task; it is the evidence a
+        resume would have to be built on, and what lets a real run quantify
+        what a from-zero restart costs.
 
         The method reads the canonical nested fields by name but remains
         duck-typed so the contracts module can evolve independently.
@@ -3658,6 +3828,38 @@ class QairtSdkAdapter:
                                     compile_config_options=diagnostic_compile_options,
                                 )
                             )
+
+                if on_publish is not None:
+                    on_publish(
+                        {
+                            "context_length": context_length,
+                            "slice_name": slice_name,
+                            "ar_values": list(selected_ars),
+                            "weight_sharing": bool(weight_sharing),
+                            "converted_models": [
+                                str(item.model_path)
+                                for item in converted_for_slice
+                                if item.model_path is not None
+                            ],
+                            "contexts": [
+                                str(item.context_binary_path)
+                                for item in contexts
+                                if item.slice_name == slice_name
+                                and item.context_length == context_length
+                            ],
+                        }
+                    )
+
+                # This slice's converted models and transformed graphs are on
+                # disk and recorded; release their live SDK objects before the
+                # next slice allocates its own.
+                self._release_published(converted, converted_for_slice)
+                self._release_published(transformed, ordered_slices)
+
+            # Every artifact this context length produced is published; the
+            # variants' live graph contexts are no longer reachable from the
+            # accumulated build state.
+            self._release_published(variants, variants_for_cl)
 
         if family_profile.family is FamilyId.QWEN3_VL:
             vision_source = _first(spec, (("sources", "vision"), ("vision_source",)))

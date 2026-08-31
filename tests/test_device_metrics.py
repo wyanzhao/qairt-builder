@@ -331,3 +331,54 @@ class DeviceExecutionFailClosedTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------- #
+# Partial-sample aggregation is marked (T16)
+# --------------------------------------------------------------------------- #
+
+
+def _execute_block(**overrides):
+    block = {
+        "schema": "qairt-agent.device-execution/2",
+        "accelerator_compute_us": 77.0,
+        "accelerator_execute_us": 1800.0,
+        "qnn_execute_us": 2000.0,
+    }
+    block.update(overrides)
+    return block
+
+
+def test_a_full_sample_set_is_not_marked_partial() -> None:
+    aggregated = aggregate_device_executions(
+        [_execute_block() for _ in range(10)], requested=10
+    )
+
+    assert aggregated["partial"] is False
+    assert aggregated["samples_requested"] == 10
+    assert aggregated["samples_used"] == 10
+
+
+def test_fewer_samples_than_requested_are_marked_with_both_counts() -> None:
+    # The contract says ten profiled executes; averaging three under the same
+    # label is a different statistic wearing the same name.
+    aggregated = aggregate_device_executions(
+        [_execute_block() for _ in range(3)], requested=10
+    )
+
+    assert aggregated["partial"] is True
+    assert aggregated["samples_requested"] == 10
+    assert aggregated["samples_used"] == 3
+    assert "3 of 10" in aggregated["partial_reason"]
+
+
+def test_a_metric_missing_from_some_samples_is_named() -> None:
+    blocks = [_execute_block() for _ in range(10)]
+    for block in blocks[:4]:
+        del block["accelerator_compute_us"]
+
+    aggregated = aggregate_device_executions(blocks, requested=10)
+
+    assert aggregated["partial"] is True
+    assert aggregated["partial_metrics"] == {"accelerator_compute_us": 6}
+    assert aggregated["samples_used_by_metric"]["accelerator_execute_us"] == 10

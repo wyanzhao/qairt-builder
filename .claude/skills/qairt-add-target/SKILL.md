@@ -41,6 +41,15 @@ QAIRT_AGENT_TARGET_ACCEPTANCE=<name> qairt-agent workflow --spec <spec>
 Set it for that run only, then record the outcome in the registry entry:
 SDK build id, date, the device string, and how it was qualified.
 
+The acceptance run is also what confirms the `soc_id` list. Every device stage
+compares the handset's reported `soc_id` against the entry's list and fails
+closed on a contradiction — but for the qualifying run that check is downgraded
+to a recorded warning, exactly because the list is one of the things being
+confirmed. Read the run's `device_soc` record (or `qairt-agent device doctor`),
+and copy the observed id into the entry before marking it verified. Leaving the
+list wrong means every later run either refuses the handset or, if the list is
+empty, records `not_recorded` and proves nothing.
+
 `python tools/make_smoke_fixture.py --target <name>` generates a runnable
 fixture for the target, so qualification needs no proprietary model.
 
@@ -51,6 +60,22 @@ tuple — so a resolved-value check cannot distinguish an intended target from a
 silent fallback. An empty `device_custom_configs` list (the SDK's "skipping
 device config creation" path) therefore fails closed in its own right,
 whichever target was named. Do not weaken that guard.
+
+## The steps that are easy to miss
+
+1. **Deployment cell.** If the target is meant to be launched from, add
+   `configs/{preset}/{name}.json`. A test resolves every cell, requires the
+   directory/file names to agree with the preset and target inside, and
+   requires that target to be verified — so a cell for an unqualified target
+   fails the suite while a registry entry alone does not.
+2. **Packaging.** The wheel ships `harness/targets` as a directory, so a new
+   entry is included automatically. It was a per-file list, and adding a target
+   used to ship a wheel silently missing it; `tests/test_packaging.py` keeps
+   that from coming back.
+3. **The registry tests are structural.** They check that names agree with
+   filenames and that no two entries share a tuple, and they require a
+   `verified` block only for the *active* target and any target a `configs/`
+   cell deploys. An entry committed ahead of its acceptance run passes.
 
 ## Verify
 

@@ -4,7 +4,8 @@ A walkthrough from a fresh clone to a real report on a real device, using a
 fixture this repository can generate. Nothing here needs a proprietary model.
 
 The other documents are reference material: [`README.md`](../README.md) covers
-installation and the spec schema, [`native-workflow.md`](native-workflow.md)
+installation and the spec schema, [`spec-reference.md`](spec-reference.md) for
+every field a spec can carry, [`native-workflow.md`](native-workflow.md)
 covers every stage in detail, [`architecture.md`](architecture.md) covers why
 the pieces are shaped the way they are, and [`worker-runtimes.md`](worker-runtimes.md)
 covers container and ADB setup. This page is the ordered path through them.

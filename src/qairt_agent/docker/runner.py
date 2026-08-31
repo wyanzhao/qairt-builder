@@ -25,6 +25,15 @@ from qairt_agent.docker.image import (
     RuntimeMounts,
     WORKER_PYTHONPATH,
 )
+from qairt_agent.container_runtime import (
+    SDK_MOUNT_TARGET,
+    SMOKE_COMMAND,
+    WORKER_WORKDIR,
+    flatten_env,
+    image_build_args,
+    resolve_harness_build_path,
+    worker_smoke_env,
+)
 from qairt_agent.errors import DockerUnavailableError
 from qairt_agent.harness import (
     DEFAULT_CONSTRAINTS,
@@ -179,24 +188,21 @@ class DockerRunner:
 
         self.require_available()
         context_path = Path(context).expanduser().resolve()
-        constraints_path = self.constraints.source_path.expanduser().resolve()
-        try:
-            harness_build_path = constraints_path.relative_to(
-                context_path
-            ).as_posix()
-        except ValueError:
-            if constraints_path == DEFAULT_CONSTRAINTS.source_path.resolve():
-                harness_build_path = DEFAULT_CONSTRAINTS_LOGICAL_PATH
-            else:
-                raise DockerUnavailableError(
+        harness_build_path = resolve_harness_build_path(
+            self.constraints,
+            context_path,
+            on_outside_context=lambda constraints_path, resolved_context: (
+                DockerUnavailableError(
                     "selected harness constraints must be inside the image "
                     "build context",
                     stage="docker-build",
                     details={
                         "constraints": str(constraints_path),
-                        "context": str(context_path),
+                        "context": str(resolved_context),
                     },
                 )
+            ),
+        )
         image_ref = self.image.image_ref if self.image else DEFAULT_IMAGE_REF
         platform_name = self.image.platform if self.image else DEFAULT_PLATFORM
         argv = [
@@ -208,18 +214,7 @@ class DockerRunner:
             str(Path(dockerfile)),
             "--tag",
             image_ref,
-            "--build-arg",
-            f"UBUNTU_VERSION={self.constraints.ubuntu_version}",
-            "--build-arg",
-            f"PYTHON_VERSION={self.constraints.python_version}",
-            "--build-arg",
-            f"QAIRT_DEPENDENCIES_FILE={self.constraints.dependencies_file}",
-            "--build-arg",
-            f"HARNESS_CONSTRAINTS_FILE={harness_build_path}",
-            "--build-arg",
-            f"TORCH_VERSION={self.constraints.torch_version}",
-            "--build-arg",
-            f"TORCH_INDEX_URL={self.constraints.torch_index_url}",
+            *image_build_args(self.constraints, harness_build_path),
             str(context_path),
         ]
         result = self._executor(argv)
@@ -249,26 +244,17 @@ class DockerRunner:
             "--rm",
             "--platform",
             platform_name,
+            # Docker gives real IP-egress isolation here; Apple `container`
+            # only offers --no-dns, and says so at its own call site.
             "--network",
             "none",
             "--workdir",
-            "/opt/qairt-agent",
-            "-e",
-            "QAIRT_SDK_ROOT=/opt/qairt",
-            "-e",
-            "QNN_SDK_ROOT=/opt/qairt",
-            "-e",
-            "QAIRT_AGENT_HARNESS_CONSTRAINTS=/opt/qairt-agent/harness/constraints.json",
-            "-e",
-            f"PYTHONPATH={WORKER_PYTHONPATH}",
-            "-e",
-            "LD_LIBRARY_PATH=/opt/qairt/lib/x86_64-linux-clang",
+            WORKER_WORKDIR,
+            *flatten_env(worker_smoke_env(), flag="-e"),
             "-v",
-            f"{resolved_sdk}:/opt/qairt:ro",
+            f"{resolved_sdk}:{SDK_MOUNT_TARGET}:ro",
             image_ref,
-            "/opt/venv/bin/python",
-            "-m",
-            "qairt_agent.docker.smoke",
+            *SMOKE_COMMAND,
         ]
 
     def smoke_test_sdk(self, *, sdk_root: str | Path) -> Any:

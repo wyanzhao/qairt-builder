@@ -106,10 +106,54 @@ def sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> tuple[str
     return digest.hexdigest(), size_bytes
 
 
+#: Verifications this process has already done, keyed by what could invalidate
+#: them: the exact path, its stat identity, and the digest that was expected.
+#:
+#: Every continuation stage re-hashes all cumulative artifacts at its
+#: boundaries. On the smoke fixture that is free; on a real build it is
+#: repeated full reads of multi-GB context binaries within one worker process.
+#: Cross-process and cross-run behaviour is unchanged -- a cold start still
+#: reads and hashes everything -- and a file whose stat moved is always
+#: re-hashed in full, so this never accepts a changed artifact.
+_VERIFIED: dict[tuple[str, int, int, str], None] = {}
+
+#: Counters for the stage diagnostics, so the evidence trail shows what was
+#: re-hashed versus stat-checked rather than implying everything was re-read.
+_VERIFICATION_COUNTS = {"full": 0, "cached": 0}
+
+
+def verification_statistics() -> dict[str, int]:
+    """Full re-hashes and cache hits since the last reset, for stage records."""
+
+    return dict(_VERIFICATION_COUNTS)
+
+
+def reset_verification_cache() -> None:
+    """Forget every cached verification (used by tests and worker startup)."""
+
+    _VERIFIED.clear()
+    _VERIFICATION_COUNTS.update({"full": 0, "cached": 0})
+
+
 def verify_artifact(ref: ArtifactRef) -> None:
     """Raise when a referenced artifact is missing, resized, or rehashed."""
 
+    try:
+        status = os.stat(ref.path)
+    except OSError:
+        # Let the hashing path produce the usual missing/unreadable failure.
+        status = None
+    key = (
+        (str(ref.path), status.st_mtime_ns, status.st_size, ref.sha256)
+        if status is not None
+        else None
+    )
+    if key is not None and key in _VERIFIED:
+        _VERIFICATION_COUNTS["cached"] += 1
+        return
+
     actual_sha256, actual_size = sha256_file(ref.path)
+    _VERIFICATION_COUNTS["full"] += 1
     if actual_sha256 != ref.sha256 or actual_size != ref.size_bytes:
         raise ArtifactIntegrityError(
             f"artifact integrity check failed: {ref.path}",
@@ -121,6 +165,8 @@ def verify_artifact(ref: ArtifactRef) -> None:
                 "actual_size_bytes": actual_size,
             },
         )
+    if key is not None:
+        _VERIFIED[key] = None
 
 
 def _fsync_directory(path: Path) -> None:
@@ -511,7 +557,9 @@ __all__ = [
     "ManifestStore",
     "atomic_publish_json",
     "canonical_json_bytes",
+    "reset_verification_cache",
     "sha256_file",
+    "verification_statistics",
     "verify_artifact",
     "verify_manifest_graph",
 ]

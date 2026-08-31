@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import tempfile
 import unittest
+import weakref
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +35,7 @@ from qairt_agent.qairt_adapter import (
     Qwen35ValidationEvidence,
     Qwen35RuntimeValidationResult,
     TransformedSliceArtifact,
+    without_live_sdk_objects,
     audit_native_kv_config,
     expected_tensors,
 )
@@ -705,34 +708,109 @@ class AdapterTests(unittest.TestCase):
             ],
         )
 
-    def test_saved_genai_raw_slices_bind_public_graph_metadata(self) -> None:
-        def graph(name: str) -> Any:
-            return SimpleNamespace(
-                name=name,
-                inputs=[SimpleNamespace(name="x")],
-                outputs=[SimpleNamespace(name="y")],
-            )
+    @staticmethod
+    def _ar_graph(name: str, ar: int | None) -> Any:
+        """A public graph-metadata stand-in with the AR in its shapes.
 
-        container = SimpleNamespace(
-            models=[
-                SimpleNamespace(
-                    graphs_info=[
-                        graph("decoder_ar1"),
-                        graph("decoder_ar128"),
-                    ]
-                )
-            ]
+        A real ``TensorInfo`` always carries ``dimensions``; the AR-bearing
+        dimension is what distinguishes an AR1 graph from an AR128 one, since
+        their tensor *names* are identical by construction.
+        """
+
+        dimensions = [1, 4] if ar is None else [1, ar, 4]
+        return SimpleNamespace(
+            name=name,
+            inputs=[SimpleNamespace(name="x", dimensions=list(dimensions))],
+            outputs=[SimpleNamespace(name="y", dimensions=list(dimensions))],
         )
+
+    @classmethod
+    def _raw_slice_container(cls, graphs: list[Any]) -> Any:
+        return SimpleNamespace(models=[SimpleNamespace(graphs_info=graphs)])
+
+    @staticmethod
+    def _raw_slices_from(container: Any, ars: tuple[int, ...]) -> Any:
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory)
             model_path = destination / "models" / "split_0" / "model.bin"
             model_path.parent.mkdir(parents=True)
             model_path.write_bytes(b"context")
-            slices, supported, notes = QairtSdkAdapter._saved_genai_raw_slices(
-                container,
-                destination,
-                (1, 128),
+            return QairtSdkAdapter._saved_genai_raw_slices(
+                container, destination, ars
             )
+
+    @staticmethod
+    def _registry_target() -> Any:
+        return resolve_target("sm8750")
+
+    def test_genai_target_verification_reads_back_the_resolved_target(self) -> None:
+        target = self._registry_target()
+        builder = SimpleNamespace(
+            _compilation_config=SimpleNamespace(
+                device_custom_configs=[
+                    SimpleNamespace(
+                        soc_model=target.soc_model,
+                        dsp_arch=SimpleNamespace(value=target.dsp_arch),
+                    )
+                ]
+            )
+        )
+
+        verification = QairtSdkAdapter._verify_genai_target(
+            builder, target, component="text"
+        )
+
+        self.assertEqual(verification["status"], "resolved_verified")
+        self.assertEqual(verification["resolved"]["soc_model"], target.soc_model)
+        self.assertEqual(verification["resolved"]["dsp_arch"], target.dsp_arch)
+
+    def test_genai_target_verification_refuses_a_different_resolved_target(self) -> None:
+        target = self._registry_target()
+        builder = SimpleNamespace(
+            _compilation_config=SimpleNamespace(
+                device_custom_configs=[
+                    SimpleNamespace(
+                        soc_model=target.soc_model + 1,
+                        dsp_arch=SimpleNamespace(value=target.dsp_arch),
+                    )
+                ]
+            )
+        )
+
+        with self.assertRaises(QairtConfigurationError) as caught:
+            QairtSdkAdapter._verify_genai_target(builder, target, component="text")
+
+        self.assertIn("refusing an SDK fallback", str(caught.exception))
+
+    def test_genai_target_verification_refuses_an_empty_device_config(self) -> None:
+        # The SDK's "skipping device config creation" path leaves the compiler
+        # on defaults that happen to be the SM8750 tuple, so an empty list can
+        # never be read as agreement.
+        target = self._registry_target()
+        builder = SimpleNamespace(
+            _compilation_config=SimpleNamespace(device_custom_configs=[])
+        )
+
+        with self.assertRaises(QairtConfigurationError):
+            QairtSdkAdapter._verify_genai_target(builder, target, component="text")
+
+    def test_genai_target_verification_says_input_only_when_unreadable(self) -> None:
+        # No readable resolved value: the receipt must say so rather than
+        # presenting the input echo as a verified resolution.
+        target = self._registry_target()
+
+        verification = QairtSdkAdapter._verify_genai_target(
+            SimpleNamespace(), target, component="text"
+        )
+
+        self.assertEqual(verification["status"], "input_only")
+        self.assertIn("no readable compilation config", verification["reason"])
+
+    def test_saved_genai_raw_slices_bind_public_graph_metadata(self) -> None:
+        container = self._raw_slice_container(
+            [self._ar_graph("decoder_ar1", 1), self._ar_graph("decoder_ar128", 128)]
+        )
+        slices, supported, notes = self._raw_slices_from(container, (1, 128))
 
         self.assertTrue(supported)
         self.assertTrue(notes)
@@ -743,6 +821,31 @@ class AdapterTests(unittest.TestCase):
         )
         self.assertEqual(slices[0].input_names, ("x",))
         self.assertEqual(slices[0].output_names, ("y",))
+
+    def test_saved_genai_raw_slices_detect_an_inverted_ar_graph_order(self) -> None:
+        # The tensor names are identical between AR graphs, so the name-only
+        # ABI check cannot see this; only the shapes can.
+        container = self._raw_slice_container(
+            [self._ar_graph("decoder_ar128", 128), self._ar_graph("decoder_ar1", 1)]
+        )
+        slices, supported, notes = self._raw_slices_from(container, (1, 128))
+
+        self.assertFalse(supported)
+        self.assertEqual(slices, ())
+        self.assertIn("inverted", " ".join(notes))
+        self.assertIn("decoder_ar128", " ".join(notes))
+
+    def test_saved_genai_raw_slices_refuse_an_unprovable_ar_binding(self) -> None:
+        # No dimension distinguishes the ARs: guessing positionally here is
+        # exactly what the guard exists to prevent.
+        container = self._raw_slice_container(
+            [self._ar_graph("decoder_a", None), self._ar_graph("decoder_b", None)]
+        )
+        slices, supported, notes = self._raw_slices_from(container, (1, 128))
+
+        self.assertFalse(supported)
+        self.assertEqual(slices, ())
+        self.assertIn("cannot prove", " ".join(notes))
 
     def test_standalone_vit_uses_convert_then_single_graph_compile(self) -> None:
         adapter = self._adapter()
@@ -2460,3 +2563,88 @@ def get_family_profile_for_test(family: FamilyId):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiveObjectRetentionTests(unittest.TestCase):
+    """A published slice must not keep its live SDK objects reachable (T20)."""
+
+    def test_releasing_a_published_slice_drops_its_live_objects(self) -> None:
+        class LiveGraph:
+            pass
+
+        graph = LiveGraph()
+        model = LiveGraph()
+        transformed = TransformedSliceArtifact(
+            slice_name="decoder_00",
+            split_index=0,
+            model_path=Path("/m/decoder_00_ar1.onnx"),
+            encodings_path=None,
+            ar=1,
+            context_length=4096,
+            graph_context=graph,
+        )
+        converted = ConvertedModelArtifact(
+            model_path=Path("/m/decoder_00_ar1.dlc"),
+            source_model_path=Path("/m/decoder_00_ar1.onnx"),
+            quantization_mode="apply_encodings",
+            slice_name="decoder_00",
+            ar=1,
+            context_length=4096,
+            sdk_model=model,
+        )
+        accumulated_transformed = [transformed]
+        accumulated_converted = [converted]
+        graph_ref = weakref.ref(graph)
+        model_ref = weakref.ref(model)
+
+        QairtSdkAdapter._release_published(accumulated_transformed, [transformed])
+        QairtSdkAdapter._release_published(accumulated_converted, [converted])
+        del transformed, converted, graph, model
+        gc.collect()
+
+        self.assertIsNone(accumulated_transformed[0].graph_context)
+        self.assertIsNone(accumulated_converted[0].sdk_model)
+        # Nothing in the accumulated build state keeps them alive.
+        self.assertIsNone(graph_ref())
+        self.assertIsNone(model_ref())
+
+    def test_a_released_artifact_still_compares_equal(self) -> None:
+        # Releasing changes what is reachable, not what the artifact means, so
+        # every identity/reuse comparison downstream is unaffected.
+        artifact = ConvertedModelArtifact(
+            model_path=Path("/m/a.dlc"),
+            source_model_path=Path("/m/a.onnx"),
+            quantization_mode="apply_encodings",
+            slice_name="decoder_00",
+            ar=1,
+            context_length=4096,
+            sdk_model=object(),
+        )
+
+        self.assertEqual(without_live_sdk_objects(artifact), artifact)
+
+    def test_release_leaves_artifacts_it_was_not_given_alone(self) -> None:
+        keep = TransformedSliceArtifact(
+            slice_name="decoder_01",
+            split_index=1,
+            model_path=Path("/m/decoder_01_ar1.onnx"),
+            encodings_path=None,
+            ar=1,
+            context_length=4096,
+            graph_context=object(),
+        )
+        drop = TransformedSliceArtifact(
+            slice_name="decoder_00",
+            split_index=0,
+            model_path=Path("/m/decoder_00_ar1.onnx"),
+            encodings_path=None,
+            ar=1,
+            context_length=4096,
+            graph_context=object(),
+        )
+        accumulator = [keep, drop]
+
+        QairtSdkAdapter._release_published(accumulator, [drop])
+
+        self.assertIsNotNone(accumulator[0].graph_context)
+        self.assertIsNone(accumulator[1].graph_context)

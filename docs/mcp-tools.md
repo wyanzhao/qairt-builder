@@ -7,18 +7,23 @@ The agent no longer orchestrates a dozen fine-grained tools; it submits a job
 and polls/watches it by id.
 
 ```text
-submit_job(spec, stages?, from_job?)  -> {job_id, state, status_path}
+submit_job(spec, stages?, from_job?, inline?) -> {job_id, state, status_path,
+                                                 worker_pid, execution}
 get_job(job_id, after_seq?)           -> {status, events}
 cancel_job(job_id)                    -> {ok, job_id}
 resume_job(job_id)                    -> {job_id, state, status_path}
 ```
 
-- `submit_job` returns immediately; the job keeps running in a detached worker.
-  `stages` defaults to `["build"]`; pass
-  `["build","validate","benchmark"]` for the standard workflow. Submit
-  `["diagnose"]` from that job only after a reported regression. `from_job`
-  seeds the initial manifest for a continuation
-  (`validate`/`benchmark`/`diagnose`).
+- `submit_job` returns immediately and the job runs in the **detached pinned
+  worker** — the same launch the CLI uses, so the job survives the MCP process
+  and gets the pinned environment. `execution` says `detached`, and
+  `worker_pid` names the process. `stages` defaults to the CLI workflow set
+  `["build","validate","benchmark"]`. Submit `["diagnose"]` from that job only
+  after a reported regression. `from_job` seeds the initial manifest for a
+  continuation (`validate`/`benchmark`/`diagnose`).
+- `inline: true` runs the job in the calling process instead. It is explicit
+  only, for tests or a short run inside a compatible worker environment, and
+  never a silent fallback — same rule as the CLI's `--inline`.
 - `get_job` returns the current `JobStatus` plus events after `after_seq`, so
   a watch can resume from the last sequence number it saw.
 - `cancel_job` sets the journal cancel flag; the worker stops before the next
@@ -152,9 +157,12 @@ worker and resumable journal.
 ## Reports and errors
 
 Quality operations report `full_reference`, `teacher_forced`, and `chain`
-comparisons. Benchmark operations report warmed production-wall latency and
-optional op work attribution. Neither operation applies an SQNR or latency
-pass/fail threshold.
+comparisons. Benchmark operations report device time: the published latency is
+`production_latency_us`, QAIRT's accelerator compute time read from its own
+profiling log, with optional op work attribution beside it. The host wall-clock
+number is not latency and appears only under `harness_diagnostics`, marked
+`not_latency: true`. Neither operation applies an SQNR or latency pass/fail
+threshold.
 
 Tool failures use:
 

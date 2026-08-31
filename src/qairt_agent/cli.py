@@ -27,7 +27,9 @@ from qairt_agent import project
 from qairt_agent.agent import QairtAgentClient
 from qairt_agent.apple_container import AppleContainerRunner
 from qairt_agent.artifacts import sha256_file
+from qairt_agent.compare import compare_runs
 from qairt_agent.contracts import JobState, StageProvenance
+from qairt_agent.jobs.journal import IN_FLIGHT_JOB_STATES
 from qairt_agent.device.adb import canonicalize_adb_server
 from qairt_agent.docker import (
     BindMount,
@@ -681,10 +683,29 @@ def _spawn_worker(job_id: str, jobs_root: Path) -> int:
         raise ToolError(error) from exc
 
 
-def _follow(client: QairtAgentClient, job_id: str, out: TextIO, *, poll: float = 0.05) -> dict[str, Any]:
-    """Stream events as JSONL until the job is terminal; return final status."""
+def _follow(
+    client: QairtAgentClient,
+    job_id: str,
+    out: TextIO,
+    *,
+    poll: float = 0.05,
+    timeout: float | None = None,
+    clock: Any = time.monotonic,
+) -> dict[str, Any]:
+    """Stream events as JSONL until the job stops progressing; return status.
+
+    ``ORPHANED`` is deliberately not a terminal state -- an orphaned job can be
+    resumed -- but that made this loop spin forever whenever a worker died
+    uncleanly: the state stays in-flight and the heartbeat simply stops. The
+    watch therefore checks heartbeat staleness on each poll with the same
+    threshold recovery uses, and exits with a structured event instead of
+    hanging. Marking the job orphaned needs the worker lease, so the watch
+    reports the condition read-only and leaves the transition to ``resume``.
+    """
 
     seen = 0
+    started = clock()
+    stale_after = getattr(client, "heartbeat_stale_after", None)
     while True:
         handle = client.job(job_id)
         for event in handle.events(after_seq=seen):
@@ -693,6 +714,47 @@ def _follow(client: QairtAgentClient, job_id: str, out: TextIO, *, poll: float =
         status = handle.status()
         if status.state.terminal:
             final = status.model_dump(mode="json")
+            _emit(out, {"type": "final", "status": final})
+            return final
+        if (
+            stale_after
+            and status.state in IN_FLIGHT_JOB_STATES
+            and handle.journal.heartbeat_stale(stale_after)
+        ):
+            final = status.model_dump(mode="json")
+            final["state"] = JobState.ORPHANED.value
+            _emit(
+                out,
+                {
+                    "type": "orphaned",
+                    "job_id": job_id,
+                    "observed_state": status.state.value,
+                    "heartbeat_at": (
+                        status.heartbeat_at.isoformat()
+                        if status.heartbeat_at is not None
+                        else None
+                    ),
+                    "stale_after_seconds": stale_after,
+                    "note": (
+                        "the worker heartbeat went stale; the job is not marked "
+                        "ORPHANED here because that transition needs the worker "
+                        "lease -- use 'qairt-agent job resume' to recover it"
+                    ),
+                },
+            )
+            _emit(out, {"type": "final", "status": final})
+            return final
+        if timeout is not None and (clock() - started) >= timeout:
+            final = status.model_dump(mode="json")
+            _emit(
+                out,
+                {
+                    "type": "watch_timeout",
+                    "job_id": job_id,
+                    "observed_state": status.state.value,
+                    "timeout_seconds": timeout,
+                },
+            )
             _emit(out, {"type": "final", "status": final})
             return final
         time.sleep(poll)
@@ -724,6 +786,7 @@ def _run_stage_command(
         _emit(out, {"ok": False, "error": "a --spec is required"})
         return 2
 
+    spec = _apply_diagnose_overrides(client, args, spec)
     handle = client.prepare(spec, stages=stages, initial_manifest_job=from_job)
 
     if args.inline:
@@ -859,6 +922,71 @@ def _effective_target(build_spec: Any) -> dict[str, Any]:
     }
 
 
+def _job_manifest(client: QairtAgentClient, job_id: str) -> Any:
+    """The manifest a finished job published, or a structured refusal."""
+
+    status = client.job(job_id).status()
+    if status.manifest is None:
+        raise InvalidSpecError(
+            f"job '{job_id}' has published no manifest to compare",
+            stage="compare",
+            details={"job_id": job_id, "state": status.state.value},
+        )
+    return status.manifest
+
+
+def _compare_side(
+    client: QairtAgentClient, job: str | None, manifest: str | None, label: str
+) -> Any:
+    if (job is None) == (manifest is None):
+        raise InvalidSpecError(
+            f"compare needs exactly one of --{label}-job / --{label}-manifest",
+            stage="compare",
+        )
+    return _job_manifest(client, job) if job is not None else Path(manifest)
+
+
+def _apply_diagnose_overrides(
+    client: QairtAgentClient, args: argparse.Namespace, spec: Any
+) -> Any:
+    """Fold --baseline/--kind into the spec's diagnose stage config.
+
+    The engine reads the diagnose lane from ``stage_configs.diagnose``, so the
+    flags land there rather than opening a second, divergent path into the
+    stage.
+    """
+
+    baseline = getattr(args, "baseline", None)
+    kind = getattr(args, "kind", None)
+    if baseline is None and kind is None:
+        return spec
+
+    payload = client._normalize_spec(spec).model_dump(mode="json")  # noqa: SLF001
+    stage_configs = dict(payload.get("stage_configs") or {})
+    diagnose = dict(stage_configs.get("diagnose") or {})
+    config = dict(diagnose.get("config") or {})
+    if kind is not None:
+        diagnose["kind"] = kind
+        config["kind"] = kind
+    if baseline is not None:
+        config["baseline_manifest"] = str(_job_manifest(client, baseline).path)
+    diagnose["config"] = config
+    stage_configs["diagnose"] = diagnose
+    payload["stage_configs"] = stage_configs
+    return payload
+
+
+def _cmd_compare(
+    args: argparse.Namespace, client: QairtAgentClient, out: TextIO, spawner: Any
+) -> int:
+    """Report-only delta between two verified runs."""
+
+    baseline = _compare_side(client, args.from_job, args.from_manifest, "from")
+    candidate = _compare_side(client, args.to_job, args.to_manifest, "to")
+    _emit(out, {"ok": True, **compare_runs(baseline, candidate)})
+    return 0
+
+
 def _cmd_plan(args: argparse.Namespace, client: QairtAgentClient, out: TextIO, spawner: Any) -> int:
     workflow_spec = client._normalize_spec(args.spec)  # noqa: SLF001 - CLI uses the normalizer
     resolved = resolve_workflow(workflow_spec)
@@ -891,7 +1019,7 @@ def _cmd_job(args: argparse.Namespace, client: QairtAgentClient, out: TextIO, sp
         return 0
     if action == "watch":
         if args.follow:
-            _follow(client, args.job_id, out)
+            _follow(client, args.job_id, out, timeout=getattr(args, "timeout", None))
         else:
             for event in client.job(args.job_id).events(after_seq=args.after_seq):
                 _emit(out, event)
@@ -1283,6 +1411,22 @@ def build_parser() -> argparse.ArgumentParser:
         stage_parser.add_argument("--from-job", dest="from_job", default=None)
         stage_parser.add_argument("--follow", action="store_true")
         stage_parser.add_argument("--inline", action="store_true")
+        if command == "diagnose":
+            stage_parser.add_argument(
+                "--baseline",
+                default=None,
+                help=(
+                    "job id of a comparable earlier run; its verified reports "
+                    "are compared against this one so the diagnosis reports "
+                    "which path the measured change points at"
+                ),
+            )
+            stage_parser.add_argument(
+                "--kind",
+                choices=("quality", "latency"),
+                default=None,
+                help="run one diagnosis path explicitly instead of both",
+            )
 
     p_workflow = sub.add_parser(
         "workflow",
@@ -1299,6 +1443,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_rerun.add_argument("--follow", action="store_true")
     p_rerun.add_argument("--inline", action="store_true")
 
+    p_compare = sub.add_parser(
+        "compare",
+        help=(
+            "report-only delta of production latency and SQNR between two "
+            "verified runs; no pass/fail verdict is produced"
+        ),
+    )
+    p_compare.add_argument("--from-job", dest="from_job", default=None)
+    p_compare.add_argument("--from-manifest", dest="from_manifest", default=None)
+    p_compare.add_argument("--to-job", dest="to_job", default=None)
+    p_compare.add_argument("--to-manifest", dest="to_manifest", default=None)
+
     p_job = sub.add_parser("job", help="inspect/control jobs")
     job_sub = p_job.add_subparsers(dest="job_command", required=True)
     job_sub.add_parser("list")
@@ -1308,6 +1464,15 @@ def build_parser() -> argparse.ArgumentParser:
     j_watch.add_argument("job_id")
     j_watch.add_argument("--after-seq", dest="after_seq", type=int, default=0)
     j_watch.add_argument("--follow", action="store_true")
+    j_watch.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help=(
+            "with --follow, stop watching after this many seconds and report "
+            "the last observed state instead of waiting indefinitely"
+        ),
+    )
     j_cancel = job_sub.add_parser("cancel")
     j_cancel.add_argument("job_id")
     j_resume = job_sub.add_parser("resume")
@@ -1368,6 +1533,7 @@ _HANDLERS = {
     "workflow": lambda a, c, o, s: _run_stage_command(c, a, DEFAULT_WORKFLOW_STAGES, o, s),
     "rerun": _run_rerun,
     "job": _cmd_job,
+    "compare": _cmd_compare,
     "vectors": _cmd_vectors,
     "device": _cmd_device,
     "artifact": _cmd_artifact,

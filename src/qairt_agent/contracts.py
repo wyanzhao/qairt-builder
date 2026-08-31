@@ -27,6 +27,7 @@ from pydantic import (
 )
 
 from qairt_agent.errors import ErrorCode, ToolError, ToolErrorData
+from qairt_agent.family_registry import FAMILY_RECORDS
 from qairt_agent.harness import (
     HarnessConstraintsError,
     load_harness_constraints,
@@ -64,23 +65,21 @@ class ModelFamily(str, Enum):
 
     @classmethod
     def _missing_(cls, value: object) -> "ModelFamily | None":
+        """Accept any spelling the canonical family registry declares.
+
+        This used to be a hand-written alias table -- a fifth copy of family
+        identity, and one that had already drifted from the other four.
+        """
+
         if not isinstance(value, str):
             return None
         normalized = value.lower().replace("-", "_").replace(".", "_")
-        aliases = {
-            "qwen3_dense": cls.QWEN3_DENSE,
-            "qwen3_4b": cls.QWEN3_DENSE,
-            "qwen3moe": cls.QWEN3_MOE,
-            "qwen3_vl": cls.QWEN3_VL,
-            "qwen35": cls.QWEN3_5,
-            "qwen3_5": cls.QWEN3_5,
-            "qwen35_omni_thinker": cls.QWEN3_5,
-            "qwen3_5_omni_thinker": cls.QWEN3_5,
-            "qwen35_omni": cls.QWEN3_5_OMNI,
-            "qwen3_5_omni": cls.QWEN3_5_OMNI,
-            "vit": cls.VIT,
-        }
-        return aliases.get(normalized)
+        for record in FAMILY_RECORDS:
+            for spelling in record.spellings:
+                folded = spelling.lower().replace("-", "_").replace(".", "_")
+                if folded == normalized:
+                    return cls(record.model_family)
+        return None
 
 
 class ArtifactKind(str, Enum):
@@ -425,10 +424,11 @@ class TargetSpec(FrozenContract):
         # reads like any other bad field rather than escaping the model.
         try:
             if len(supplied) == 3:
+                soc_model = supplied["soc_model"]
                 entry = resolve_target_tuple(
                     str(supplied["chipset"]),
                     str(supplied["dsp_arch"]),
-                    int(supplied["soc_model"]),
+                    int(soc_model) if soc_model is not None else 0,
                 )
             elif supplied:
                 raise ValueError(
@@ -1461,13 +1461,16 @@ class JobStatus(FrozenContract):
 # Spec conversion
 # --------------------------------------------------------------------------- #
 
+#: Derived from the canonical family records: the preset a family builds
+#: through. Where several presets share a family lane (Omni Thinker builds
+#: through Qwen3.5), the record whose key matches the family wins, so this stays
+#: the "default preset for this family" mapping it always was.
 _FAMILY_TO_PRESET: dict[ModelFamily, str] = {
-    ModelFamily.QWEN3_DENSE: "qwen3_dense",
-    ModelFamily.QWEN3_MOE: "qwen3_moe",
-    ModelFamily.QWEN3_VL: "qwen3_vl",
-    ModelFamily.QWEN3_5: "qwen3_5",
-    ModelFamily.QWEN3_5_OMNI: "qwen3_5_omni",
-    ModelFamily.VIT: "vit",
+    ModelFamily(record.model_family): record.preset_ids[0]
+    for record in FAMILY_RECORDS
+    if record.key == record.model_family or record.model_family not in {
+        other.key for other in FAMILY_RECORDS
+    }
 }
 
 

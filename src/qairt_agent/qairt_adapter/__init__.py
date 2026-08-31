@@ -28,7 +28,11 @@ from .preflight import (
     require_preflight,
 )
 from .types import (
+    LIVE_SDK_FIELDS,
     BuildResult,
+    QairtAdapterFactory,
+    QairtAdapterOptionalProtocol,
+    QairtAdapterProtocol,
     CompiledContextArtifact,
     ConvertedModelArtifact,
     GenAIAttachedModel,
@@ -47,9 +51,15 @@ from .types import (
     Qwen35RuntimeValidationRequest,
     Qwen35RuntimeValidationResult,
     TransformedSliceArtifact,
+    without_live_sdk_objects,
 )
 
 __all__ = [
+    "LIVE_SDK_FIELDS",
+    "QairtAdapterFactory",
+    "QairtAdapterOptionalProtocol",
+    "QairtAdapterProtocol",
+    "without_live_sdk_objects",
     "BuildResult",
     "CompiledContextArtifact",
     "ConvertedModelArtifact",

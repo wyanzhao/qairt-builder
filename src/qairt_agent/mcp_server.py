@@ -3,7 +3,7 @@
 By default the server exposes only four short, asynchronous tools backed by the
 file job journal:
 
-    submit_job(spec, stages?, from_job?)  -> {job_id, state, status_path}
+    submit_job(spec, stages?, from_job?, inline?) -> {job_id, state, status_path}
     get_job(job_id, after_seq?)           -> {status, events}
     cancel_job(job_id)                    -> {ok, job_id}
     resume_job(job_id)                    -> {job_id, state, status_path}
@@ -26,6 +26,7 @@ else:
     _MCP_IMPORT_ERROR = None
 
 from qairt_agent.agent import QairtAgentClient
+from qairt_agent.jobs.worker import DEFAULT_WORKFLOW_STAGES
 from qairt_agent.pipeline import QairtAgent
 
 
@@ -74,28 +75,62 @@ def _invoke(method: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
-def _register_async_tools(server: Any, *, jobs_root: str | None, client: QairtAgentClient | None) -> None:
+def _default_launcher(job_id: str, jobs_root: Any) -> int:
+    """The CLI's detached worker launch, imported late to avoid a cycle."""
+
+    from qairt_agent.cli import _spawn_worker
+
+    return _spawn_worker(job_id, jobs_root)
+
+
+def _register_async_tools(
+    server: Any,
+    *,
+    jobs_root: str | None,
+    client: QairtAgentClient | None,
+    launcher: Callable[[str, Any], int] | None = None,
+) -> None:
     if client is None:
-        client = QairtAgentClient(jobs_root=jobs_root or ".qairt-agent/jobs", background=True)
+        # background=False: this client only prepares journals. The work runs
+        # in the detached pinned worker, exactly as it does from the CLI.
+        client = QairtAgentClient(
+            jobs_root=jobs_root or ".qairt-agent/jobs", background=False
+        )
+    launch = launcher or _default_launcher
 
     @server.tool(
         description=(
-            "Submit an asynchronous workflow job. Returns job_id/state/status_path "
-            "immediately; the job keeps running after this call returns."
+            "Submit an asynchronous workflow job (build, validate, benchmark by "
+            "default). Returns job_id/state/status_path immediately; the work "
+            "runs in the detached pinned worker and keeps going after this "
+            "call returns. Pass inline=true only for a short run inside a "
+            "compatible worker environment."
         )
     )
     def submit_job(
         spec: dict[str, Any],
         stages: list[str] | None = None,
         from_job: str | None = None,
+        inline: bool = False,
     ) -> dict[str, Any]:
-        return _safe(
-            lambda: client.submit(
+        def call() -> dict[str, Any]:
+            handle = client.prepare(
                 spec,
-                stages=tuple(stages) if stages else ("build",),
-                from_job=from_job,
-            ).submission()
-        )
+                stages=tuple(stages) if stages else DEFAULT_WORKFLOW_STAGES,
+                initial_manifest_job=from_job,
+            )
+            if inline:
+                status = client.execute(handle.job_id)
+                return {
+                    "job_id": handle.job_id,
+                    "state": status.state.value,
+                    "status_path": handle.status_path,
+                    "execution": "inline",
+                }
+            pid = launch(handle.job_id, client.jobs_root)
+            return {**handle.submission(), "worker_pid": pid, "execution": "detached"}
+
+        return _safe(call)
 
     @server.tool(
         description=(
@@ -234,6 +269,7 @@ def create_server(
     legacy: bool = False,
     jobs_root: str | None = None,
     client: QairtAgentClient | None = None,
+    launcher: Callable[[str, Any], int] | None = None,
 ) -> Any:
     if FastMCP is None:
         raise RuntimeError("MCP support is not installed; install qairt-agent[mcp]") from _MCP_IMPORT_ERROR
@@ -250,7 +286,9 @@ def create_server(
     if legacy:
         _register_legacy_tools(server)
     else:
-        _register_async_tools(server, jobs_root=jobs_root, client=client)
+        _register_async_tools(
+            server, jobs_root=jobs_root, client=client, launcher=launcher
+        )
     return server
 
 

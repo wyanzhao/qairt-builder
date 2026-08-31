@@ -8,6 +8,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from qairt_agent.errors import InvalidSpecError
+
 
 def _validated_pair(reference: Any, actual: Any) -> tuple[np.ndarray, np.ndarray]:
     reference_array = np.asarray(reference)
@@ -277,6 +279,55 @@ class QualityDiagnoser:
             label = "local_error_chain_unchanged"
         return label, propagated_delta
 
+    def _compare_localized(
+        self,
+        reference: Any,
+        actual: Any,
+        *,
+        slice_id: str,
+        tensor_name: str,
+        source: str,
+    ) -> Any:
+        """Compare one tap, naming it if the comparison is impossible.
+
+        A device tensor full of NaN used to abort the whole validation with
+        "Actual tensor contains NaN or infinity" and nothing else -- the reader
+        learned that something diverged but not where, which is precisely what a
+        validation stage exists to tell them. The failure is still a failure;
+        it just localizes now.
+        """
+
+        try:
+            return self.compare(reference, actual)
+        except (ValueError, TypeError) as error:
+            array = np.asarray(actual)
+            non_finite = (
+                int(np.count_nonzero(~np.isfinite(array)))
+                if array.size and not array.dtype.hasobject
+                and np.issubdtype(array.dtype, np.number)
+                and not np.iscomplexobj(array)
+                else None
+            )
+            raise InvalidSpecError(
+                f"quality comparison failed at {slice_id}.{tensor_name} "
+                f"({source}): {error}",
+                stage="validate",
+                details={
+                    "slice_id": slice_id,
+                    "tensor_name": tensor_name,
+                    "source": source,
+                    "reason": str(error),
+                    **(
+                        {
+                            "non_finite_elements": non_finite,
+                            "element_count": int(array.size),
+                        }
+                        if non_finite is not None
+                        else {}
+                    ),
+                },
+            ) from error
+
     def diagnose_slices(
         self,
         references: Mapping[str, Mapping[str, Any]],
@@ -307,12 +358,24 @@ class QualityDiagnoser:
                 if chain_enabled and tensor_name not in chain_slice:
                     raise KeyError(f"Device-chain output is missing {slice_id}.{tensor_name}")
                 teacher = (
-                    self.compare(reference, teacher_slice[tensor_name])
+                    self._compare_localized(
+                        reference,
+                        teacher_slice[tensor_name],
+                        slice_id=str(slice_id),
+                        tensor_name=str(tensor_name),
+                        source="teacher_forced",
+                    )
                     if tensor_name in teacher_slice
                     else None
                 )
                 chain = (
-                    self.compare(reference, chain_slice[tensor_name])
+                    self._compare_localized(
+                        reference,
+                        chain_slice[tensor_name],
+                        slice_id=str(slice_id),
+                        tensor_name=str(tensor_name),
+                        source="device_chain",
+                    )
                     if tensor_name in chain_slice
                     else None
                 )

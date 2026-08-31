@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -325,6 +326,26 @@ def build_chain_fixture(
     return produced
 
 
+def active_target_name() -> str:
+    """The target `harness/constraints.json` currently makes active.
+
+    A fixture that defaults to a fixed chip silently plans a first run for
+    hardware the harness is not pinned to, which is the one thing a first run
+    must not do. Read as plain JSON rather than through `qairt_agent.harness`
+    so the generator still works before the package is installed.
+    """
+
+    path = Path(__file__).resolve().parents[1] / "harness" / "constraints.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read the active target from {path}: {error}") from error
+    name = payload.get("target", {}).get("name")
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"{path} carries no target.name")
+    return name
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -334,8 +355,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--target",
-        default="sm8750",
-        help="target name from harness/targets/ to write into the spec",
+        default=None,
+        help=(
+            "target name from harness/targets/ to write into the spec "
+            "(default: whichever target harness/constraints.json makes active)"
+        ),
     )
     parser.add_argument(
         "--artifacts-root",
@@ -355,6 +379,13 @@ def main() -> int:
         ),
     )
     arguments = parser.parse_args()
+
+    if arguments.target is None:
+        try:
+            arguments.target = active_target_name()
+        except ValueError as error:
+            print(f"error: {error}; pass --target explicitly", file=sys.stderr)
+            return 2
 
     output_dir = Path(arguments.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)

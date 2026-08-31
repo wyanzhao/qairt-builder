@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from pathlib import Path
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -161,13 +162,64 @@ def test_parse_version(text, expected) -> None:
 def test_target_registry_separates_the_two_soc_numbering_schemes() -> None:
     registry = load_target_registry(DEFAULT_CONSTRAINTS)
 
-    assert set(registry) == {"sm8750", "sm8850"}
+    # The two reviewed targets in the seed set, asserted by value rather than
+    # by pinning the registry population: adding a third target is the
+    # documented add-target workflow, not a test failure.
     # soc_model is Qnn_SocModel_t; soc_id is the Android SoC ID. Keeping both
     # in the entry is what stops them being conflated again.
     assert (registry["sm8850"].soc_model, registry["sm8850"].soc_id) == (87, (660,))
     assert (registry["sm8750"].soc_model, registry["sm8750"].soc_id) == (69, (618, 639))
     assert registry["sm8850"].dsp_arch == "v81"
     assert registry["sm8750"].dsp_arch == "v79"
+
+
+def test_the_registry_is_structurally_sound_whatever_it_contains() -> None:
+    """Structure, not population.
+
+    Pinning the registry to an exact set made adding a target a test failure,
+    which is the opposite of what the add-target workflow documents.
+    """
+
+    registry = load_target_registry(DEFAULT_CONSTRAINTS)
+    files = sorted((DEFAULT_CONSTRAINTS.targets_dir).glob("*.json"))
+
+    assert files, "the reviewed target registry is empty"
+    assert set(registry) == {path.stem for path in files}
+
+    tuples: dict[tuple[str, str, int], str] = {}
+    for name, entry in registry.items():
+        assert entry.name == name, f"{entry.source_path} disagrees with its filename"
+        assert entry.chipset and entry.dsp_arch
+        assert isinstance(entry.soc_model, int)
+        key = (entry.chipset.lower(), entry.dsp_arch.lower(), entry.soc_model)
+        assert key not in tuples, (
+            f"{name} and {tuples[key]} share the tuple {entry.tuple_text}; a "
+            "spec supplying that tuple could not resolve to one entry"
+        )
+        tuples[key] = name
+
+
+def test_the_active_target_and_every_deployed_target_are_verified() -> None:
+    """Verification is required where it matters, not everywhere.
+
+    An entry committed ahead of its acceptance run -- the documented
+    intermediate state of the add-target workflow -- must pass the suite; the
+    gate that refuses device stages for it is what keeps that safe.
+    """
+
+    registry = load_target_registry(DEFAULT_CONSTRAINTS)
+    required = {DEFAULT_CONSTRAINTS.target_name}
+    for cell in sorted((Path(__file__).parents[1] / "configs").glob("*/*.json")):
+        required.add(cell.stem)
+
+    for name in sorted(required):
+        entry = registry[name]
+        assert entry.verified is not None, (
+            f"{name} is active or deployed but records no acceptance run"
+        )
+        assert entry.verified["sdk_build"] == DEFAULT_CONSTRAINTS.qairt_build_id
+        assert entry.verified["device"], name
+        assert entry.verified["how"], name
 
 
 def test_unregistered_target_and_unregistered_tuple_fail_closed() -> None:
@@ -203,9 +255,36 @@ def test_unverified_target_is_refused_until_an_acceptance_run(
         require_verified_target(unverified)
 
 
-def test_both_seeded_targets_record_a_real_device_acceptance_run() -> None:
-    for entry in load_target_registry(DEFAULT_CONSTRAINTS).values():
-        assert entry.verified is not None, entry.name
-        assert entry.verified["sdk_build"] == DEFAULT_CONSTRAINTS.qairt_build_id
-        assert entry.verified["device"], entry.name
-        assert entry.verified["how"], entry.name
+def test_an_unverified_entry_still_loads_and_still_refuses_device_stages(
+    tmp_path, monkeypatch
+) -> None:
+    """The add-target intermediate state: committed, not yet qualified."""
+
+    monkeypatch.delenv(ENV_TARGET_ACCEPTANCE, raising=False)
+    harness = tmp_path / "harness"
+    targets = harness / "targets"
+    targets.mkdir(parents=True)
+    shutil.copy(DEFAULT_CONSTRAINTS.source_path, harness / "constraints.json")
+    for existing in DEFAULT_CONSTRAINTS.targets_dir.glob("*.json"):
+        shutil.copy(existing, targets / existing.name)
+    (targets / "sm8950.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "name": "sm8950",
+                "chipset": "SM8950",
+                "dsp_arch": "v83",
+                "soc_model": 99,
+                "soc_id": [700],
+                "notes": ["seeded ahead of its acceptance run"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    constraints = load_harness_constraints(harness / "constraints.json")
+
+    registry = load_target_registry(constraints)
+
+    assert registry["sm8950"].verified is None
+    with pytest.raises(HarnessConstraintsError, match="no verified block"):
+        require_verified_target(registry["sm8950"])

@@ -143,6 +143,33 @@ or factory methods fail closed before packaging.
 `preset capture` binds a reference overlay to a model SHA, architecture, tensor
 ABI, and exact slice boundaries into a reproducible `SkuOverlay`.
 
+### Identity cross-checks
+
+The preset is the routing authority, and it is checked rather than trusted.
+
+- **Preset vs config.** When a model config is supplied, its `architectures`
+  (outer level and `text_config`) are compared with the family table at
+  spec/plan time. An architecture belonging to a *different* known family fails
+  closed, naming the preset, the architecture, and the config file. An
+  architecture the table does not know, or a config that says nothing, leaves
+  the preset authoritative and is recorded under
+  `effective_config.family_cross_check` with a `status` of
+  `unknown_architecture`, `silent`, or `agrees`. A nested decoder `model_type`
+  can disagree without failing (`model_type_disagrees`), because Qwen3-VL
+  legitimately nests `model_type: "qwen3"`.
+- **Resolved compile target.** Both lanes verify what the SDK resolved, not
+  what was requested. On the GenAI lane the builder's `CompileConfig` is read
+  back after `set_targets` and checked against the registry entry with the same
+  guard the low-level lane uses, empty `device_custom_configs` included. The
+  receipt's `target.verification.status` is `resolved_verified`, or `input_only`
+  when a builder exposes no readable resolved value -- never an input echo
+  presented as a resolution.
+- **AR to graph.** Raw GenAI slices bind ARs to graphs by shape, not by list
+  position: the AR-bearing dimension takes each requested AR exactly once across
+  the graphs, so an inverted order is detected even though the tensor names are
+  identical. When no dimension discriminates, the slice is refused by name
+  rather than guessed.
+
 ### Per-stage inputs
 
 The continuation stages deliberately do not share one catch-all configuration.
@@ -317,9 +344,61 @@ Rules the mode enforces:
   `claim_scope: "first_observed_divergence_not_root_cause"`. The
   supplied-golden report is unchanged.
 
-Only `granularity: "slice_boundary"` is implemented. Layer-level drilldown
-requires executing the diagnostic contexts the build already produces, which is
-not wired up yet; requesting it fails closed.
+`granularity` accepts `"slice_boundary"` and `"layer"`. Layer granularity
+executes the diagnostic contexts the build already produces and compares the
+tapped intermediates, so it requires a hash-verified diagnostic context for
+every slice in scope; a slice without one fails closed and is named, rather
+than the comparison quietly narrowing. Because a diagnostic context belongs to
+the build that produced it, a chain stitched together from two independent
+builds can never satisfy this — the multi-slice success path is therefore still
+unexercised on hardware, while the single-slice path has run.
+
+### Cross-run comparison
+
+```bash
+qairt-agent compare --from-job BASELINE --to-job CANDIDATE
+qairt-agent compare --from-manifest a/manifest-r000003-<sha>.json \
+                    --to-manifest b/manifest-r000003-<sha>.json
+```
+
+A path-addressed manifest is verified against the sha256 in its published
+filename; a bare path with no recorded expectation is refused, because hashing a
+file and comparing it to itself proves nothing.
+
+The pair must agree on preset, family, target, AR set, context lengths,
+`sqnr_modes`, and the latency meter/lane. Any mismatch fails closed naming the
+field: a delta between two differently shaped runs is not a measurement.
+
+Output (`qairt-agent.run-comparison/1`):
+
+- `latency.by_ar` — per-AR `production_latency_us` before/after, `delta_us`,
+  `delta_percent`, `pooled_cv_percent`, and `delta_in_pooled_cv`. The last is
+  the one to read: production latency is the most dispersed metric in the block.
+  An AR either side could not meter is listed with `comparable: false` and a
+  reason rather than silently dropped.
+- `quality.by_tap` — per-tap SQNR/RMSE/cosine deltas keyed
+  `ar/scope/mode/slice/tensor`, worst movers first, with `worst_mover` called
+  out.
+- `provenance` — both run ids, revisions, manifest SHAs, and the SHAs of the
+  latency and SQNR reports actually read, each verified before a number was
+  taken out of it.
+
+There are no thresholds and no verdicts anywhere in this output.
+
+### Diagnosis path selection
+
+`stage_configs.diagnose.kind` (or `qairt-agent diagnose --kind`) runs exactly
+one path and fails closed when that path has no evidence. Without a kind both
+paths run and the report's `considered` block records `found`, `no_evidence`, or
+`skipped_by_kind` for each; when both have evidence the payload is
+`qairt-agent.automatic-diagnosis.v1` with `quality` and `latency` sub-reports.
+
+`qairt-agent diagnose --from-job CANDIDATE --baseline BASELINE` runs the
+comparison above first and adds an `implicated` block: quality is implicated by
+any tap whose SQNR fell, latency by any AR whose production latency moved at
+least one pooled CV. The rule is published inline with the block, and both
+paths are still reported — it says where the measured change points, not
+whether the run passed.
 
 ### Benchmark sampling and token accounting
 
@@ -327,8 +406,10 @@ Sampling policy is lane-aware. The low-level lane measures 10 warmup and 50
 measured graph invocations. One GenAI sample is an entire `generate()` call, so
 that lane resolves 3 warmup and 10 measured — materialized into the `BuildSpec`
 when the spec is parsed, so `qairt-agent plan` shows the numbers that will run
-under `effective_config.benchmark` (with `lane` and `sample_unit`), and every
-later stage reads the same values. Explicit spec values always win, per field.
+under `effective_benchmark` (with `lane` and `sample_unit`), and every later
+stage reads the same values. Do not look under the plan key named
+`effective_config`: that is an output-layout role naming where the effective
+config is written, not the benchmark block. Explicit spec values always win, per field.
 A/A calibration doubles whichever numbers apply.
 
 **Latency means device time.** Every latency report names its metric in
@@ -353,7 +434,23 @@ than `CompiledModel.__call__` and `qairt.Profiler` cannot observe it. Chain
 scope *is* measured: the timed pass records what each slice was actually fed,
 and every slice is then profiled with those exact inputs, so `by_slice` carries
 one block per slice and `totals` is an explicitly labelled sum of per-slice
-means.
+means. A multi-step sequence publishes `scope: "chain_sequence"` with `by_step`
+instead — per-step `by_slice`, graph name and AR, plus `steps_covered` and
+`steps_total` — so a prefill+decode run cannot present decode-only evidence as
+the whole chain.
+
+Aggregates carry their own honesty markers. The multi-AR latency report's
+`latency_metric` is `device_execution` only when every AR published an available
+block, `partial` otherwise, with `coverage.metered_ars`,
+`coverage.unmetered_ars` and `coverage.unmetered_ar_reasons` naming what was
+missed. Every `device_execution` block reports `samples_requested`,
+`samples_used`, `samples_used_by_metric` and a `partial` flag, so a mean is
+never taken over a different N than the contract's ten without saying so.
+
+A device tensor that carries NaN or infinity fails the validation stage — it is
+not a comparison that can be made — but the error names the slice, the tensor,
+which side it came from, and how many elements were non-finite, instead of
+aborting with an unlocalized message.
 
 The host wall-clock number survives only under `harness_diagnostics`, marked
 `not_latency: true`, because it still detects ADB, container and transport

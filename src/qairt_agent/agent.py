@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from qairt_agent.artifacts import canonical_json_bytes
 from qairt_agent.contracts import ArtifactRef, BuildSpec, utc_now
 from qairt_agent.contracts import (
@@ -200,26 +202,81 @@ class QairtAgentClient:
         with self._harness_scope():
             return self._normalize_spec_active(spec)
 
-    def _normalize_spec_active(self, spec: Any) -> WorkflowSpec:
+    @staticmethod
+    def _validated(model: Any, payload: Any, *, source: str | None) -> Any:
+        """Validate a spec payload, or raise the structured spec error.
+
+        A pydantic ``ValidationError`` escaping the CLI entry path reaches the
+        caller as a traceback rather than the JSON error contract every other
+        failure honours, so it is converted here -- keeping the field path and
+        message of every complaint, which is the part a caller can act on.
+        """
+
+        try:
+            return model.model_validate(payload)
+        except ValidationError as error:
+            problems = [
+                {
+                    "field": ".".join(str(part) for part in item.get("loc", ())),
+                    "message": str(item.get("msg", "")),
+                    "type": str(item.get("type", "")),
+                }
+                for item in error.errors()
+            ]
+            rendered = "; ".join(
+                f"{problem['field'] or '<root>'}: {problem['message']}"
+                for problem in problems
+            )
+            details: dict[str, Any] = {"model": model.__name__, "errors": problems}
+            if source is not None:
+                details["source"] = source
+            raise InvalidSpecError(
+                f"spec is not a valid {model.__name__}: {rendered}",
+                stage="spec",
+                details=details,
+            ) from error
+
+    def _normalize_spec_active(
+        self, spec: Any, *, source: str | None = None
+    ) -> WorkflowSpec:
         if isinstance(spec, WorkflowSpec):
-            return WorkflowSpec.model_validate(
-                spec.model_dump(mode="python")
+            return self._validated(
+                WorkflowSpec, spec.model_dump(mode="python"), source=source
             )
         if isinstance(spec, BuildSpec):
             return to_workflow_spec(
-                BuildSpec.model_validate(spec.model_dump(mode="python"))
+                self._validated(
+                    BuildSpec, spec.model_dump(mode="python"), source=source
+                )
             )
         if isinstance(spec, (str, Path)):
             path = Path(spec).expanduser()
             if not path.exists():
                 raise InvalidSpecError(f"spec file not found: {path}", stage="spec")
-            return self._normalize_spec_active(
-                json.loads(path.read_text(encoding="utf-8"))
-            )
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as error:
+                raise InvalidSpecError(
+                    f"spec file is not valid JSON: {path}: {error}",
+                    stage="spec",
+                    details={
+                        "source": str(path),
+                        "line": error.lineno,
+                        "column": error.colno,
+                        "reason": error.msg,
+                    },
+                ) from error
+            except OSError as error:
+                raise InvalidSpecError(
+                    f"cannot read spec file {path}: {error}",
+                    stage="spec",
+                    details={"source": str(path)},
+                ) from error
+            return self._normalize_spec_active(payload, source=str(path))
         if isinstance(spec, dict):
             if "preset" in spec:
-                return WorkflowSpec.model_validate(spec)
-            return to_workflow_spec(BuildSpec.model_validate(spec))
+                return self._validated(WorkflowSpec, spec, source=source)
+            return to_workflow_spec(self._validated(BuildSpec, spec, source=source))
         raise InvalidSpecError(f"cannot interpret spec of type {type(spec).__name__}", stage="spec")
 
     def _default_engine(self) -> Any:

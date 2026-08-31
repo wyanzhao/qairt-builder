@@ -28,6 +28,7 @@ from qairt_agent.device.lease import (
     lease_snapshot,
     scan_stale_lease_snapshots,
 )
+from qairt_agent.device.soc import verify_device_soc
 from qairt_agent.errors import DeviceUnavailableError
 from qairt_agent.harness import (
     DEFAULT_CONSTRAINTS,
@@ -141,6 +142,7 @@ def device_doctor(
     *,
     sdk_build: str | None = None,
     target: str | None = None,
+    target_name: str | None = None,
     min_free_kb: int = 100 * 1024,
     constraints: HarnessConstraints | None = None,
 ) -> dict[str, Any]:
@@ -156,10 +158,16 @@ def device_doctor(
     resolved_sdk_build = (
         expected_sdk_build if sdk_build is None else sdk_build
     )
+    try:
+        target_entry: TargetEntry | None = resolve_target(
+            target_name, constraints=active
+        )
+    except Exception:  # noqa: BLE001 - reported by the device_soc check below
+        target_entry = None
     resolved_target = (
-        _target_text(resolve_target(constraints=active))
-        if target is None
-        else target
+        target
+        if target is not None
+        else (_target_text(target_entry) if target_entry is not None else "unresolved")
     )
     checks: dict[str, dict[str, Any]] = {}
 
@@ -190,12 +198,43 @@ def device_doctor(
     except Exception as exc:  # noqa: BLE001
         checks["device_state"] = _check(False, f"could not read device state: {exc}")
 
-    # 4. target triple resolvable (recorded; acceptance is policy elsewhere).
+    # 4. the attached handset really is the resolved target's SoC.
+    #
+    # This used to record the resolved triple and pass unconditionally, which
+    # proved only that a target was named. The registry carries each target's
+    # Android soc_id list so the claim can actually be checked against the
+    # hardware: contradiction fails, absence warns.
     checks["target_resolved"] = _check(
         True,
         f"target triple recorded: {resolved_target}",
         target=resolved_target,
     )
+    if target_entry is None:
+        checks["device_soc"] = _check(
+            False, f"could not resolve target {target_name or '<active>'}"
+        )
+    else:
+        try:
+            verification = verify_device_soc(
+                client, target_entry, serial=config.serial
+            )
+        except DeviceUnavailableError as exc:
+            checks["device_soc"] = _check(False, str(exc), **dict(exc.details or {}))
+        except Exception as exc:  # noqa: BLE001 - doctor captures, never raises
+            checks["device_soc"] = _check(
+                False, f"could not read the device soc_id: {exc}"
+            )
+        else:
+            observed = verification["observed_soc_id"]
+            message = (
+                f"device soc_id {observed} matches target {target_entry.name} "
+                f"{verification['expected_soc_id']}"
+                if verification["status"] == "verified"
+                else str(verification.get("warning", verification["status"]))
+            )
+            # Absence is a gap in what we can see, not proof of the wrong
+            # chip, so an unreadable soc_id does not fail the doctor.
+            checks["device_soc"] = _check(True, message, **verification)
 
     # 5. remote free space.
     try:

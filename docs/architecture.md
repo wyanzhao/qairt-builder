@@ -17,6 +17,37 @@ a named entry from the reviewed target registry must resolve explicitly through 
 The canonical target fields are `chipset`, `dsp_arch`, and `soc_model`. There is
 no V79 or default-SoC fallback.
 
+## Module map
+
+`QairtAgent` is a facade. Its public methods are unchanged -- the CLI, job
+worker and MCP layers see exactly what they always did -- but the stage bodies
+live beside it rather than inside it:
+
+| Module | What it holds |
+| --- | --- |
+| `pipeline.py` | The `QairtAgent` facade: construction, run/manifest plumbing, continuation and reuse machinery, device-stage setup. |
+| `pipeline_support.py` | Helpers the facade and every stage share (`_jsonable`, artifact classification, static footprint, `run_directory`). Stage modules import this, never the facade -- the reverse would be a cycle. |
+| `pipeline_stages/planning.py` | Resolving a spec into the effective build, the preset↔config cross-check, and publishing what resolved. |
+| `pipeline_stages/build.py` | Both build lanes and the evidence each publishes. |
+| `pipeline_stages/qwen35_derivation.py` | The fail-closed Qwen3.5 multi-AR derivation check. |
+| `pipeline_stages/validate.py` | The validate stage and its SQNR modes. |
+| `pipeline_stages/vectors_for_quality.py` | Binding the vectors each SQNR mode is entitled to. |
+| `pipeline_stages/float_reference.py` | The debug-only ONNX Runtime float reference and diagnostic-context execution. |
+| `pipeline_stages/benchmark.py` | The benchmark stage: sampling policy and the multi-AR aggregate. |
+| `pipeline_stages/benchmark_one.py` | Measuring one runtime binding — formerly an 870-line closure. |
+| `pipeline_stages/optrace.py` | Normalizing QAIRT's per-operator records. |
+| `pipeline_stages/execution.py` | Running graphs and slice chains on the device, and metering them. |
+| `pipeline_stages/diagnose.py` | Diagnosis path selection and attribution. |
+| `pipeline_stages/stage_tools.py` | The deprecated per-stage low-level tools. |
+| `container_runtime.py` | The container contract both worker backends implement: build args, smoke environment, harness-path resolution. |
+| `family_registry.py` | The one place a model family is declared; every other registry derives from it. |
+
+Stages are mixins composed into `QairtAgent`, so a helper one stage calls on
+another resolves across the MRO exactly as it did when they shared a class body.
+`tests/test_pipeline_decomposition.py` keeps the shape: line budgets, no
+family-string conditionals in stage bodies, no stage importing the facade, and
+the public surface unchanged.
+
 ## Canonical request contract
 
 `WorkflowSpec` is the native CLI source of build intent and names a `preset`.

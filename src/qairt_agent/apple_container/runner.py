@@ -23,6 +23,15 @@ from qairt_agent.docker.image import (
     WORKER_PYTHONPATH,
     WorkerImageConfig,
 )
+from qairt_agent.container_runtime import (
+    SDK_MOUNT_TARGET,
+    SMOKE_COMMAND,
+    WORKER_WORKDIR,
+    flatten_env,
+    image_build_args,
+    resolve_harness_build_path,
+    worker_smoke_env,
+)
 from qairt_agent.errors import AppleContainerUnavailableError
 from qairt_agent.harness import (
     DEFAULT_CONSTRAINTS,
@@ -361,24 +370,21 @@ class AppleContainerRunner:
     def build_image(self, *, context: str | Path, dockerfile: str | Path) -> Any:
         self.require_available()
         context_path = Path(context).expanduser().resolve()
-        constraints_path = self.constraints.source_path.expanduser().resolve()
-        try:
-            harness_build_path = constraints_path.relative_to(
-                context_path
-            ).as_posix()
-        except ValueError:
-            if constraints_path == DEFAULT_CONSTRAINTS.source_path.resolve():
-                harness_build_path = DEFAULT_CONSTRAINTS_LOGICAL_PATH
-            else:
-                raise AppleContainerUnavailableError(
+        harness_build_path = resolve_harness_build_path(
+            self.constraints,
+            context_path,
+            on_outside_context=lambda constraints_path, resolved_context: (
+                AppleContainerUnavailableError(
                     "selected harness constraints must be inside the image "
                     "build context",
                     stage="apple-container-build",
                     details={
                         "constraints": str(constraints_path),
-                        "context": str(context_path),
+                        "context": str(resolved_context),
                     },
                 )
+            ),
+        )
         argv = [
             "container",
             "build",
@@ -390,18 +396,7 @@ class AppleContainerRunner:
             self.image_ref,
             "--progress",
             "plain",
-            "--build-arg",
-            f"UBUNTU_VERSION={self.constraints.ubuntu_version}",
-            "--build-arg",
-            f"PYTHON_VERSION={self.constraints.python_version}",
-            "--build-arg",
-            f"QAIRT_DEPENDENCIES_FILE={self.constraints.dependencies_file}",
-            "--build-arg",
-            f"HARNESS_CONSTRAINTS_FILE={harness_build_path}",
-            "--build-arg",
-            f"TORCH_VERSION={self.constraints.torch_version}",
-            "--build-arg",
-            f"TORCH_INDEX_URL={self.constraints.torch_index_url}",
+            *image_build_args(self.constraints, harness_build_path),
             str(context_path),
         ]
         result = self._executor(argv)
@@ -435,25 +430,16 @@ class AppleContainerRunner:
         ):
             argv.append("--rosetta")
         argv += [
+            # Apple `container` 1.0 offers only --no-dns, which is not the hard
+            # IP-egress isolation Docker's --network none gives.
             "--no-dns",
             "--workdir",
-            "/opt/qairt-agent",
-            "--env",
-            "QAIRT_SDK_ROOT=/opt/qairt",
-            "--env",
-            "QNN_SDK_ROOT=/opt/qairt",
-            "--env",
-            "QAIRT_AGENT_HARNESS_CONSTRAINTS=/opt/qairt-agent/harness/constraints.json",
-            "--env",
-            f"PYTHONPATH={WORKER_PYTHONPATH}",
-            "--env",
-            "LD_LIBRARY_PATH=/opt/qairt/lib/x86_64-linux-clang",
+            WORKER_WORKDIR,
+            *flatten_env(worker_smoke_env(), flag="--env"),
             "--mount",
-            f"type=bind,source={resolved_sdk},target=/opt/qairt,readonly",
+            f"type=bind,source={resolved_sdk},target={SDK_MOUNT_TARGET},readonly",
             self.image_ref,
-            "/opt/venv/bin/python",
-            "-m",
-            "qairt_agent.docker.smoke",
+            *SMOKE_COMMAND,
         ]
         return argv
 

@@ -12,8 +12,10 @@ This module is QAIRT-import-free: planning and resolution work without the SDK.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from qairt_agent.artifacts import canonical_json_bytes
+from qairt_agent.family_registry import PRESET_TO_RECORD
 from qairt_agent.contracts import (
     BenchmarkSpec,
     BuildSpec,
@@ -345,12 +347,16 @@ def resolve_workflow(spec: WorkflowSpec) -> ResolvedWorkflow:
                     stage="preset",
                     details={"preset_id": preset.preset_id, "missing_ars": missing},
                 )
+            def _attachment(ar: Any) -> dict[str, Any] | None:
+                if not isinstance(attached, dict):
+                    return None
+                entry = attached.get(str(ar), attached.get(ar))
+                return entry if isinstance(entry, dict) else None
+
             missing_encodings = [
                 str(ar)
                 for ar in ars
-                if not isinstance(attached, dict)
-                or not isinstance(attached.get(str(ar), attached.get(ar)), dict)
-                or attached.get(str(ar), attached.get(ar)).get("encodings_path") is None
+                if (_attachment(ar) or {}).get("encodings_path") is None
             ]
             if missing_encodings:
                 raise InvalidSpecError(
@@ -416,14 +422,10 @@ def resolve_workflow(spec: WorkflowSpec) -> ResolvedWorkflow:
 # family <-> preset bridge
 # --------------------------------------------------------------------------- #
 
+#: Derived from the canonical family records.
 _PRESET_TO_FAMILY: dict[str, ModelFamily] = {
-    "qwen3_dense": ModelFamily.QWEN3_DENSE,
-    "qwen3_moe": ModelFamily.QWEN3_MOE,
-    "qwen3_vl": ModelFamily.QWEN3_VL,
-    "qwen3_5": ModelFamily.QWEN3_5,
-    "qwen3_5_omni_thinker": ModelFamily.QWEN3_5,
-    "qwen3_5_omni": ModelFamily.QWEN3_5_OMNI,
-    "vit": ModelFamily.VIT,
+    preset_id: ModelFamily(record.model_family)
+    for preset_id, record in PRESET_TO_RECORD.items()
 }
 
 

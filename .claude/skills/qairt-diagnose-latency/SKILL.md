@@ -55,6 +55,29 @@ explicitly labelled sum of per-slice means, not a measured end-to-end number.
   worker mounts the project root read-only, so the capture needs a writable
   `working_dir` or the execute fails outright with `ExecutionError`.
 
+## Compare before you drill
+
+A single run's numbers cannot tell you whether anything changed. Start from the
+delta:
+
+```bash
+qairt-agent compare --from-job BASELINE_JOB --to-job CANDIDATE_JOB
+```
+
+It refuses a non-comparable pair by name (preset, family, target, AR set,
+context lengths, `sqnr_modes`, latency meter/lane), then reports per-AR
+`production_latency_us` deltas both in microseconds and in units of the **pooled
+CV**. Read `delta_in_pooled_cv`, not `delta_us` alone: production latency is the
+most dispersed metric in the block (8-17% CV against ~2% for accelerator
+execute), so a change smaller than its own dispersion is not yet a finding. The
+output is report-only and carries no pass/fail verdict; that judgement is yours.
+
+`qairt-agent diagnose --from-job CANDIDATE --baseline BASELINE` runs the same
+comparison first and publishes an `implicated` block naming which path the
+measured change points at. Use `--kind latency` to run only the latency path;
+it now fails closed when there is no optrace evidence instead of quietly
+producing a quality report.
+
 ## Where a device number is unavailable
 
 `latency_metric: "unavailable"` with a reason in

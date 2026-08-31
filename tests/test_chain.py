@@ -186,3 +186,144 @@ def test_runner_can_read_routes_from_manifest_metadata() -> None:
     runner = SliceChainRunner.from_manifest(manifest, {"head": head})
     result = runner.run_device_chain({"x": np.array([1.0])}, ar=1)
     np.testing.assert_array_equal(result.final_outputs["y"], np.array([2.0]))
+
+
+# --------------------------------------------------------------------------- #
+# Chain-step device provenance (T16)
+# --------------------------------------------------------------------------- #
+
+
+class _CountingAdapter:
+    """Records every profiled execute so coverage can be asserted exactly."""
+
+    def __init__(self) -> None:
+        self.captures: list[tuple[str, float]] = []
+
+    def capture_device_execution(
+        self, compiled, inputs, *, graph_name, device, native_io, working_dir, **_
+    ):
+        marker = float(np.asarray(next(iter(inputs.values()))).ravel()[0])
+        self.captures.append((graph_name, marker))
+        return {
+            "schema": "qairt-agent.device-execution/2",
+            "accelerator_compute_us": 10.0 + marker,
+            "accelerator_execute_us": 100.0,
+            "qnn_execute_us": 200.0,
+        }
+
+
+def _record(step_inputs: list[tuple[str, str, float]]) -> dict:
+    """Build the recorded structure one chain pass would have produced."""
+
+    recorded: dict[str, list[dict]] = {}
+    for slice_name, graph_name, marker in step_inputs:
+        entries = recorded.setdefault(slice_name, [])
+        entries.append(
+            {
+                "step_index": len(entries),
+                "inputs": {"x": np.array([marker], dtype=np.float32)},
+                "graph_name": graph_name,
+                "ar": 1 if graph_name.endswith("ar1") else 128,
+            }
+        )
+    return recorded
+
+
+def test_a_two_step_chain_publishes_per_step_device_evidence(tmp_path) -> None:
+    """Keeping only the last step made a prefill+decode run look like a chain.
+
+    The block used to carry ``scope="chain"`` over decode-only evidence; a
+    reader had no way to see that prefill was never measured.
+    """
+
+    from qairt_agent.pipeline import QairtAgent
+
+    adapter = _CountingAdapter()
+    recorded = _record(
+        [
+            ("embedding", "embedding_ar128", 1.0),
+            ("decoder", "decoder_ar128", 2.0),
+            ("embedding", "embedding_ar1", 3.0),
+            ("decoder", "decoder_ar1", 4.0),
+        ]
+    )
+
+    block = QairtAgent._chain_device_execution(
+        QairtAgent.__new__(QairtAgent),
+        adapter,
+        recorded,
+        {"embedding": object(), "decoder": object()},
+        device=object(),
+        native_io=False,
+        execution_options={},
+        working_dir=tmp_path,
+    )
+
+    assert block["scope"] == "chain_sequence"
+    assert block["steps_total"] == 2
+    assert block["steps_covered"] == 2
+    assert [step["step_index"] for step in block["by_step"]] == [0, 1]
+    # Both steps were profiled with their own inputs and their own AR graph.
+    assert block["by_step"][0]["by_slice"]["embedding"]["ar"] == 128
+    assert block["by_step"][1]["by_slice"]["embedding"]["ar"] == 1
+    # Every recorded invocation was profiled with its own recorded inputs.
+    assert sorted({marker for _, marker in adapter.captures}) == [1.0, 2.0, 3.0, 4.0]
+    assert sorted({graph for graph, _ in adapter.captures}) == [
+        "decoder_ar1",
+        "decoder_ar128",
+        "embedding_ar1",
+        "embedding_ar128",
+    ]
+    # No unqualified per-slice collapse: a sequence publishes steps.
+    assert "by_slice" not in block
+
+
+def test_a_single_pass_chain_keeps_the_documented_per_slice_shape(tmp_path) -> None:
+    from qairt_agent.pipeline import QairtAgent
+
+    adapter = _CountingAdapter()
+    recorded = _record(
+        [("embedding", "embedding_ar1", 1.0), ("decoder", "decoder_ar1", 2.0)]
+    )
+
+    block = QairtAgent._chain_device_execution(
+        QairtAgent.__new__(QairtAgent),
+        adapter,
+        recorded,
+        {"embedding": object(), "decoder": object()},
+        device=object(),
+        native_io=False,
+        execution_options={},
+        working_dir=tmp_path,
+    )
+
+    assert block["scope"] == "chain"
+    assert block["steps_total"] == 1
+    assert set(block["by_slice"]) == {"embedding", "decoder"}
+    assert block["totals_basis"] == (
+        "sum_of_per_slice_means_slices_run_sequentially"
+    )
+
+
+def test_the_recorder_keeps_every_invocation_not_just_the_last() -> None:
+    from qairt_agent.pipeline import QairtAgent
+
+    recorded: dict[str, list[dict]] = {}
+    calls: list[str] = []
+
+    def executor(inputs, invocation):
+        calls.append(invocation.graph_name)
+        return {"out": np.array([1.0], dtype=np.float32)}
+
+    wrapped = QairtAgent._recording_chain_executors({"decoder": executor}, recorded)
+    for graph in ("decoder_ar128", "decoder_ar1"):
+        wrapped["decoder"](
+            {"x": np.array([1.0], dtype=np.float32)},
+            SimpleNamespace(graph_name=graph, ar=1 if graph.endswith("ar1") else 128),
+        )
+
+    assert [entry["graph_name"] for entry in recorded["decoder"]] == [
+        "decoder_ar128",
+        "decoder_ar1",
+    ]
+    assert [entry["step_index"] for entry in recorded["decoder"]] == [0, 1]

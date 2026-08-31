@@ -226,6 +226,7 @@ def _normalize_op_records(
     records: Mapping[str, Any] | Sequence[Mapping[str, Any] | OpCycleRecord],
 ) -> dict[str, OpCycleRecord]:
     normalized: dict[str, OpCycleRecord] = {}
+    items: Iterable[tuple[str, Any]]
     if isinstance(records, Mapping):
         items = records.items()
     else:

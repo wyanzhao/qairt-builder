@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -9,7 +10,13 @@ from pathlib import Path
 import pytest
 
 import qairt_agent.artifacts as artifacts_module
-from qairt_agent.artifacts import ManifestStore, atomic_publish_json, verify_artifact
+from qairt_agent.artifacts import (
+    ManifestStore,
+    atomic_publish_json,
+    reset_verification_cache,
+    verification_statistics,
+    verify_artifact,
+)
 from qairt_agent.contracts import (
     ArtifactKind,
     ArtifactRef,
@@ -276,3 +283,61 @@ def test_store_serializes_concurrent_publication_of_one_revision(
     run_directory = store.root / str(initial.run_id)
     revisions = tuple(run_directory.glob("manifest-r000001-*.json"))
     assert len(revisions) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Verification cache (T20)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_repeat_verification_within_one_process_is_not_re_read(tmp_path) -> None:
+    """Continuation stages re-hash every cumulative artifact at each boundary.
+
+    Free on the smoke fixture; repeated full reads of multi-GB contexts on a
+    real build.
+    """
+
+    reset_verification_cache()
+    path = tmp_path / "context.bin"
+    path.write_bytes(b"payload" * 1000)
+    ref = ArtifactRef.from_path(path, kind=ArtifactKind.CONTEXT_BINARY)
+
+    verify_artifact(ref)
+    verify_artifact(ref)
+    verify_artifact(ref)
+
+    statistics = verification_statistics()
+    assert statistics["full"] == 1
+    assert statistics["cached"] == 2
+
+
+def test_a_stat_changed_file_is_always_re_hashed(tmp_path) -> None:
+    # The cache must never stand between a changed artifact and its failure.
+    reset_verification_cache()
+    path = tmp_path / "context.bin"
+    path.write_bytes(b"original")
+    ref = ArtifactRef.from_path(path, kind=ArtifactKind.CONTEXT_BINARY)
+    verify_artifact(ref)
+
+    path.write_bytes(b"tampered")
+    os.utime(path, (0, 0))
+
+    with pytest.raises(ArtifactIntegrityError):
+        verify_artifact(ref)
+
+
+def test_a_same_size_same_mtime_rewrite_is_still_caught_on_a_cold_cache(
+    tmp_path,
+) -> None:
+    # Cold behaviour is byte-identical to before the cache existed.
+    path = tmp_path / "context.bin"
+    path.write_bytes(b"original")
+    ref = ArtifactRef.from_path(path, kind=ArtifactKind.CONTEXT_BINARY)
+    status = path.stat()
+    path.write_bytes(b"tampered")
+    os.utime(path, ns=(status.st_atime_ns, status.st_mtime_ns))
+
+    reset_verification_cache()
+
+    with pytest.raises(ArtifactIntegrityError):
+        verify_artifact(ref)

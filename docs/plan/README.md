@@ -62,9 +62,49 @@ new decision entry here instead.
 | [T09](T09-docs-agent-organization.md) | Docs and agent organization | done (2026-08-29) | — |
 | [T10](T10-latency-measurement-correction.md) | Latency is host-harness time, not device time | done (2026-08-30) | — |
 | [T11](T11-device-only-latency.md) | Make device the only latency metric | low-level half done (2026-08-30); GenAI half blocked | T10; GenAI half needs T08 |
+| [T12](T12-doc-truth-reconciliation.md) | Documentation truth reconciliation | done (2026-08-30) | — |
+| [T13](T13-identity-and-routing-guards.md) | Identity and routing guards | done (2026-08-30) | — |
+| [T14](T14-device-soc-verification.md) | Attached-device SoC verification | done (2026-08-30) | — |
+| [T15](T15-cli-job-robustness.md) | CLI and job lifecycle robustness | done (2026-08-30) | — |
+| [T16](T16-measurement-report-honesty.md) | Measurement report honesty fixes | done (2026-08-30) | — |
+| [T17](T17-regression-detection.md) | Regression detection and cross-run comparison | done (2026-08-30) | — |
+| [T18](T18-onboarding-gaps.md) | Onboarding: vector-import skill and spec reference | done (2026-08-30) | — |
+| [T19](T19-packaging-registry-seams.md) | Packaging and registry seams | done (2026-08-30) | — |
+| [T20](T20-build-scale-preparation.md) | Build-stage scaling (memory, hash cost) | done (2026-08-30) | — |
+| [T21](T21-real-model-acceptance.md) | First real-model end-to-end acceptance | blocked — awaiting real model export | T08 (GenAI half); T20, T12 recommended |
+| [T22](T22-family-registry-unification.md) | Family registry unification | done (2026-08-30) | — |
+| [T23](T23-typed-boundaries.md) | Typed boundaries (adapter Protocol, report contracts) | done (2026-08-30) | — |
+| [T24](T24-pipeline-decomposition.md) | Pipeline decomposition and runner dedup | done (2026-08-30) | T23; T22 recommended |
 
 Status values: `planned`, `blocked(<task>)`, `in-progress(<date>)`,
 `done(<date>)`.
+
+### Review wave 2026-08-30 (T12–T24)
+
+Evidence base: [review-findings-2026-08-30.md](review-findings-2026-08-30.md)
+(an eight-dimension full-repo review at commit `c9f551c`; the highest-impact
+claims were independently re-verified). Suggested execution order, three
+phases — within a phase, tasks are independent and may run in any order:
+
+- **Phase A — correctness and truth (do first):** T12 (highest leverage: the
+  contract currently *understates* landed capabilities, which misleads every
+  agent reading it), then T13, T14, T15, T16, T17.
+- **Phase B — enablement:** T18, T19, T20, then T21 when a real model export
+  (and T08's pickles for the GenAI half) arrive. T21 is the program's single
+  most valuable pending action: no real model has been through either lane
+  yet, and capability claims to other teams must not run ahead of it.
+- **Phase C — structure (long-horizon, schedule around feature work):** T22,
+  T23, then T24 (T24 depends on T23's typed seams).
+
+Phase C changes no behavior; do not batch it with Phase A/B patches. Findings
+recorded without a task (accepted or low severity) are listed at the end of
+the findings file — check that list before filing anything new from the same
+review.
+
+**All three phases landed on 2026-08-30** except T21, which is the one task
+still waiting on inputs rather than on work. It remains the program's single
+most valuable pending action: no real model has been through either lane, and
+capability claims to other teams must not run ahead of it.
 
 ## Execution protocol
 
@@ -148,6 +188,24 @@ must settle the SM8850 `soc_model` discrepancy T02 now documents.
   GenAI lane, and the two are never combined or converted into one another.
 
 ## Progress log
+
+- **2026-08-30** — session 3. Landed the whole 2026-08-30 review wave except
+  what needs real model inputs: **T12–T20 and T22–T24**. T08 and T21 remain
+  blocked on the AIMET pickles and a real export, and T11's GenAI half with
+  them. Suite 552 → **698 passed / 2 skipped**, with two new gates: a scoped
+  `mypy` type check (15 files, clean) and `tests/test_pipeline_decomposition.py`
+  pinning the new module shape.
+
+  Three things worth recording beyond the task files. The GenAI lane does expose
+  a readable resolved compile target after all (`HTPMixin` builds the same
+  `CompileConfig` the low-level lane validates), so it now runs the identical
+  guard instead of echoing its input into the receipt. A *fifth* family registry
+  turned up during T22 — `ModelFamily._missing_` carried its own alias table —
+  and was folded into the canonical records with the other four. And
+  `pipeline.py` went from 8,285 lines to 943 across twelve stage modules with no
+  report, JSON, or CLI change, verified by the suite at every landing.
+
+  Nothing committed — the working tree carries the session.
 
 - **2026-08-29** — session 2. Environment created (`.venv`, CPython 3.11.15);
   baseline 478 passed / 2 skipped. Landed T07 (5 fixes), T05 (static

@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from qairt_agent.families import (
+    FamilyCrossCheckStatus,
+    cross_check_declared_family,
     AutoArPolicy,
     FamilyConfigGenerator,
     FamilyId,
@@ -331,6 +333,65 @@ class LazyInspectorTests(unittest.TestCase):
         inspector = OnnxInspector(module_loader=lambda _name: fake_onnx)
         paths = inspector.external_data_paths("/models/model.onnx")
         self.assertEqual(paths, (Path("/models/weights/model.data"),))
+
+
+class FamilyCrossCheckTests(unittest.TestCase):
+    """The declared preset stays authoritative, but it gets checked."""
+
+    def test_a_config_naming_another_family_contradicts_the_preset(self) -> None:
+        check = cross_check_declared_family(
+            {"architectures": ["Qwen3_5ForCausalLM"]},
+            "qwen3",
+            config_path="/models/qwen3/config.json",
+        )
+
+        self.assertTrue(check.contradicts)
+        self.assertEqual(check.implied_family, "qwen3.5")
+        self.assertEqual(check.architectures, ("Qwen3_5ForCausalLM",))
+        self.assertEqual(check.config_path, "/models/qwen3/config.json")
+
+    def test_a_matching_config_agrees(self) -> None:
+        check = cross_check_declared_family(
+            {"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}, "qwen3"
+        )
+
+        self.assertIs(check.status, FamilyCrossCheckStatus.AGREES)
+        self.assertFalse(check.contradicts)
+
+    def test_an_unknown_architecture_is_a_warning_not_a_failure(self) -> None:
+        # A family the table has never seen must not be blocked by the table.
+        check = cross_check_declared_family(
+            {"architectures": ["LlamaForCausalLM"]}, "qwen3"
+        )
+
+        self.assertIs(check.status, FamilyCrossCheckStatus.UNKNOWN_ARCHITECTURE)
+        self.assertFalse(check.contradicts)
+        self.assertTrue(check.is_warning)
+
+    def test_a_nested_decoder_model_type_does_not_contradict(self) -> None:
+        # Qwen3-VL legitimately nests model_type="qwen3" under text_config;
+        # the outer architecture is the specific signal.
+        check = cross_check_declared_family(
+            {
+                "architectures": ["Qwen3VLForConditionalGeneration"],
+                "text_config": {"model_type": "qwen3"},
+            },
+            "qwen3_vl",
+        )
+
+        self.assertIs(check.status, FamilyCrossCheckStatus.AGREES)
+
+    def test_a_silent_config_leaves_the_preset_authoritative(self) -> None:
+        check = cross_check_declared_family({"hidden_size": 16}, "qwen3")
+
+        self.assertIs(check.status, FamilyCrossCheckStatus.SILENT)
+        self.assertFalse(check.contradicts)
+
+    def test_a_family_without_a_decoder_profile_says_nothing(self) -> None:
+        check = cross_check_declared_family({"architectures": ["ViTModel"]}, "vit")
+
+        self.assertIs(check.status, FamilyCrossCheckStatus.NO_PROFILE)
+        self.assertFalse(check.contradicts)
 
 
 if __name__ == "__main__":

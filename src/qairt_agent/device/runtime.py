@@ -19,7 +19,9 @@ from qairt_agent.device.adb import (
     remote_attempt_dir,
 )
 from qairt_agent.device.lease import DeviceLease
+from qairt_agent.device.soc import verify_device_soc
 from qairt_agent.errors import DeviceUnavailableError
+from qairt_agent.harness import TargetEntry
 
 ENV_LEASES_DIR = "QAIRT_AGENT_LEASES_DIR"
 ENV_ADB_CANONICAL_SERVER = "QAIRT_AGENT_ADB_CANONICAL_SERVER"
@@ -39,6 +41,9 @@ class DeviceStageSession:
     device: Any
     adb: AttemptSession
     identifier: str
+    #: What the handset said its SoC was, checked against the resolved target.
+    #: ``None`` only when no target was supplied to verify against.
+    soc_verification: dict[str, Any] | None = None
 
 
 class DeviceRuntime:
@@ -91,6 +96,7 @@ class DeviceRuntime:
         stage_key: str,
         attempt_id: str,
         push_files: Mapping[str, str | Path],
+        expected_target: TargetEntry | None = None,
     ) -> Iterator[DeviceStageSession]:
         """Acquire, record, stage, yield, and exactly clean one attempt.
 
@@ -102,6 +108,13 @@ class DeviceRuntime:
 
         config = self._config_factory()
         client = self._adb_client_factory(config)
+        # Before the lease, before any push, before the SDK: a report must
+        # never publish under a target identity the hardware contradicts.
+        soc_verification = (
+            verify_device_soc(client, expected_target, serial=config.serial)
+            if expected_target is not None
+            else None
+        )
         attempt_dir = remote_attempt_dir(job_id, stage_key, attempt_id)
         configured_lease_root = (os.environ.get(ENV_LEASES_DIR) or "").strip()
         project_root = (
@@ -193,6 +206,7 @@ class DeviceRuntime:
                         device=device,
                         adb=adb_session,
                         identifier=config.device_identifier,
+                        soc_verification=soc_verification,
                     )
                 except BaseException as exc:
                     # Let stage_attempt finish its exact cleanup first, then

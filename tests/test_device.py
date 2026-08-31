@@ -31,7 +31,8 @@ from qairt_agent.errors import (
     DeviceUnavailableError,
     LeaseConflictError,
 )
-from qairt_agent.harness import DEFAULT_CONSTRAINTS
+from qairt_agent.device.soc import verify_device_soc
+from qairt_agent.harness import DEFAULT_CONSTRAINTS, resolve_target
 
 CONFIG = AdbConfig(serial="ABC123", server="localhost:5037")
 BASE = ["adb", "-H", "localhost", "-P", "5037", "-s", "ABC123"]
@@ -1132,6 +1133,81 @@ def test_device_runtime_stages_records_device_and_cleans(tmp_path) -> None:
     assert list(leases.glob("*.json")) == []
 
 
+def test_device_runtime_verifies_the_soc_before_leasing_anything(tmp_path) -> None:
+    local = tmp_path / "context.bin"
+    local.write_bytes(b"context")
+    digest = _sha(b"context")
+    target = _target()
+
+    def handler(argv):
+        if "sha256sum" in argv:
+            return FakeCompleted(stdout=f"{digest}  /remote/context.bin\n")
+        if "ro.soc.id" in argv:
+            return FakeCompleted(stdout=str(target.soc_id[0]))
+        return FakeCompleted()
+
+    adapter = FakeDeviceAdapter()
+    leases = tmp_path / "leases"
+    runtime = DeviceRuntime(
+        config_factory=lambda: CONFIG,
+        adb_client_factory=lambda config: AdbClient(
+            config, command_executor=FakeExecutor(handler=handler)
+        ),
+        leases_dir=leases,
+    )
+
+    with runtime.stage(
+        adapter,
+        output_root=tmp_path / "artifacts",
+        job_id="job1",
+        stage_key="stage-key",
+        attempt_id="attempt-001",
+        push_files={"context.bin": local},
+        expected_target=target,
+    ) as session:
+        assert session.soc_verification["status"] == "verified"
+        assert session.soc_verification["observed_soc_id"] == target.soc_id[0]
+
+
+def test_device_runtime_refuses_a_contradicting_handset_before_the_sdk(
+    tmp_path,
+) -> None:
+    # The device must never be constructed and the lease never taken when the
+    # hardware contradicts the target the report would be published under.
+    local = tmp_path / "context.bin"
+    local.write_bytes(b"context")
+
+    def handler(argv):
+        if "ro.soc.id" in argv:
+            return FakeCompleted(stdout="999")
+        return FakeCompleted()
+
+    adapter = FakeDeviceAdapter()
+    leases = tmp_path / "leases"
+    runtime = DeviceRuntime(
+        config_factory=lambda: CONFIG,
+        adb_client_factory=lambda config: AdbClient(
+            config, command_executor=FakeExecutor(handler=handler)
+        ),
+        leases_dir=leases,
+    )
+
+    with pytest.raises(DeviceUnavailableError, match="999"):
+        with runtime.stage(
+            adapter,
+            output_root=tmp_path / "artifacts",
+            job_id="job1",
+            stage_key="stage-key",
+            attempt_id="attempt-001",
+            push_files={"context.bin": local},
+            expected_target=_target(),
+        ):
+            pass
+
+    assert adapter.calls == []
+    assert not leases.exists()
+
+
 def test_device_runtime_cleanup_failure_retains_gc_pointer(tmp_path) -> None:
     local = tmp_path / "context.bin"
     local.write_bytes(b"context")
@@ -1319,3 +1395,123 @@ def test_device_doctor_uses_injected_harness_identity() -> None:
         report["checks"]["sdk_compatible"]["expected_sdk_build"]
         == "next-build"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Attached-device SoC verification (T14)
+# --------------------------------------------------------------------------- #
+
+
+def _soc_executor(soc_id: str | None, *, fail: bool = False):
+    """An adb stand-in that answers the soc_id reads and nothing else."""
+
+    def handler(argv: list[str]) -> FakeCompleted:
+        joined = " ".join(argv)
+        if "getprop" in joined or "soc_id" in joined:
+            if fail:
+                return FakeCompleted(returncode=1, stderr="closed")
+            return FakeCompleted(stdout=("" if soc_id is None else soc_id))
+        return FakeCompleted()
+
+    return FakeExecutor(handler)
+
+
+def _target(name: str = "sm8750"):
+    return resolve_target(name, constraints=DEFAULT_CONSTRAINTS)
+
+
+def test_read_soc_id_prefers_the_property_and_keeps_every_raw_source() -> None:
+    target = _target()
+    client = AdbClient(CONFIG, command_executor=_soc_executor(str(target.soc_id[0])))
+
+    reading = client.read_soc_id()
+
+    assert reading["soc_id"] == target.soc_id[0]
+    # Absence must stay inspectable, so every source is recorded, not just the
+    # one that answered.
+    assert [entry["source"] for entry in reading["sources"]] == [
+        "getprop ro.soc.id",
+        "getprop ro.soc.model",
+        "sysfs",
+    ]
+
+
+def test_a_registered_soc_id_verifies_and_is_recorded() -> None:
+    target = _target()
+    client = AdbClient(CONFIG, command_executor=_soc_executor(str(target.soc_id[0])))
+
+    record = verify_device_soc(client, target, serial=CONFIG.serial)
+
+    assert record["status"] == "verified"
+    assert record["observed_soc_id"] == target.soc_id[0]
+    assert record["expected_soc_id"] == list(target.soc_id)
+    assert record["target"] == target.name
+
+
+def test_an_unregistered_soc_id_fails_closed_naming_both_sides() -> None:
+    # A report must never publish under a target identity the hardware
+    # contradicts, and this fires before any SDK call.
+    target = _target()
+    client = AdbClient(CONFIG, command_executor=_soc_executor("999"))
+
+    with pytest.raises(DeviceUnavailableError) as error:
+        verify_device_soc(client, target, serial=CONFIG.serial)
+
+    message = str(error.value)
+    assert "999" in message
+    assert str(target.soc_id[0]) in message
+    assert target.name in message
+    assert error.value.retryable is False
+
+
+def test_an_unreadable_soc_id_warns_and_lets_the_stage_proceed() -> None:
+    # An old or locked-down Android is a gap in what we can see, not evidence
+    # of the wrong chip.
+    target = _target()
+    client = AdbClient(CONFIG, command_executor=_soc_executor(None, fail=True))
+
+    record = verify_device_soc(client, target, serial=CONFIG.serial)
+
+    assert record["status"] == "unreadable"
+    assert record["observed_soc_id"] is None
+    assert "could not be confirmed" in record["warning"]
+    assert record["sources"]
+
+
+def test_an_acceptance_run_downgrades_a_contradiction_to_a_warning(
+    monkeypatch,
+) -> None:
+    # The qualifying run is exactly the run that confirms the soc_id list, so
+    # it cannot be gated on the list already being right.
+    target = _target()
+    monkeypatch.setenv("QAIRT_AGENT_TARGET_ACCEPTANCE", target.name)
+    client = AdbClient(CONFIG, command_executor=_soc_executor("999"))
+
+    record = verify_device_soc(client, target, serial=CONFIG.serial)
+
+    assert record["status"] == "contradicted_acceptance_override"
+    assert record["acceptance_run"] is True
+    assert "qualifying" in record["warning"]
+
+
+def test_device_doctor_compares_the_real_soc_instead_of_passing_always() -> None:
+    target = resolve_target(constraints=DEFAULT_CONSTRAINTS)
+
+    def handler(argv: list[str]) -> FakeCompleted:
+        joined = " ".join(argv)
+        if "devices" in joined:
+            return FakeCompleted(stdout=f"List of devices attached\n{CONFIG.serial}\tdevice\n")
+        if "get-state" in joined:
+            return FakeCompleted(stdout="device")
+        if "getprop ro.soc.id" in joined or ("getprop" in joined and "ro.soc.id" in joined):
+            return FakeCompleted(stdout="999")
+        if "getprop" in joined or "soc_id" in joined:
+            return FakeCompleted()
+        return FakeCompleted()
+
+    report = device_doctor(CONFIG, AdbClient(CONFIG, command_executor=FakeExecutor(handler)))
+
+    check = report["checks"]["device_soc"]
+    assert check["ok"] is False
+    assert "999" in check["message"]
+    assert target.name in check["message"]

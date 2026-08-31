@@ -215,6 +215,8 @@ def _mean_by_key(
 
 def aggregate_device_executions(
     blocks: Sequence[Mapping[str, Any]],
+    *,
+    requested: int | None = None,
 ) -> dict[str, Any]:
     """Average N parsed executes into one block, with the mean as the headline.
 
@@ -225,6 +227,11 @@ def aggregate_device_executions(
 
     Per-sample values are kept so a reader can see the spread rather than
     trusting an average of ten.
+
+    ``requested`` is how many profiled executes the contract asked for. When
+    fewer arrive -- or when a metric is missing from some of them -- the block
+    says so with ``partial``, ``samples_requested`` and ``samples_used``, rather
+    than presenting a mean over a different N under the same label.
     """
 
     if not blocks:
@@ -279,6 +286,11 @@ def aggregate_device_executions(
         "profiler_option": first.get("profiler_option"),
         "statistic": "mean",
         "sample_count": len(blocks),
+        "samples_requested": int(requested) if requested is not None else len(blocks),
+        "samples_used": len(blocks),
+        "samples_used_by_metric": {
+            name: len(values) for name, values in sorted(samples.items())
+        },
         "sample_unit": "one_profiled_graph_execute",
         "producer": first.get("producer"),
         "per_op_cycles": [
@@ -298,6 +310,22 @@ def aggregate_device_executions(
     }
     for name, values in samples.items():
         aggregated[name] = statistics.fmean(values)
+
+    expected = aggregated["samples_requested"]
+    short_metrics = {
+        name: len(values) for name, values in samples.items() if len(values) < expected
+    }
+    if len(blocks) < expected or short_metrics:
+        aggregated["partial"] = True
+        aggregated["partial_reason"] = (
+            f"{len(blocks)} of {expected} profiled executes were aggregated"
+            if len(blocks) < expected
+            else "some metrics were absent from part of the profiled executes"
+        )
+        if short_metrics:
+            aggregated["partial_metrics"] = dict(sorted(short_metrics.items()))
+    else:
+        aggregated["partial"] = False
 
     production = aggregated.get(PRODUCTION_LATENCY_SOURCE)
     if isinstance(production, (int, float)):

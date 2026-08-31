@@ -9,6 +9,7 @@ config/ONNX; resolution merges an overlay back over the preset defaults.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from qairt_agent.artifacts import sha256_file
 from qairt_agent.contracts import utc_now
@@ -108,7 +109,7 @@ def capture_sku(
     if resolved_sha is None and model_path is not None:
         resolved_sha, _ = sha256_file(model_path)
 
-    abi = {"byte_order": "little", "layout": "C", "storage": "raw"}
+    abi: dict[str, Any] = {"byte_order": "little", "layout": "C", "storage": "raw"}
     if tensor_abi:
         abi.update(tensor_abi)
 

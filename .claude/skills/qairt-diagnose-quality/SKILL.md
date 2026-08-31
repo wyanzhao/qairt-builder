@@ -26,6 +26,21 @@ level; each step narrows what the next one has to explain.
    the diagnostic contexts and compares every tapped tensor, ordered by the
    float graph's topology.
 
+## Compare before you drill
+
+Nonzero noise is the steady state of a quantized model, not a regression. To
+know whether quality actually moved, compare against a baseline run:
+
+```bash
+qairt-agent compare --from-job BASELINE_JOB --to-job CANDIDATE_JOB
+```
+
+`quality.by_tap` lists per-tap SQNR/RMSE/cosine deltas with the worst movers
+first, and `quality.worst_mover` is where to start bisecting. Non-comparable
+pairs are refused by name rather than differenced. `qairt-agent diagnose
+--from-job CANDIDATE --baseline BASELINE` runs the same comparison and reports
+which path the measured change implicates before drilling down.
+
 ## Requirements that fail closed
 
 - Layer granularity needs a build that emitted diagnostic contexts: set
@@ -36,6 +51,11 @@ level; each step narrows what the next one has to explain.
   Map names from the transform lineage of the exact export, not by eye.
 - Several diagnostic contexts with no routes fails closed — each slice must be
   fed what the previous slice produced, not a guess.
+- A chain stitched from two independent builds cannot be drilled down: a
+  diagnostic context belongs to the build that produced it, so one slice has
+  none. The stage names the slices instead of failing deep in the runner. Only
+  the single-slice layer path has run on hardware so far; say so when reporting
+  a multi-slice drilldown result.
 
 ## Reading the report without over-concluding
 

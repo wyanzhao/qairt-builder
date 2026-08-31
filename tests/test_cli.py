@@ -1361,3 +1361,132 @@ def test_device_gc_dry_run_does_not_require_device_env(
     )
     assert code == 0
     assert lines[0]["dry_run"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Spec errors reach the caller as the JSON contract (T15)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "payload, expected_fragment",
+    [
+        ("{not json", "not valid JSON"),
+        (json.dumps({"preset": "qwen3_dense"}), "Field required"),
+        (
+            json.dumps({**spec_dict(), "bogus_field": 1}),
+            "Extra inputs are not permitted",
+        ),
+    ],
+    ids=["malformed", "missing_required", "unknown_field"],
+)
+def test_a_bad_spec_is_the_json_error_contract_not_a_traceback(
+    tmp_path, payload: str, expected_fragment: str
+) -> None:
+    # A pydantic ValidationError escaping the entry path used to reach the
+    # caller as a traceback, which no automation can parse.
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(payload, encoding="utf-8")
+    client, _ = make_client(tmp_path)
+
+    code, lines = run(["plan", "--spec", str(spec_path)], client)
+
+    assert code == 1
+    assert len(lines) == 1
+    assert lines[0]["ok"] is False
+    assert lines[0]["error"]["code"] == "invalid_spec"
+    assert lines[0]["error"]["stage"] == "spec"
+    assert expected_fragment in lines[0]["error"]["message"]
+    assert lines[0]["error"]["details"]["source"] == str(spec_path)
+
+
+def test_a_field_error_names_the_field_path(tmp_path) -> None:
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps({"preset": "qwen3_dense"}), encoding="utf-8")
+    client, _ = make_client(tmp_path)
+
+    _, lines = run(["plan", "--spec", str(spec_path)], client)
+
+    fields = {problem["field"] for problem in lines[0]["error"]["details"]["errors"]}
+    assert "sources" in fields
+
+
+# --------------------------------------------------------------------------- #
+# job watch terminates on a dead worker (T15)
+# --------------------------------------------------------------------------- #
+
+
+def test_follow_exits_when_the_worker_heartbeat_goes_stale(tmp_path) -> None:
+    """ORPHANED is not terminal, so a dead worker used to spin this forever."""
+
+    from qairt_agent.cli import _follow
+
+    fake = FakeEngine(tmp_path / "engine")
+    client = QairtAgentClient(
+        jobs_root=tmp_path / "jobs",
+        engine_factory=lambda: fake,
+        background=False,
+        # A real threshold, just a very small one: the job below never
+        # heartbeats, so it is stale as soon as this much time has passed.
+        heartbeat_stale_after=0.001,
+    )
+    handle = client.prepare(spec_dict(), stages=("build",))
+    handle.journal.set_state(JobState.RUNNING)
+
+    out = io.StringIO()
+    final = _follow(client, handle.job_id, out, poll=0.01)
+
+    events = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+    kinds = [event.get("type") for event in events]
+    assert "orphaned" in kinds
+    assert kinds[-1] == "final"
+    assert final["state"] == JobState.ORPHANED.value
+    orphan = events[kinds.index("orphaned")]
+    assert orphan["observed_state"] == JobState.RUNNING.value
+    assert orphan["stale_after_seconds"] == client.heartbeat_stale_after
+
+
+def test_follow_honours_an_explicit_timeout(tmp_path) -> None:
+    from qairt_agent.cli import _follow
+
+    client, _ = make_client(tmp_path)
+    handle = client.prepare(spec_dict(), stages=("build",))
+    handle.journal.set_state(JobState.RUNNING)
+
+    ticks = iter([0.0, 5.0, 10.0])
+    out = io.StringIO()
+    final = _follow(
+        client,
+        handle.job_id,
+        out,
+        poll=0.0,
+        timeout=1.0,
+        clock=lambda: next(ticks),
+    )
+
+    events = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+    assert "watch_timeout" in [event.get("type") for event in events]
+    assert final["state"] == JobState.RUNNING.value
+
+
+def test_compare_requires_exactly_one_side_selector(tmp_path) -> None:
+    client, _ = make_client(tmp_path)
+
+    code, lines = run(["compare", "--from-job", "a", "--from-manifest", "m"], client)
+
+    assert code == 1
+    assert lines[0]["ok"] is False
+    assert lines[0]["error"]["code"] == "invalid_spec"
+    assert "--from-job" in lines[0]["error"]["message"]
+
+
+def test_compare_refuses_a_job_that_published_no_manifest(tmp_path) -> None:
+    client, _ = make_client(tmp_path)
+    handle = client.prepare(spec_dict(), stages=("build",))
+
+    code, lines = run(
+        ["compare", "--from-job", handle.job_id, "--to-job", handle.job_id], client
+    )
+
+    assert code == 1
+    assert "no manifest" in lines[0]["error"]["message"]

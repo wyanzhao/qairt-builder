@@ -36,6 +36,7 @@ import numpy as np
 import onnx
 from onnx import helper
 
+from qairt_agent.family_registry import FAMILY_RECORDS
 from qairt_agent.vectors import VectorManifest, VectorPreparer, sha256_file
 
 
@@ -136,62 +137,17 @@ def _register_family(
         _FAMILY_ALIASES[key] = policy
 
 
-_register_family(
-    "qwen3",
-    "qwen3_dense",
-    "qwen3-dense",
-    "qwen3-4b",
-    retarget_allowed=True,
-    kv_state=True,
-)
-_register_family(
-    "qwen3-moe",
-    "qwen3_moe",
-    "qwen3moe",
-    retarget_allowed=True,
-    kv_state=True,
-)
-_register_family(
-    "qwen3-vl",
-    "qwen3_vl",
-    "qwen3vl",
-    retarget_allowed=True,
-    kv_state=True,
-)
-_register_family(
-    "vit",
-    "vision-transformer",
-    retarget_allowed=True,
-    kv_state=False,
-    allowed_ars=frozenset({1}),
-)
-_register_family(
-    "qwen3.5",
-    "qwen3_5",
-    "qwen3-5",
-    "qwen35",
-    retarget_allowed=False,
-    kv_state=True,
-    allowed_ars=frozenset({1, 128}),
-)
-_register_family(
-    "qwen3.5-omni-thinker",
-    "qwen3_5_omni_thinker",
-    "qwen3-5-omni-thinker",
-    "qwen35-omni-thinker",
-    retarget_allowed=False,
-    kv_state=True,
-    allowed_ars=frozenset({1, 128}),
-)
-_register_family(
-    "qwen3.5-omni",
-    "qwen3_5_omni",
-    "qwen3-5-omni",
-    "qwen35-omni",
-    retarget_allowed=False,
-    kv_state=True,
-    allowed_ars=frozenset({1, 128}),
-)
+# Derived from the canonical family records: one declaration site, so a
+# spelling can no longer resolve here and fail in the profile table.
+for _record in FAMILY_RECORDS:
+    _register_family(
+        _record.canonical_name,
+        *_record.aliases,
+        retarget_allowed=_record.retarget_allowed,
+        kv_state=_record.kv_state,
+        allowed_ars=_record.allowed_ars,
+    )
+del _record
 
 
 def _family_policy(family: Any, ar: int, cl: int) -> _FamilyPolicy:

@@ -110,3 +110,42 @@ def test_diagnoser_rejects_missing_requested_outputs() -> None:
             {"slice0": {"hidden": np.ones(1)}},
             teacher_forced_outputs={"slice0": {}},
         )
+
+
+# --------------------------------------------------------------------------- #
+# A non-finite device tensor localizes instead of aborting blind (T16)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_non_finite_device_tensor_names_the_slice_and_tensor() -> None:
+    from qairt_agent.errors import InvalidSpecError
+
+    diagnoser = QualityDiagnoser()
+    references = {"decoder_00": {"hidden": np.array([1.0, 2.0], dtype=np.float32)}}
+    chain = {
+        "decoder_00": {"hidden": np.array([1.0, np.nan], dtype=np.float32)}
+    }
+
+    with pytest.raises(InvalidSpecError) as error:
+        diagnoser.diagnose_slices(references, device_chain_outputs=chain)
+
+    assert "decoder_00.hidden" in str(error.value)
+    details = error.value.details
+    assert details["slice_id"] == "decoder_00"
+    assert details["tensor_name"] == "hidden"
+    assert details["source"] == "device_chain"
+    assert details["non_finite_elements"] == 1
+    assert details["element_count"] == 2
+
+
+def test_a_non_finite_teacher_tensor_says_which_side_it_was() -> None:
+    from qairt_agent.errors import InvalidSpecError
+
+    diagnoser = QualityDiagnoser()
+    references = {"decoder_00": {"hidden": np.array([1.0], dtype=np.float32)}}
+    teacher = {"decoder_00": {"hidden": np.array([np.inf], dtype=np.float32)}}
+
+    with pytest.raises(InvalidSpecError) as error:
+        diagnoser.diagnose_slices(references, teacher_forced_outputs=teacher)
+
+    assert error.value.details["source"] == "teacher_forced"

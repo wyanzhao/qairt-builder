@@ -13,6 +13,8 @@ import pytest
 from onnx import TensorProto, helper
 
 from qairt_agent.artifacts import ManifestStore, verify_artifact
+from qairt_agent.device import SOC_VERIFICATION_SCHEMA
+from qairt_agent.harness import resolve_target
 from qairt_agent.contracts import (
     ArtifactRef,
     BenchmarkSpec,
@@ -31,6 +33,8 @@ from qairt_agent.qairt_adapter import (
     GenAIContainerBuildResult,
     GenAIRawSliceArtifact,
     ModelVariantArtifact,
+    NativeKvGraphExpectation,
+    QuantizedModelArtifact,
     PreflightReport,
     TransformedSliceArtifact,
     Qwen35ValidationEvidence,
@@ -41,6 +45,8 @@ from qairt_agent.qairt_adapter.errors import (
     QairtPreflightError,
 )
 from qairt_agent.vectors import VectorPreparer
+
+_ACTIVE_TARGET = resolve_target()
 
 
 def _write_onnx(
@@ -331,6 +337,80 @@ class FakeAdapter:
             target_soc="SM8750",
             dsp_arch="v79",
             soc_model=69,
+        )
+
+    # The low-level stage tools (the deprecated per-stage debugging surface)
+    # are part of the declared adapter boundary, so the fake implements them
+    # too -- otherwise the fake and the real adapter drift silently, which is
+    # exactly what QairtAdapterProtocol exists to prevent.
+    def ar_convert(
+        self,
+        model_path: str | Path,
+        *,
+        ar: int = 1,
+        context_length: int = 4096,
+        **kwargs: Any,
+    ) -> ModelVariantArtifact:
+        self.log.record(self.adapter_id, "ar_convert", ar=ar, cl=context_length)
+        return ModelVariantArtifact(
+            model_path=Path(model_path),
+            encodings_path=None,
+            ar=ar,
+            context_length=context_length,
+            source_kind="derived",
+            family=None,
+        )
+
+    def transform(
+        self,
+        variant_or_path: Any,
+        *,
+        output_dir: str | Path = ".",
+        **kwargs: Any,
+    ) -> tuple[TransformedSliceArtifact, ...]:
+        self.log.record(self.adapter_id, "transform")
+        source = Path(getattr(variant_or_path, "model_path", variant_or_path))
+        return (
+            TransformedSliceArtifact(
+                slice_name="decoder_00",
+                split_index=0,
+                model_path=source,
+                encodings_path=None,
+                ar=getattr(variant_or_path, "ar", 1),
+                context_length=getattr(variant_or_path, "context_length", 4096),
+            ),
+        )
+
+    def convert(
+        self,
+        slice_or_path: Any,
+        *,
+        output_path: str | Path | None = None,
+        **kwargs: Any,
+    ) -> ConvertedModelArtifact:
+        self.log.record(self.adapter_id, "convert")
+        source = Path(getattr(slice_or_path, "model_path", slice_or_path))
+        return ConvertedModelArtifact(
+            model_path=Path(output_path) if output_path is not None else source,
+            source_model_path=source,
+            quantization_mode="apply_encodings",
+            slice_name=getattr(slice_or_path, "slice_name", None),
+            ar=getattr(slice_or_path, "ar", None),
+            context_length=getattr(slice_or_path, "context_length", None),
+        )
+
+    def quantize(
+        self,
+        model_or_path: Any,
+        *,
+        output_path: str | Path | None = None,
+        **kwargs: Any,
+    ) -> QuantizedModelArtifact:
+        self.log.record(self.adapter_id, "quantize")
+        source = Path(getattr(model_or_path, "model_path", model_or_path))
+        return QuantizedModelArtifact(
+            dlc_path=Path(output_path) if output_path is not None else source,
+            encodings_path=None,
         )
 
     def create_calibration_config(self, **kwargs: Any) -> dict[str, Any]:
@@ -922,13 +1002,34 @@ class MultiArFakeAdapter(FakeAdapter):
         )
 
 
+class OneArUnmeteredFakeAdapter(MultiArFakeAdapter):
+    """Device profiling works for AR1 and fails for AR128.
+
+    Exactly the shape of a real degraded capture: one AR publishes
+    ``device_execution``, the other publishes ``available=false``.
+    """
+
+    def capture_device_execution(self, context, inputs, *, graph_name, **kwargs):
+        if str(graph_name).endswith("ar128"):
+            raise RuntimeError("profiler returned no execute message")
+        return super().capture_device_execution(
+            context, inputs, graph_name=graph_name, **kwargs
+        )
+
+
 class MultiArFakeAdapterFactory(FakeAdapterFactory):
+    adapter_class = MultiArFakeAdapter
+
     def __call__(self) -> FakeAdapter:
-        return MultiArFakeAdapter(
+        return self.adapter_class(
             self.log,
             result_style=self.result_style,
             profile_cycles=self.profile_cycles,
         )
+
+
+class OneArUnmeteredFakeAdapterFactory(MultiArFakeAdapterFactory):
+    adapter_class = OneArUnmeteredFakeAdapter
 
 
 class FakeVlAdapter(FakeAdapter):
@@ -1234,6 +1335,19 @@ class FakeDeviceRuntime:
         yield SimpleNamespace(
             device=self.device,
             identifier="TEST@localhost:5037",
+            # The real DeviceRuntime verifies the handset's soc_id against the
+            # resolved target before it leases anything; the stage records what
+            # it saw, so the fake carries the same shape.
+            soc_verification={
+                "schema": SOC_VERIFICATION_SCHEMA,
+                "status": "verified",
+                "serial": "TEST",
+                "target": _ACTIVE_TARGET.name,
+                "expected_soc_id": list(_ACTIVE_TARGET.soc_id),
+                "observed_soc_id": (
+                    _ACTIVE_TARGET.soc_id[0] if _ACTIVE_TARGET.soc_id else None
+                ),
+            },
             adb=SimpleNamespace(
                 attempt_dir=(
                     "/data/local/tmp/qairt-agent/test/stage/attempt-001/"
@@ -4402,3 +4516,468 @@ def test_auto_diagnose_fails_closed_without_sqnr_drop_or_optrace(
     assert diagnosed.error is not None
     assert diagnosed.error.code is ErrorCode.INVALID_SPEC
     assert "no provable quality divergence" in diagnosed.error.message
+
+
+def test_a_config_naming_another_family_fails_the_declared_preset(
+    tmp_path: Path,
+) -> None:
+    """The preset routes, but a config that contradicts it is not ignored.
+
+    A Qwen3.5 hybrid export declared `qwen3_dense` would otherwise slip past
+    every family-specific gate downstream, because the preset short-circuits
+    family resolution before the architecture table is ever consulted.
+    """
+
+    spec = _make_spec(tmp_path)
+    config_path = tmp_path / "declared-wrong" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForCausalLM"],
+                "model_type": "qwen3_5",
+                "hidden_size": 16,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 4096,
+                "vocab_size": 32,
+            }
+        )
+    )
+    spec = spec.model_copy(
+        update={"metadata": {"model_config_path": str(config_path)}}
+    )
+    agent = _fake_agent(FakeAdapterFactory())
+
+    result = agent.plan(spec, offline=True)
+
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code is ErrorCode.INVALID_SPEC
+    assert "qwen3" in result.error.message
+    assert "Qwen3_5ForCausalLM" in result.error.message
+    details = result.error.details
+    assert details["implied_family"] == "qwen3.5"
+    assert details["config_path"] == str(config_path)
+
+
+def test_an_unknown_architecture_is_recorded_rather_than_refused(
+    tmp_path: Path,
+) -> None:
+    # An incomplete architecture table must not block a genuinely new family.
+    spec = _make_spec(tmp_path)
+    config = dict(spec.metadata["model_config"])
+    config["architectures"] = ["SomeNewForCausalLM"]
+    config.pop("model_type", None)
+    spec = spec.model_copy(update={"metadata": {"model_config": config}})
+    agent = _fake_agent(FakeAdapterFactory())
+
+    plan = agent.plan(spec, offline=True)
+
+    cross_check = plan.data["effective_config"]["family_cross_check"]
+    assert cross_check["status"] == "unknown_architecture"
+    assert cross_check["architectures"] == ["SomeNewForCausalLM"]
+
+
+def test_compile_context_carries_model_path_into_the_native_kv_audit(
+    tmp_path: Path,
+) -> None:
+    """The audit maps QAIRT's ONNX-stem graph names back through model_path.
+
+    Dropping it in the JSON round-trip left ``by_stem`` empty, so the SDK's own
+    selection kept its stem names and could never match the graph names this
+    program audits against -- the standalone stage tool could not pass.
+    """
+
+    factory = FakeAdapterFactory()
+    agent = _fake_agent(factory)
+    plan = agent.plan(_make_spec(tmp_path), offline=True)
+    assert plan.manifest is not None
+    slice_model = _write_onnx(tmp_path / "transformed" / "decoder_00_ar1.onnx")
+    models = (_write(tmp_path / "models" / "ar1.dlc", b"ar1"),)
+
+    result = agent.compile_context(
+        plan.manifest.path,
+        plan.manifest.sha256,
+        config={
+            "models": models,
+            "output_path": tmp_path / "contexts" / "one.bin",
+            "graph_names": ["decoder_ar1"],
+            "ar_values": [1],
+            "source_kinds": ["derived"],
+            "slice_name": "decoder_00",
+            "context_length": 4096,
+            "native_kv_expectations": [
+                {
+                    "graph_name": "decoder_ar1",
+                    "ar": 1,
+                    "input_names": ["past_key_0_in", "hidden"],
+                    "output_names": ["present_key_0_out"],
+                    "model_path": str(slice_model),
+                }
+            ],
+        },
+    )
+
+    assert result.ok
+    compile_call = next(
+        details
+        for _, name, details in factory.log.calls
+        if name == "compile_context"
+    )
+    expectation = compile_call["native_kv_expectations"][0]
+    assert expectation.model_path == slice_model
+    # The stem is what QAIRT names the graph, so it must survive the trip.
+    assert expectation.model_path.stem == "decoder_00_ar1"
+
+
+def test_native_kv_expectation_round_trips_through_json() -> None:
+    original = NativeKvGraphExpectation(
+        graph_name="decoder_ar128",
+        ar=128,
+        input_names=("past_key_0_in",),
+        output_names=("present_key_0_out",),
+        model_path=Path("/m/transformed/decoder_00_ar128.onnx"),
+    )
+
+    restored = NativeKvGraphExpectation.from_dict(
+        json.loads(json.dumps(original.to_dict()))
+    )
+
+    assert restored == original
+
+
+def test_a_degraded_per_ar_capture_is_named_in_the_aggregate(
+    tmp_path: Path,
+) -> None:
+    """The aggregate label must follow the evidence, not the intent.
+
+    ``latency_metric`` was hardcoded to "device_execution" for the whole set,
+    so one AR losing its device meter still published as if every AR had one.
+    """
+
+    ar1_vectors = _vector_case(
+        tmp_path / "ar1",
+        inputs={"x": np.array([1.0], dtype=np.float32)},
+        goldens={"y": np.array([1.0], dtype=np.float32)},
+        case_id="degraded-ar1",
+    )
+    ar128_vectors = _vector_case(
+        tmp_path / "ar128",
+        inputs={"x": np.array([128.0], dtype=np.float32)},
+        goldens={"y": np.array([128.0], dtype=np.float32)},
+        case_id="degraded-ar128",
+    )
+    spec = _make_spec(
+        tmp_path,
+        vectors={
+            "mode": "provided",
+            "validation_manifests_by_ar": {1: ar1_vectors, 128: ar128_vectors},
+        },
+        sequence={
+            "ars": [1, 128],
+            "context_lengths": [4096],
+            "weight_sharing": True,
+            "native_kv": False,
+        },
+    )
+    agent = _fake_agent(OneArUnmeteredFakeAdapterFactory())
+    built = agent.build(spec)
+    assert built.ok, built.error
+    validated = agent.validate(built.manifest.path, built.manifest.sha256)
+    assert validated.ok, validated.error
+
+    benchmarked = agent.benchmark(
+        validated.manifest.path,
+        validated.manifest.sha256,
+        config={"warmup_runs": 0, "measured_runs": 1, "aa_calibration": False},
+    )
+
+    assert benchmarked.ok, benchmarked.error
+    assert benchmarked.data is not None
+    assert benchmarked.data["latency_metric"] == "partial"
+    coverage = benchmarked.data["coverage"]
+    assert coverage["device_meter_complete"] is False
+    assert coverage["metered_ars"] == [1]
+    assert coverage["unmetered_ars"] == [128]
+    assert "128" in coverage["unmetered_ar_reasons"]
+    # The AR that did measure keeps its own device block untouched.
+    ar1 = benchmarked.data["results_by_ar"]["1"]["report"]
+    assert ar1["latency_metric"] == "device_execution"
+
+
+# --------------------------------------------------------------------------- #
+# Cross-run comparison (T17)
+# --------------------------------------------------------------------------- #
+
+
+def _benchmarked_run(tmp_path: Path, name: str, *, optrace: bool = False) -> Any:
+    """Build, validate and benchmark one run and return its manifest ref."""
+
+    vectors = _vector_case(
+        tmp_path / name,
+        inputs={"x": np.array([1.0], dtype=np.float32)},
+        goldens={"y": np.array([1.0], dtype=np.float32)},
+        case_id=f"{name}-case",
+    )
+    spec = _make_spec(
+        tmp_path / name,
+        vectors={"mode": "provided", "validation_manifest": vectors},
+        sequence={
+            "ars": [1],
+            "context_lengths": [4096],
+            "weight_sharing": False,
+            "native_kv": False,
+        },
+    )
+    agent = _fake_agent(FakeAdapterFactory())
+    built = agent.build(spec)
+    assert built.ok, built.error
+    validated = agent.validate(built.manifest.path, built.manifest.sha256)
+    assert validated.ok, validated.error
+    benchmarked = agent.benchmark(
+        validated.manifest.path,
+        validated.manifest.sha256,
+        config={
+            "warmup_runs": 0,
+            "measured_runs": 1,
+            "aa_calibration": False,
+            "optrace": optrace,
+        },
+    )
+    assert benchmarked.ok, benchmarked.error
+    return benchmarked.manifest
+
+
+def test_compare_reports_deltas_with_dispersion_and_verified_provenance(
+    tmp_path: Path,
+) -> None:
+    """A latency change is only readable against its published dispersion."""
+
+    from qairt_agent.compare import COMPARE_SCHEMA, compare_runs
+
+    baseline = _benchmarked_run(tmp_path, "baseline")
+    candidate = _benchmarked_run(tmp_path, "candidate")
+
+    delta = compare_runs(baseline, candidate)
+
+    assert delta["schema"] == COMPARE_SCHEMA
+    assert delta["policy"] == "report_only"
+    latency_rows = delta["latency"]["by_ar"]
+    assert latency_rows
+    row = latency_rows[0]
+    assert row["comparable"] is True
+    assert row["delta_us"] == 0.0
+    assert "pooled_cv_percent" in row
+    assert "delta_in_pooled_cv" in row
+    assert delta["quality"]["tap_count"] >= 1
+    for side in ("baseline", "candidate"):
+        provenance = delta["provenance"][side]
+        assert provenance["evidence_verified"] is True
+        assert provenance["manifest_sha256"]
+        assert provenance["latency_report_sha256"]
+
+
+def test_compare_produces_no_pass_fail_verdict(tmp_path: Path) -> None:
+    from qairt_agent.compare import compare_runs
+
+    delta = compare_runs(
+        _benchmarked_run(tmp_path, "a"), _benchmarked_run(tmp_path, "b")
+    )
+
+    rendered = json.dumps(delta)
+    for forbidden in ('"pass"', '"fail"', '"verdict"', '"regression": true'):
+        assert forbidden not in rendered
+    assert delta["claim_scope"] == "measured_delta_not_a_verdict"
+
+
+def test_compare_refuses_a_pair_whose_identity_differs(tmp_path: Path) -> None:
+    # A delta between runs of different shapes is not a measurement of
+    # anything, so the mismatch is named rather than averaged over.
+    from qairt_agent.compare import compare_runs
+
+    baseline = _benchmarked_run(tmp_path, "single-ar")
+
+    ar1_vectors = _vector_case(
+        tmp_path / "multi" / "ar1",
+        inputs={"x": np.array([1.0], dtype=np.float32)},
+        goldens={"y": np.array([1.0], dtype=np.float32)},
+        case_id="multi-ar1",
+    )
+    ar128_vectors = _vector_case(
+        tmp_path / "multi" / "ar128",
+        inputs={"x": np.array([128.0], dtype=np.float32)},
+        goldens={"y": np.array([128.0], dtype=np.float32)},
+        case_id="multi-ar128",
+    )
+    multi_spec = _make_spec(
+        tmp_path / "multi",
+        vectors={
+            "mode": "provided",
+            "validation_manifests_by_ar": {1: ar1_vectors, 128: ar128_vectors},
+        },
+        sequence={
+            "ars": [1, 128],
+            "context_lengths": [4096],
+            "weight_sharing": True,
+            "native_kv": False,
+        },
+    )
+    agent = _fake_agent(MultiArFakeAdapterFactory())
+    built = agent.build(multi_spec)
+    assert built.ok, built.error
+    validated = agent.validate(built.manifest.path, built.manifest.sha256)
+    assert validated.ok, validated.error
+    candidate = agent.benchmark(
+        validated.manifest.path,
+        validated.manifest.sha256,
+        config={"warmup_runs": 0, "measured_runs": 1, "aa_calibration": False},
+    ).manifest
+
+    with pytest.raises(InvalidSpecError) as error:
+        compare_runs(baseline, candidate)
+
+    assert "ars" in str(error.value)
+    fields = {item["field"] for item in error.value.details["mismatches"]}
+    assert "ars" in fields
+
+
+def test_kind_latency_runs_the_latency_path_despite_sqnr_observations(
+    tmp_path: Path,
+) -> None:
+    """`kind: "latency"` used to be ignored.
+
+    Automatic selection keyed on "some observation has nonzero noise", which is
+    true of every healthy quantized run, so the latency path was unreachable
+    once a validate stage had run.
+    """
+
+    vectors = _vector_case(
+        tmp_path / "kind",
+        inputs={"x": np.array([1.0], dtype=np.float32)},
+        goldens={"y": np.array([0.5], dtype=np.float32)},
+        case_id="kind-case",
+    )
+    spec = _make_spec(
+        tmp_path,
+        vectors={"mode": "provided", "validation_manifest": vectors},
+        sequence={
+            "ars": [1],
+            "context_lengths": [4096],
+            "weight_sharing": False,
+            "native_kv": False,
+        },
+    )
+    agent = _fake_agent(FakeAdapterFactory())
+    built = agent.build(spec)
+    assert built.ok, built.error
+    validated = agent.validate(built.manifest.path, built.manifest.sha256)
+    assert validated.ok, validated.error
+    benchmarked = agent.benchmark(
+        validated.manifest.path,
+        validated.manifest.sha256,
+        config={
+            "warmup_runs": 0,
+            "measured_runs": 1,
+            "aa_calibration": False,
+            "optrace": True,
+        },
+    )
+    assert benchmarked.ok, benchmarked.error
+
+    # The manifest carries diverging SQNR observations, so the old selector
+    # would have produced a quality report here.
+    sqnr = json.loads(
+        next(
+            artifact
+            for artifact in _load_run(benchmarked.manifest).artifacts
+            if artifact.logical_name == "sqnr_report"
+        ).path.read_text(encoding="utf-8")
+    )
+    assert any(
+        observation.get("device_chain", {}).get("noise_energy", 0.0) > 0.0
+        for observation in sqnr["observations"]
+    )
+
+    diagnosed = agent.diagnose_latency(
+        benchmarked.manifest.path,
+        benchmarked.manifest.sha256,
+    )
+
+    assert diagnosed.ok, diagnosed.error
+    assert diagnosed.data is not None
+    assert diagnosed.data["diagnosis_kind"] == "latency"
+    assert diagnosed.data["considered"]["quality"] == "skipped_by_kind"
+
+
+def test_automatic_mode_reports_both_paths_when_both_have_evidence(
+    tmp_path: Path,
+) -> None:
+    # Nonzero noise no longer *selects* quality over latency; when both paths
+    # have verified evidence, both are reported.
+    vectors = _vector_case(
+        tmp_path / "both",
+        inputs={"x": np.array([1.0], dtype=np.float32)},
+        goldens={"y": np.array([0.5], dtype=np.float32)},
+        case_id="both-case",
+    )
+    spec = _make_spec(
+        tmp_path,
+        vectors={"mode": "provided", "validation_manifest": vectors},
+        sequence={
+            "ars": [1],
+            "context_lengths": [4096],
+            "weight_sharing": False,
+            "native_kv": False,
+        },
+    )
+    agent = _fake_agent(FakeAdapterFactory())
+    built = agent.build(spec)
+    validated = agent.validate(built.manifest.path, built.manifest.sha256)
+    benchmarked = agent.benchmark(
+        validated.manifest.path,
+        validated.manifest.sha256,
+        config={
+            "warmup_runs": 0,
+            "measured_runs": 1,
+            "aa_calibration": False,
+            "optrace": True,
+        },
+    )
+
+    diagnosed = agent.diagnose_quality(
+        benchmarked.manifest.path,
+        benchmarked.manifest.sha256,
+    )
+
+    assert diagnosed.ok, diagnosed.error
+    assert diagnosed.data is not None
+    assert diagnosed.data["diagnosis_kind"] == "quality_and_latency"
+    assert diagnosed.data["considered"] == {"quality": "found", "latency": "found"}
+    assert diagnosed.data["quality"]["diagnosis_kind"] == "quality"
+    assert diagnosed.data["latency"]["diagnosis_kind"] == "latency"
+
+
+def test_a_baseline_diagnosis_reports_where_the_measured_change_points(
+    tmp_path: Path,
+) -> None:
+    baseline = _benchmarked_run(tmp_path, "before", optrace=True)
+    candidate = _benchmarked_run(tmp_path, "after", optrace=True)
+    agent = _fake_agent(FakeAdapterFactory())
+
+    diagnosed = agent.diagnose_quality(
+        candidate.path,
+        candidate.sha256,
+        config={"baseline_manifest": str(baseline.path)},
+    )
+
+    assert diagnosed.ok, diagnosed.error
+    assert diagnosed.data is not None
+    comparison = diagnosed.data["comparison"]
+    assert comparison["schema"] == "qairt-agent.run-comparison/1"
+    implicated = diagnosed.data["implicated"]
+    # Two identical runs: nothing moved, so nothing is implicated.
+    assert implicated["quality"] is False
+    assert implicated["latency"] is False
+    assert "pooled CV" in implicated["rule"]

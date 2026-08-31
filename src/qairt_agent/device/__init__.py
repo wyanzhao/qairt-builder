@@ -17,6 +17,7 @@ from qairt_agent.device.adb import (
 )
 from qairt_agent.device.doctor import device_doctor, device_gc, require_healthy
 from qairt_agent.device.lease import DeviceLease, list_stale_leases
+from qairt_agent.device.soc import SOC_VERIFICATION_SCHEMA, verify_device_soc
 from qairt_agent.device.runtime import (
     ENV_ADB_CANONICAL_SERVER,
     ENV_LEASES_DIR,
@@ -35,8 +36,10 @@ __all__ = [
     "ENV_LEASES_DIR",
     "ENV_ADB_CANONICAL_SERVER",
     "canonicalize_adb_server",
+    "SOC_VERIFICATION_SCHEMA",
     "device_doctor",
     "device_gc",
+    "verify_device_soc",
     "list_stale_leases",
     "parse_remote_attempt_dir",
     "remote_attempt_dir",
