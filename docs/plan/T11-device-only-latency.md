@@ -138,7 +138,12 @@ the mean alone.
 
 - GenAI half (`genie_execution`): blocked on [T08](T08-aimet-vector-import.md)
   for a real container.
-- Chain scope: **covered 2026-08-30.** The timed pass records what each slice
+- Chain scope: **covered 2026-08-30, and verified on hardware.** Job
+  `20260830T235541Z-02deec10` on SM8750 chained two independently built slices
+  and measured both: slice0 77.8 us and slice1 73.1 us of accelerator compute,
+  ten executes each, `totals` 150.9 us against a wall p50 of 9994.5 ms. The
+  fixture comes from `tools/make_smoke_fixture.py --chain`, so this is
+  reproducible without a proprietary model. The timed pass records what each slice
   was actually fed and every slice is then profiled with those exact inputs;
   `by_slice` carries one block per slice and `totals` is a labelled sum of
   per-slice means. The low-level lane now has no `available: false` scope.

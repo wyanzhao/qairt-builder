@@ -150,6 +150,181 @@ def build_encodings(
     return path
 
 
+def build_chain_fixture(
+    output_dir: Path,
+    *,
+    target: str,
+    artifacts_root: Path,
+    rng: np.random.Generator,
+) -> dict[str, str]:
+    """Two slices whose shapes compose, plus the routes that chain them.
+
+    A single-slice fixture cannot exercise the paths that only exist when one
+    slice feeds another: chain-scope device capture, the multi-slice diagnostic
+    execution branch, and the `chain`/`teacher_forced` SQNR modes. Those were
+    covered only by fake adapters until this existed.
+    """
+
+    middle = 48
+    weight0 = rng.normal(0.0, 0.125, (IN_FEATURES, middle)).astype(np.float32)
+    bias0 = rng.normal(0.0, 0.05, (middle,)).astype(np.float32)
+    weight1 = rng.normal(0.0, 0.125, (middle, OUT_FEATURES)).astype(np.float32)
+    bias1 = rng.normal(0.0, 0.05, (OUT_FEATURES,)).astype(np.float32)
+    sample = rng.normal(0.0, 1.0, (1, IN_FEATURES)).astype(np.float32)
+
+    # Float reference for both slices, so each slice has its own golden and
+    # teacher_forced can feed a slice its own boundary rather than a device
+    # output.
+    h0_a = sample @ weight0
+    h1_a = h0_a + bias0
+    hidden = np.maximum(h1_a, 0.0).astype(np.float32)
+    h0_b = hidden @ weight1
+    h1_b = h0_b + bias1
+    output = np.maximum(h1_b, 0.0).astype(np.float32)
+
+    from qairt_agent.vectors import VectorPreparer
+
+    slices: list[dict[str, object]] = [
+        {
+            "name": "slice0",
+            "weight": weight0,
+            "bias": bias0,
+            "input_name": "input",
+            "output_name": "hidden",
+            "inputs": {"input": sample},
+            "goldens": {"hidden": hidden},
+            "activations": {"input": sample, "h0": h0_a, "h1": h1_a, "hidden": hidden},
+        },
+        {
+            "name": "slice1",
+            "weight": weight1,
+            "bias": bias1,
+            "input_name": "hidden",
+            "output_name": "output",
+            "inputs": {"hidden": hidden},
+            "goldens": {"output": output},
+            "activations": {"hidden": hidden, "h0": h0_b, "h1": h1_b, "output": output},
+        },
+    ]
+
+    produced: dict[str, str] = {}
+    slice_manifests: dict[str, str] = {}
+    for item in slices:
+        name = str(item["name"])
+        slice_dir = output_dir / name
+        weight = item["weight"]
+        bias = item["bias"]
+        model_path = slice_dir / f"{name}.onnx"
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        graph = helper.make_graph(
+            [
+                helper.make_node("MatMul", [item["input_name"], "w"], ["h0"], name="fc"),
+                helper.make_node("Add", ["h0", "b"], ["h1"], name="bias_add"),
+                helper.make_node("Relu", ["h1"], [item["output_name"]], name="act"),
+            ],
+            name,
+            [
+                helper.make_tensor_value_info(
+                    str(item["input_name"]), TensorProto.FLOAT, [1, weight.shape[0]]
+                )
+            ],
+            [
+                helper.make_tensor_value_info(
+                    str(item["output_name"]), TensorProto.FLOAT, [1, weight.shape[1]]
+                )
+            ],
+            initializer=[
+                helper.make_tensor(
+                    "w", TensorProto.FLOAT, list(weight.shape), weight.ravel().tolist()
+                ),
+                helper.make_tensor(
+                    "b", TensorProto.FLOAT, list(bias.shape), bias.ravel().tolist()
+                ),
+            ],
+        )
+        model = helper.make_model(
+            graph, opset_imports=[helper.make_operatorsetid("", OPSET)]
+        )
+        model.ir_version = IR_VERSION
+        onnx.save_model(model, model_path)
+
+        encodings_path = build_encodings(
+            slice_dir / f"{name}.encodings",
+            activations=dict(item["activations"]),
+            parameters={"w": weight, "b": bias},
+        )
+        manifest_path = VectorPreparer(slice_dir / "vectors").prepare_case(
+            f"{name}-ar1",
+            dict(item["inputs"]),
+            goldens=dict(item["goldens"]),
+            metadata={"purpose": "chain smoke slice", "slice": name},
+        )
+        slice_manifests[name] = str(manifest_path)
+
+        spec = {
+            "name": f"smoke-{name}",
+            "preset": "vit",
+            "sources": {
+                "text": {"onnx": str(model_path), "encodings": str(encodings_path)}
+            },
+            "quantization": {"mode": "apply_encodings"},
+            "sequence": {"ars": [1], "weight_sharing": False, "native_kv": False},
+            "split": {"decoder_slice_count": 1, "split_lm_head": False},
+            "transforms": {"mha2sha": False},
+            "vectors": {"mode": "provided", "validation_manifest": str(manifest_path)},
+            "benchmark": {"warmup_runs": 2, "measured_runs": 5, "optrace": False},
+            "target": {"backend": "HTP", "name": target},
+            "output_root": str(artifacts_root / name),
+        }
+        spec_path = slice_dir / "spec.json"
+        spec_path.write_text(json.dumps(spec, indent=2) + "\n")
+        produced[f"{name}_spec"] = str(spec_path)
+        produced[f"{name}_model"] = str(model_path)
+        produced[f"{name}_context"] = str(
+            artifacts_root / name / "runs" / "<run_id>" / "build" / "contexts" / f"{name}.bin"
+        )
+
+    chain_manifest = VectorPreparer(output_dir / "vectors").prepare_case(
+        "chain-ar1",
+        {"input": sample},
+        goldens={"output": output},
+        metadata={"purpose": "chain smoke end-to-end"},
+    )
+
+    # The stage config both validate and benchmark take. Context paths are
+    # filled in after the two builds, because each build mints its own run id.
+    chain_config = {
+        "ar": 1,
+        "context_length": 4096,
+        "vector_manifest": str(chain_manifest),
+        "routes": [
+            {
+                "slice_id": "slice0",
+                "input_names": ["input"],
+                "output_names": ["hidden"],
+                "graph_names": {"1": "slice0"},
+            },
+            {
+                "slice_id": "slice1",
+                "input_names": ["hidden"],
+                "output_names": ["output"],
+                "graph_names": {"1": "slice1"},
+                "from_previous": {"hidden": "hidden"},
+            },
+        ],
+        "contexts": {"slice0": "<fill in>", "slice1": "<fill in>"},
+        "slice_vector_manifests": slice_manifests,
+        "warmup_runs": 2,
+        "measured_runs": 5,
+        "aa_calibration": False,
+    }
+    chain_config_path = output_dir / "chain-stage-config.json"
+    chain_config_path.write_text(json.dumps(chain_config, indent=2) + "\n")
+    produced["chain_vector_manifest"] = str(chain_manifest)
+    produced["chain_stage_config"] = str(chain_config_path)
+    return produced
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -169,6 +344,14 @@ def main() -> int:
             "where the run writes artifacts (default: artifacts/smoke). It must "
             "not live under the models directory: the worker mounts that "
             "read-only, so a build there fails with EROFS."
+        ),
+    )
+    parser.add_argument(
+        "--chain",
+        action="store_true",
+        help=(
+            "also emit a two-slice fixture whose shapes compose, for chain-scope "
+            "device capture and multi-slice diagnostic execution"
         ),
     )
     arguments = parser.parse_args()
@@ -249,10 +432,21 @@ def main() -> int:
     debug_spec_path = output_dir / "spec-layer-debug.json"
     debug_spec_path.write_text(json.dumps(debug_spec, indent=2) + "\n")
 
+    chain_outputs: dict[str, str] = {}
+    if arguments.chain:
+        chain_outputs = build_chain_fixture(
+            output_dir / "chain",
+            target=arguments.target,
+            artifacts_root=Path(arguments.artifacts_root).expanduser().resolve()
+            / "chain",
+            rng=rng,
+        )
+
     print(
         json.dumps(
             {
                 "ok": True,
+                **chain_outputs,
                 "model": str(model_path),
                 "encodings": str(encodings_path),
                 "vector_manifest": str(manifest_path),

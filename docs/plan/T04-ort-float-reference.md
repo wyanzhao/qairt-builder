@@ -241,8 +241,20 @@ divergence; it deliberately does not adjudicate it.
 ### Coverage gap to be honest about
 
 The multi-slice branch (several diagnostic contexts routed through
-`SliceChainRunner`) is implemented and its no-routes guard fails closed, but
-**no fixture test exercises the multi-slice success path** — the existing fake
-adapters do not emit diagnostic contexts through the build path the pipeline
-takes, and the acceptance model is single-slice. A multi-slice model, which
-needs [T08](T08-aimet-vector-import.md), is what would prove it.
+`SliceChainRunner`) is implemented and its guards fail closed, but **no run has
+exercised the multi-slice success path.**
+
+An attempt on 2026-08-30 established *why*, and it is structural rather than a
+missing fixture. `tools/make_smoke_fixture.py --chain` can build two composable
+slices and chain them — that is how chain-scope device capture and the
+`teacher_forced`/`chain` SQNR modes were verified on hardware. But diagnostic
+contexts belong to **the build that produced them**, and two independently built
+slices do not share a manifest, so a chain assembled that way has a diagnostic
+context for one slice and none for the other. Layer drilldown over a chain needs
+a single build that emits several diagnostic contexts, which means a genuine
+multi-slice build — an LLM-family model, still blocked on
+[T08](T08-aimet-vector-import.md).
+
+Rather than leave that as a missing-executor error deep inside the chain runner,
+`_diagnostic_device_outputs` now names the cause and lists which slices lack a
+diagnostic context.

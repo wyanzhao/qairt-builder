@@ -161,6 +161,35 @@ row is where to start looking, not the answer. `device_tensor_source`
 distinguishes a tensor tapped from a diagnostic context from a production
 context boundary.
 
+## Multi-slice: chain modes and per-slice device time
+
+Some behaviour only exists when one slice feeds another. Generate a two-slice
+fixture whose shapes compose:
+
+```bash
+python tools/make_smoke_fixture.py --output-dir models/smoke --chain
+```
+
+Build each slice, fill the built context paths into
+`models/smoke/chain/chain-stage-config.json`, and run a chain workflow. On the
+reference device this produces:
+
+- **Per-slice device time.** `device_execution.by_slice` carries one block per
+  slice — 77.8 µs and 73.1 µs of accelerator compute — and `totals` is a sum of
+  per-slice means, labelled as such because the slices run sequentially. The
+  wall p50 for the same work was 9994.5 ms.
+- **Local versus propagated error.** With
+  `quality.sqnr_modes = ["full_reference", "teacher_forced", "chain"]`,
+  `teacher_forced` feeds each slice its own golden boundary while `chain` feeds
+  it the previous slice's device output. Slice 1 measured 44.45 dB
+  teacher-forced and 40.45 dB chained: about 4 dB of its observed error is
+  inherited from slice 0, not its own. That separation is the reason both modes
+  exist.
+
+Layer drilldown does **not** work over a chain assembled this way. Diagnostic
+contexts belong to the build that produced them, so two independently built
+slices leave one of them without one; the stage says so and names the slices.
+
 ## Where to go next
 
 - Deploying a real model: `configs/README.md` for the per-cell layout, and

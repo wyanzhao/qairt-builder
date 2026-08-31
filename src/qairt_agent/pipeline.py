@@ -1929,6 +1929,29 @@ class QairtAgent:
         execution_options = self._execution_options(effective)
         native_io = bool(effective.get("native_io", False))
         if routes:
+            # Diagnostic contexts come from one build's manifest. A chain
+            # assembled from independently built contexts therefore has no
+            # diagnostic context for the slices that came from another run, and
+            # running it anyway would fail deep inside the chain runner with a
+            # missing-executor error instead of naming the cause.
+            missing = [
+                str(route.get("slice_id"))
+                for route in routes
+                if str(route.get("slice_id")) not in loaded
+            ]
+            if missing:
+                raise InvalidSpecError(
+                    "layer granularity needs a diagnostic context for every "
+                    "chain slice, and this build produced none for some of "
+                    "them; a chain assembled from separately built contexts "
+                    "cannot be drilled into, because diagnostic contexts belong "
+                    "to the build that made them",
+                    stage="validate",
+                    details={
+                        "slices_without_diagnostic_context": missing,
+                        "slices_with_diagnostic_context": sorted(loaded),
+                    },
+                )
             # Reuse the production chain wiring with the diagnostic contexts
             # substituted, so each slice is fed exactly what it is fed in a
             # real run instead of a guess at its inputs.
