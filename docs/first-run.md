@@ -140,9 +140,13 @@ in this program, by decision.
 
 **Latency** — `runs/<run>/stages/benchmark/<key>/attempt-001/latency_report.json`.
 Read `latency_metric` first. It names the block that is the latency, and that
-is `device_execution` — accelerator compute and execute time, QNN execute time,
-and per-operator cycles, averaged over ten profiled executes with `spread` and
-`samples` beside the mean.
+is `device_execution`. Inside it, **`production_latency_us` is the number this
+program reports as the model's latency**: QAIRT's accelerator compute time
+excluding wait, averaged over ten profiled executes. Read
+`production_latency_cv_percent` with it — the metric's absolute value is small,
+which makes it the most dispersed one in the block. `accelerator_execute_us`,
+`qnn_execute_us`, per-operator cycles, `spread` and `samples` are all published
+beside it.
 
 **Do not read the wall-clock number as latency.** It lives under
 `harness_diagnostics`, marked `not_latency: true`, because QAIRT relaunches

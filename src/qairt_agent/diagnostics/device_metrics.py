@@ -30,6 +30,9 @@ DEVICE_EXECUTION_SCHEMA = "qairt-agent.device-execution/2"
 # observes nothing there and that lane needs its own, differently named block.
 DEVICE_EXECUTION_METER = "qnn_accelerator"
 
+# The metric this program calls production latency (maintainer decision).
+PRODUCTION_LATENCY_SOURCE = "accelerator_compute_us"
+
 # Headline scalars averaged across samples.
 _AGGREGATED_SCALARS = (
     "accelerator_compute_us",
@@ -257,6 +260,15 @@ def aggregate_device_executions(
     )
 
     first = blocks[0]
+    # Production latency is the accelerator's own compute time, excluding wait
+    # (maintainer decision 2026-08-31): the cost of the model on the hardware,
+    # with this program's test harness and the device's queueing/memory waits
+    # both outside it.
+    #
+    # Its absolute value is small -- on SM8750 roughly 4% of accelerator execute
+    # time -- which makes it the most dispersed metric in this block, measured
+    # at 8-17% CV against ~2% for accelerator execute. The dispersion is
+    # published with it so a change can be read against it.
     aggregated: dict[str, Any] = {
         "schema": DEVICE_EXECUTION_SCHEMA,
         "meter": DEVICE_EXECUTION_METER,
@@ -286,6 +298,22 @@ def aggregate_device_executions(
     }
     for name, values in samples.items():
         aggregated[name] = statistics.fmean(values)
+
+    production = aggregated.get(PRODUCTION_LATENCY_SOURCE)
+    if isinstance(production, (int, float)):
+        spread = aggregated["spread"][PRODUCTION_LATENCY_SOURCE]
+        aggregated["production_latency_us"] = float(production)
+        aggregated["production_latency_source"] = PRODUCTION_LATENCY_SOURCE
+        aggregated["production_latency_cv_percent"] = (
+            100.0 * spread["stddev"] / production if production else None
+        )
+        aggregated["production_latency_note"] = (
+            "accelerator compute excluding wait: the model-and-hardware cost "
+            "this program reports as production latency, with host orchestration "
+            "and device queueing/memory wait both outside it; its small absolute "
+            "value makes it the most dispersed metric here, so read "
+            "production_latency_cv_percent alongside it"
+        )
     return aggregated
 
 
@@ -297,6 +325,7 @@ __all__ = [
     "CYCLES_IDENTIFIER",
     "DEVICE_EXECUTION_SCHEMA",
     "DeviceMetricsError",
+    "PRODUCTION_LATENCY_SOURCE",
     "QNN_EXECUTE_IDENTIFIER",
     "parse_device_execution",
 ]

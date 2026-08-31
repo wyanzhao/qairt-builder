@@ -26,8 +26,12 @@ and `p50_ms_per_token` live there too, since both derive from it.
 
 Read from QAIRT's own profiling log at `level="detailed"`:
 
-- `accelerator_compute_us` — accelerator time excluding wait; the closest thing
-  to "what the NPU spent".
+- `accelerator_compute_us` — accelerator time excluding wait. **This is what
+  this program calls production latency**, republished as
+  `production_latency_us`. Host orchestration and the device's queueing/memory
+  wait are both outside it. Its small absolute value makes it the most dispersed
+  metric here (8-17% CV against ~2% for accelerator execute), so read
+  `production_latency_cv_percent` alongside it.
 - `accelerator_execute_us`, `qnn_execute_us` — progressively wider scopes.
 - `per_op_cycles` — per-operator cycle counts.
 - `per_process_overhead_us` — load-binary, power-on, deinit, kept **separate**

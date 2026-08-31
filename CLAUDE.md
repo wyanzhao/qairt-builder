@@ -316,9 +316,18 @@ summed into it, diagnostic contexts sit in a separate `diagnostic` section with
 than a zero. Benchmark reports embed the block copied verbatim from the verified
 build receipt rather than re-measuring. This is the only RAM metric.
 
-**Latency means device time.** A latency report names its metric in
-`latency_metric`, and that names the `device_execution` block or the string
-`unavailable` — never a host number. `device_execution` comes from QAIRT's own
+**Latency means device time, and production latency is
+`accelerator_compute_us`** — QAIRT's "Accelerator (execute excluding wait)
+time", the cost of the model on the hardware with host orchestration and device
+queueing/memory wait both outside it. It is published as
+`production_latency_us` with `production_latency_source` and
+`production_latency_cv_percent`; its small absolute value makes it the most
+dispersed metric in the block (8-17% CV against ~2% for accelerator execute), so
+a change is read against that dispersion. Deployment latency for Qwen3.5 is a
+different meter — Genie's device-measured token rate and time-to-first-token —
+and the two are never combined. A latency report names its metric in `latency_metric`, and
+that names the `device_execution` block or the string `unavailable` — never a
+host number. `device_execution` comes from QAIRT's own
 profiling log: accelerator compute and execute time, QNN execute time, per-op
 cycles, and per-process overhead kept separate. It is read at `level="detailed"`
 with **no** profiling option — `option="optrace"` additionally requires a

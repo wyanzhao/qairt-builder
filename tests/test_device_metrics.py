@@ -240,6 +240,57 @@ class DeviceExecutionAggregationTests(unittest.TestCase):
             aggregated["claim_scope"], "profiled_executes_not_the_host_wall_samples"
         )
 
+    def test_production_latency_is_accelerator_compute_with_its_spread(self) -> None:
+        # Maintainer decision: production latency is the accelerator's own
+        # compute time. Its small absolute value makes it the most dispersed
+        # metric in the block, so the report must never present it without its
+        # dispersion.
+        blocks = [
+            parse_device_execution(_report_with(compute, compute * 10, compute * 100))
+            for compute in (70, 80, 90)
+        ]
+
+        aggregated = aggregate_device_executions(blocks)
+
+        self.assertEqual(aggregated["production_latency_source"], "accelerator_compute_us")
+        self.assertEqual(aggregated["production_latency_us"], 80.0)
+        self.assertEqual(
+            aggregated["production_latency_us"], aggregated["accelerator_compute_us"]
+        )
+        self.assertAlmostEqual(
+            aggregated["production_latency_cv_percent"],
+            100.0 * aggregated["spread"]["accelerator_compute_us"]["stddev"] / 80.0,
+        )
+        self.assertIn("excluding wait", aggregated["production_latency_note"])
+        self.assertIn(
+            "production_latency_cv_percent", aggregated["production_latency_note"]
+        )
+
+    def test_production_latency_is_absent_when_the_backend_did_not_report_it(
+        self,
+    ) -> None:
+        # "Accelerator (execute excluding wait) time" is optional in the log.
+        # Falling back to a wider metric under the production-latency name
+        # would silently change what the number means.
+        report = {
+            "messages": [
+                {
+                    "method": "BACKEND_EXECUTE",
+                    "profilingEvents": [
+                        {
+                            "identifier": "Accelerator (execute) time",
+                            "unit": "MICROSEC",
+                            "value": 1734,
+                        }
+                    ],
+                }
+            ]
+        }
+        aggregated = aggregate_device_executions([parse_device_execution(report)])
+
+        self.assertNotIn("production_latency_us", aggregated)
+        self.assertEqual(aggregated["accelerator_execute_us"], 1734.0)
+
     def test_aggregating_nothing_fails_closed(self) -> None:
         with self.assertRaises(DeviceMetricsError):
             aggregate_device_executions([])

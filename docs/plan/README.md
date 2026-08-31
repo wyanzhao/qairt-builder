@@ -132,6 +132,20 @@ must settle the SM8850 `soc_model` discrepancy T02 now documents.
 - **optrace is not the source of per-op cycles.** `option="optrace"` needs a
   schematic binary this program's compile does not emit and fails without one;
   per-op cycles come from `level="detailed"` alone.
+- **Production latency is `accelerator_compute_us`** (maintainer decision,
+  2026-08-31): QAIRT's "Accelerator (execute excluding wait) time", the cost of
+  the model on the hardware with both this program's host orchestration and the
+  device's queueing and memory wait outside it. It is published as
+  `production_latency_us` with `production_latency_source`. Its absolute value
+  is small — on SM8750 roughly 4% of accelerator execute time — which makes it
+  the most dispersed metric in the block, measured at 8–17% CV against ~2% for
+  accelerator execute, so `production_latency_cv_percent` is published with it
+  and a change is read against that dispersion. This closes T10's open
+  question.
+- **Deployment latency for Qwen3.5 is a different meter and is not this
+  number.** Genie measures `token-generation-rate` and `time-to-first-token` on
+  the device; those are the deployment-relevant numbers, they arrive through the
+  GenAI lane, and the two are never combined or converted into one another.
 
 ## Progress log
 

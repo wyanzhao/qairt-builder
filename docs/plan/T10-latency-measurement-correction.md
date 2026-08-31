@@ -191,7 +191,9 @@ and `test_benchmark_survives_an_adapter_that_cannot_profile`.
   It needs the same treatment before a GenAI latency number is trusted.
 - **Chain-scope runs** get the honest scope block but no `device_execution`;
   capture is wired for the single-graph path only.
-- **What "production latency" should mean** for this program is still open. A
-  per-call `qnn-net-run` launch is not a deployment path, so neither number
-  describes a shipped application; the device block is the one that describes
-  the model.
+- **What "production latency" should mean: settled 2026-08-31.** It is
+  `accelerator_compute_us`, published as `production_latency_us` with its
+  source, note and `production_latency_cv_percent`. See the program decision in
+  [`README.md`](README.md). Deployment latency for Qwen3.5 remains a separate
+  meter — Genie's on-device token rate and time-to-first-token — and the two are
+  never combined.
