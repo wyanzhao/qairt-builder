@@ -46,9 +46,23 @@ Full prose walkthrough: `docs/first-run.md`. This is the operational sequence.
 - Reference numbers on the smoke fixture: SQNR ~37.8 dB, accelerator compute
   ~69 µs, wall p50 ~2600 ms. The gap between the last two is expected.
 
+## Running stages separately
+
+`validate`, `benchmark` and `diagnose` take **`--from-job <build job id>`**, not
+`--spec` — they reuse the build job's manifest. Passing `--spec` is refused.
+
+```bash
+qairt-agent build --spec models/smoke/spec.json     # prints a job_id
+qairt-agent validate --from-job <BUILD_JOB_ID>
+qairt-agent benchmark --from-job <BUILD_JOB_ID>
+```
+
 ## If a device stage fails
 
-- Stale lease after an unplugged handset: `qairt-agent device gc`.
+- Stale lease after an unplugged handset: `qairt-agent device gc --dry-run`
+  first to see what it would release, then without the flag. It rechecks the
+  owner token under a per-device lock and removes only the exact
+  `<job>/<stage>/<attempt>/` sandbox.
 - `df` / free-space or ADB errors: `qairt-agent device doctor`.
 - Never broaden remote cleanup beyond the exact
   `/data/local/tmp/qairt-agent/<job>/<stage>/<attempt>/` path.

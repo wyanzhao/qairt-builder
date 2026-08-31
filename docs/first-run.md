@@ -103,6 +103,32 @@ job id. Follow it with:
 qairt-agent job watch <JOB_ID> --follow
 ```
 
+### Running the stages separately
+
+`workflow` is build + validate + benchmark in one job. To run them apart —
+re-validating without rebuilding, or re-benchmarking after a device change —
+note that **`validate`, `benchmark` and `diagnose` require `--from-job`**, not
+`--spec`. They reuse the build job's manifest and spec; there is no way to
+validate a build that does not exist.
+
+```bash
+qairt-agent build --spec models/smoke/spec.json
+```
+
+That prints a `job_id`. Feed it to the later stages:
+
+```bash
+qairt-agent validate --from-job <BUILD_JOB_ID>
+```
+
+```bash
+qairt-agent benchmark --from-job <BUILD_JOB_ID>
+```
+
+Both mint their own job ids and can be followed with `qairt-agent job watch`.
+Passing `--spec` to them instead is refused with
+`'validate' requires --from-job <build job id>`.
+
 ## 6. Read the reports
 
 Everything lands under the spec's `output_root` (`artifacts/smoke` by default).
@@ -189,6 +215,31 @@ reference device this produces:
 Layer drilldown does **not** work over a chain assembled this way. Diagnostic
 contexts belong to the build that produced them, so two independently built
 slices leave one of them without one; the stage says so and names the slices.
+
+## When a device stage will not start
+
+A run that dies with the handset unplugged, or a killed worker, can leave a
+lease held and a staged directory behind on the device. Nothing reclaims it
+automatically, because a lease is deliberately owner-checked rather than
+timed out from the outside.
+
+Look first, without changing anything:
+
+```bash
+qairt-agent device gc --dry-run
+```
+
+It reports `stale_leases`, what it would clean, and what it would skip:
+
+```json
+{"ok": true, "dry_run": true, "stale_leases": 0, "cleaned": [], "skipped": []}
+```
+
+Drop `--dry-run` to release them. It rechecks the owner token under a
+per-device lock and removes only the exact
+`/data/local/tmp/qairt-agent/<job>/<stage>/<attempt>/` sandbox — never a parent
+directory. For ADB reachability and free-space problems, use
+`qairt-agent device doctor` instead.
 
 ## Where to go next
 
